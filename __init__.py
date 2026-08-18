@@ -1,4 +1,5 @@
 import math
+import re
 from dataclasses import dataclass, replace
 
 import torch
@@ -231,21 +232,24 @@ def _actor_state(label, default, override):
     state = _text(override) or _text(default)
     if not state:
         return ""
-    return _sentence(state.replace("{actor}", label) if "{actor}" in state else f"{label} {state}")
+    return _sentence(f"{label} {state}")
 
 
-def _bind_actor(value, actor, labels, context):
+def _bind_actor_tokens(value, actor_labels):
     value = _text(value)
     if not value:
         return ""
-    if actor is None:
-        if "{actor}" in value:
-            raise ValueError(f"{context} uses {{actor}} but has no associated actor")
-        return value
-    label = labels.get(id(actor))
-    if label is None:
-        raise ValueError(f"{context} references an undeclared actor")
-    return value.replace("{actor}", label)
+
+    def replace_actor(match):
+        socket_suffix = match.group(1)
+        if not re.fullmatch(r"_\d+", socket_suffix):
+            raise ValueError(f"Invalid actor placeholder {match.group(0)}; use {{actor_0}}, {{actor_1}}, and so on")
+        index = int(socket_suffix[1:])
+        if index >= len(actor_labels):
+            raise ValueError(f"{match.group(0)} exceeds the Character Group, which contains {len(actor_labels)} actor(s)")
+        return actor_labels[index]
+
+    return re.sub(r"\{actor([^}]*)\}", replace_actor, value)
 
 
 def _video_size(megapixels, aspect_ratio):
@@ -466,17 +470,16 @@ class MiniMaxH3Camera(io.ComfyNode):
         return io.Schema(node_id="MiniMaxH3Camera", display_name="MiniMax H3 摄像机动作片段（Camera Clip）", category=CATEGORY, inputs=[
             io.Float.Input("start_time", display_name="开始时间（秒）", default=0.0, min=0.0, max=60.0, step=0.05),
             io.Float.Input("end_time", display_name="结束时间（秒）", default=5.0, min=0.0, max=60.0, step=0.05),
-            io.String.Input("framing_and_angle", display_name="景别与角度", placeholder="可用 {actor} 引用关联人物", default="The camera begins at eye level in a medium shot, keeping {actor} centered.", multiline=True),
-            io.String.Input("movement", display_name="摄像机运动", placeholder="可用 {actor} 引用关联人物", default="It slowly pushes toward {actor}.", multiline=True),
-            io.String.Input("focus", display_name="对焦与景深", placeholder="可用 {actor} 引用关联人物", default="A shallow depth of field keeps {actor}'s face sharp.", multiline=True),
-            io.String.Input("result", display_name="结束状态", placeholder="可用 {actor} 引用关联人物", default="The camera holds on the final framing.", multiline=True, optional=True),
-            H3_ACTOR_INSTANCE.Input("subject", display_name="关联人物", optional=True)],
+            io.String.Input("framing_and_angle", display_name="景别与角度", placeholder="用 {actor_0}、{actor_1} 引用人物组成员", default="The camera begins at eye level in a medium shot, keeping {actor_0} centered.", multiline=True),
+            io.String.Input("movement", display_name="摄像机运动", placeholder="用 {actor_0}、{actor_1} 引用人物组成员", default="It slowly pushes toward {actor_0}.", multiline=True),
+            io.String.Input("focus", display_name="对焦与景深", placeholder="用 {actor_0}、{actor_1} 引用人物组成员", default="A shallow depth of field keeps {actor_0}'s face sharp.", multiline=True),
+            io.String.Input("result", display_name="结束状态", placeholder="用 {actor_0}、{actor_1} 引用人物组成员", default="The camera holds on the final framing.", multiline=True, optional=True)],
             outputs=[H3_TIMELINE_CLIP.Output(display_name="clip")])
 
     @classmethod
-    def execute(cls, start_time, end_time, framing_and_angle, movement, focus, result="", subject=None):
+    def execute(cls, start_time, end_time, framing_and_angle, movement, focus, result=""):
         content = " ".join(map(_sentence, filter(_text, (framing_and_angle, movement, focus))))
-        return io.NodeOutput(TimelineClipData("camera", start_time, end_time, content, "", _sentence(result), target=subject))
+        return io.NodeOutput(TimelineClipData("camera", start_time, end_time, content, "", _sentence(result)))
 
 
 class MiniMaxH3LightingAction(io.ComfyNode):
@@ -485,16 +488,14 @@ class MiniMaxH3LightingAction(io.ComfyNode):
         return io.Schema(node_id="MiniMaxH3LightingAction", display_name="MiniMax H3 灯光动作片段（Lighting Clip）", category=CATEGORY, inputs=[
             io.Float.Input("start_time", display_name="开始时间（秒）", default=0.0, min=0.0, max=60.0, step=0.05),
             io.Float.Input("end_time", display_name="结束时间（秒）", default=5.0, min=0.0, max=60.0, step=0.05),
-            io.String.Input("lighting", display_name="灯光描述", placeholder="可用 {actor} 引用关联人物", default="Cool city light separates {actor} from the background.", multiline=True),
-            io.String.Input("transition", display_name="灯光变化", placeholder="可用 {actor} 引用关联人物", default="The lighting remains stable without flicker.", multiline=True, optional=True),
-            io.String.Input("result", display_name="结束状态", placeholder="可用 {actor} 引用关联人物", default="The final lighting state remains stable.", multiline=True, optional=True),
-            H3_ACTOR_INSTANCE.Input("subject", display_name="关联人物", optional=True)],
+            io.String.Input("lighting", display_name="灯光描述", placeholder="用 {actor_0}、{actor_1} 引用人物组成员", default="Cool city light separates {actor_0} from the background.", multiline=True),
+            io.String.Input("transition", display_name="灯光变化", placeholder="用 {actor_0}、{actor_1} 引用人物组成员", default="The lighting remains stable without flicker.", multiline=True, optional=True),
+            io.String.Input("result", display_name="结束状态", placeholder="用 {actor_0}、{actor_1} 引用人物组成员", default="The final lighting state remains stable.", multiline=True, optional=True)],
             outputs=[H3_TIMELINE_CLIP.Output(display_name="clip")])
 
     @classmethod
-    def execute(cls, start_time, end_time, lighting, transition="", result="", subject=None):
-        return io.NodeOutput(TimelineClipData("lighting", start_time, end_time, _text(lighting), _sentence(transition),
-                                              _sentence(result), target=subject))
+    def execute(cls, start_time, end_time, lighting, transition="", result=""):
+        return io.NodeOutput(TimelineClipData("lighting", start_time, end_time, _text(lighting), _sentence(transition), _sentence(result)))
 
 
 class MiniMaxH3AudioAction(io.ComfyNode):
@@ -504,16 +505,14 @@ class MiniMaxH3AudioAction(io.ComfyNode):
             io.Combo.Input("audio_type", display_name="音频种类", options=["ambient", "sound effect", "music", "off-screen sound"], default="ambient"),
             io.Float.Input("start_time", display_name="开始时间（秒）", default=0.0, min=0.0, max=60.0, step=0.05),
             io.Float.Input("end_time", display_name="结束时间（秒）", default=5.0, min=0.0, max=60.0, step=0.05),
-            io.String.Input("description", display_name="声音描述", placeholder="可用 {actor} 引用关联人物", default="Rain, wind, and distant traffic remain naturally audible.", multiline=True),
-            io.String.Input("volume_and_space", display_name="音量与空间", placeholder="可用 {actor} 引用关联人物", default="The sound remains soft and spatially coherent.", multiline=True, optional=True),
-            io.String.Input("fade", display_name="淡入淡出", placeholder="可用 {actor} 引用关联人物", default="", multiline=True, optional=True),
-            H3_ACTOR_INSTANCE.Input("subject", display_name="关联人物", optional=True)], outputs=[H3_TIMELINE_CLIP.Output(display_name="clip")])
+            io.String.Input("description", display_name="声音描述", placeholder="用 {actor_0}、{actor_1} 引用人物组成员", default="Rain, wind, and distant traffic remain naturally audible.", multiline=True),
+            io.String.Input("volume_and_space", display_name="音量与空间", placeholder="用 {actor_0}、{actor_1} 引用人物组成员", default="The sound remains soft and spatially coherent.", multiline=True, optional=True),
+            io.String.Input("fade", display_name="淡入淡出", placeholder="用 {actor_0}、{actor_1} 引用人物组成员", default="", multiline=True, optional=True)], outputs=[H3_TIMELINE_CLIP.Output(display_name="clip")])
 
     @classmethod
-    def execute(cls, audio_type, start_time, end_time, description, volume_and_space="", fade="", subject=None):
+    def execute(cls, audio_type, start_time, end_time, description, volume_and_space="", fade=""):
         quality = " ".join(filter(_text, map(_sentence, (volume_and_space, fade))))
-        return io.NodeOutput(TimelineClipData("audio", start_time, end_time, _text(description), quality, "",
-                                              target=subject, audio_type=audio_type))
+        return io.NodeOutput(TimelineClipData("audio", start_time, end_time, _text(description), quality, "", audio_type=audio_type))
 
 
 class MiniMaxH3EnvironmentAction(io.ComfyNode):
@@ -638,10 +637,9 @@ def _validate_timeline(timeline):
 
 def _render_clip(track, clip, labels):
     prefix = f"From {_time(clip.start_time)} to {_time(clip.end_time)} seconds, "
-    context = f"{clip.kind} clip"
-    content = _bind_actor(clip.content, clip.target if track.owner_kind != "actor" else None, labels, context)
-    quality = _sentence(_bind_actor(clip.quality, clip.target if track.owner_kind != "actor" else None, labels, context))
-    end_state = _bind_actor(clip.result, clip.target if track.owner_kind != "actor" else None, labels, context)
+    content = clip.content
+    quality = clip.quality
+    end_state = clip.result
     if track.owner_kind == "actor":
         label = labels[id(track.owner)]
         end_state = _actor_state(label, clip.result, "")
@@ -712,7 +710,8 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
             retentions.setdefault(number, (marker, _text(retention)))
             return number
 
-        labels = {id(actor): f"{actor.card.name} (S{index})" for index, actor in enumerate(timeline.characters.actors, 1)}
+        actor_labels = tuple(f"{actor.card.name} (S{index})" for index, actor in enumerate(timeline.characters.actors, 1))
+        labels = {id(actor): actor_labels[index] for index, actor in enumerate(timeline.characters.actors)}
         character_lines = []
         for actor in timeline.characters.actors:
             card, label = actor.card, labels[id(actor)]
@@ -762,8 +761,7 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
                 else:
                     timed_events.append(event)
                 if clip.kind == "audio":
-                    audio_text = _bind_actor(clip.content, clip.target, labels, "audio clip")
-                    timed = f"From {_time(clip.start_time)} to {_time(clip.end_time)} seconds, {_sentence(audio_text)}"
+                    timed = f"From {_time(clip.start_time)} to {_time(clip.end_time)} seconds, {_sentence(clip.content)}"
                     (music if clip.audio_type == "music" else soundscape).append(timed)
         continuous_events.sort(key=lambda item: (item[2], item[3]))
         timed_events.sort(key=lambda item: (item[0], item[2], item[3]))
@@ -807,7 +805,7 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
             result = ["integrated_multimodal_description: " + detailed,
                 "overall_soundscape: " + (" ".join(soundscape) or "N/A"),
                 "non_diegetic_music: " + (" ".join(music) or "N/A")]
-        return io.NodeOutput(CompletePromptData("\n\n".join(result), tuple(references), settings))
+        return io.NodeOutput(CompletePromptData(_bind_actor_tokens("\n\n".join(result), actor_labels), tuple(references), settings))
 
 
 class MiniMaxH3PromptParser(io.ComfyNode):

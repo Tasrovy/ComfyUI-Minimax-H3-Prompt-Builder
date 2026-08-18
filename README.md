@@ -27,7 +27,7 @@ All collection nodes use native autogrow sockets. Connecting the last socket cre
 
 Character Card and Actor Instance state fields are predicates, so write `stands beneath a streetlight` instead of `L stands beneath a streetlight`. The compiler prefixes the current actor label automatically. This keeps cards reusable when a character is renamed or assigned a different `S` number.
 
-Camera, lighting, and audio clips have an optional **Associated Actor** input. Connect an Actor Instance and write `{actor}` wherever that actor must appear, for example `keeps {actor} centered`. During compilation it becomes the declared label such as `Lapsrk (S1)`. Using `{actor}` without connecting an actor, or connecting an actor absent from the Character Group, stops compilation with an explicit error. Global style and environment fields should remain actor-independent.
+Actor placeholders use the exact Character Group socket names. `{actor_0}` is the Actor Instance connected to `actor_0` and becomes its declared label such as `Lapsrk (S1)`; `{actor_1}` maps to `actor_1` and becomes `Name (S2)`, and so on. These placeholders can be used anywhere in the final prompt source, including camera, lighting, audio, and additional instructions. Compilation stops if an index exceeds the group size. Global style and environment fields should normally remain actor-independent.
 
 ## Timeline
 
