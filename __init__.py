@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 import comfy.samplers
+import comfy.utils
 from comfy_api.latest import ComfyExtension, io
 from comfy_execution.graph_utils import GraphBuilder
 from comfy_extras.nodes_minimax_h3 import MiniMaxH3ReferenceToVideo as NativeRef2VA
@@ -262,6 +263,17 @@ def _video_length(duration):
     frames = max(5, math.ceil(duration * FPS))
     remainder = (frames - 5) % 17
     return frames if not remainder else frames + 17 - remainder
+
+
+def _match_reference_video(frames, width, height):
+    source_height, source_width = frames.shape[1:3]
+    scale = min(1.0, math.sqrt((width * height) / (source_width * source_height)))
+    target_width = max(32, round(source_width * scale / 32) * 32)
+    target_height = max(32, round(source_height * scale / 32) * 32)
+    if (target_height, target_width) == (source_height, source_width):
+        return frames
+    samples = frames[..., :3].movedim(-1, 1)
+    return comfy.utils.common_upscale(samples, target_width, target_height, "lanczos", "disabled").movedim(1, -1)
 
 
 def _time(value):
@@ -961,7 +973,7 @@ class MiniMaxH3GenerationJob(io.ComfyNode):
             io.Combo.Input("scheduler", display_name="调度器", options=comfy.samplers.SCHEDULER_NAMES, default="simple"),
             io.Int.Input("steps", display_name="采样步数", default=4, min=1, max=10000),
             io.Float.Input("denoise", display_name="降噪强度", default=1.0, min=0.0, max=1.0, step=0.01),
-            io.Combo.Input("ref_image_size", display_name="参考图尺寸", options=["match", "max"], default="match"),
+            io.Combo.Input("ref_image_size", display_name="参考媒体尺寸", options=["match", "max"], default="match"),
             io.Float.Input("continuity_seconds", display_name="连续性参考长度（秒）", default=2.0, min=0.25, max=15.0, step=0.25),
             io.Float.Input("overlap_seconds", display_name="重叠匹配长度（秒）", default=0.5, min=0.1, max=2.0, step=0.05)],
             outputs=[H3_GENERATION_JOB.Output(display_name="generation_job")])
@@ -995,10 +1007,13 @@ class MiniMaxH3SegmentConditioning(io.ComfyNode):
         ref_video_audios = {}
         video_index = 0
         if previous_tail_video is not None:
-            ref_videos["ref_video_0"] = previous_tail_video
+            ref_videos["ref_video_0"] = (_match_reference_video(previous_tail_video, settings.width, settings.height)
+                if generation_job.ref_image_size == "match" else previous_tail_video)
             video_index = 1
         for reference in motion_references:
-            ref_videos[f"ref_video_{video_index}"] = reference.frames
+            frames = (_match_reference_video(reference.frames, settings.width, settings.height)
+                if generation_job.ref_image_size == "match" else reference.frames)
+            ref_videos[f"ref_video_{video_index}"] = frames
             if reference.audio is not None:
                 ref_video_audios[f"ref_video_audio_{video_index}"] = reference.audio
             video_index += 1

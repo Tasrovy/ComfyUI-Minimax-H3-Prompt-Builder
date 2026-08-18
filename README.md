@@ -51,6 +51,8 @@ Every segment uses Ref2VA. A later segment receives the preceding segment's tail
 
 Use **MiniMax H3 Motion Reference** to trim a native `VIDEO` to the desired action, choose whether it controls only body motion or also camera, performance, or sound, and connect it to an Action clip. Ref2VA accepts at most three reference videos in one segment. Later segments reserve `<Video 1>` for continuity, so they can use at most two action-reference videos.
 
+The Generation Job's reference-media size applies to both images and videos. `match` scales each reference down to the generated segment's pixel area, while `max` keeps the native high-quality reference canvas. Use `match` on limited VRAM because every reference-video token participates in every sampling step.
+
 Connect the same Generation Job to **MiniMax H3 Final Prompt Preview** to inspect the exact complete Ref2VA prompt for every generated segment. The preview includes the original timeline range, regenerated overlap duration, continuity-video assignment, and action-reference video numbering used by the real generation path.
 
 ## Output
