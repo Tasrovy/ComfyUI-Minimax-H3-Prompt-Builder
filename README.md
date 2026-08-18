@@ -25,6 +25,10 @@ All collection nodes use native autogrow sockets. Connecting the last socket cre
 - An Environment Card and Environment Instance use the same inheritance and override rule.
 - A Style Card supplies the global visual style. Each Character Card chooses whether its character-specific style or the global style wins when they conflict.
 
+Character Card and Actor Instance state fields are predicates, so write `stands beneath a streetlight` instead of `L stands beneath a streetlight`. The compiler prefixes the current actor label automatically. This keeps cards reusable when a character is renamed or assigned a different `S` number.
+
+Camera, lighting, and audio clips have an optional **Associated Actor** input. Connect an Actor Instance and write `{actor}` wherever that actor must appear, for example `keeps {actor} centered`. During compilation it becomes the declared label such as `Lapsrk (S1)`. Using `{actor}` without connecting an actor, or connecting an actor absent from the Character Group, stops compilation with an explicit error. Global style and environment fields should remain actor-independent.
+
 ## Timeline
 
 Actor action clips have a selectable kind: `body`, `expression`, `gaze`, or `speech`. Language is an input of a `speech` action. Camera, lighting, audio, and environment nodes also produce the common `MINIMAX_H3_TIMELINE_CLIP` type.

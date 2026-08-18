@@ -227,6 +227,27 @@ def _resolved(default, override):
     return _sentence(override) or _sentence(default)
 
 
+def _actor_state(label, default, override):
+    state = _text(override) or _text(default)
+    if not state:
+        return ""
+    return _sentence(state.replace("{actor}", label) if "{actor}" in state else f"{label} {state}")
+
+
+def _bind_actor(value, actor, labels, context):
+    value = _text(value)
+    if not value:
+        return ""
+    if actor is None:
+        if "{actor}" in value:
+            raise ValueError(f"{context} uses {{actor}} but has no associated actor")
+        return value
+    label = labels.get(id(actor))
+    if label is None:
+        raise ValueError(f"{context} references an undeclared actor")
+    return value.replace("{actor}", label)
+
+
 def _video_size(megapixels, aspect_ratio):
     ratio_width, ratio_height = ASPECT_RATIOS[aspect_ratio]
     scale = math.sqrt(megapixels * 1024 * 1024 / (ratio_width * ratio_height))
@@ -250,9 +271,9 @@ class MiniMaxH3Character(io.ComfyNode):
             io.String.Input("name", display_name="人物名称", placeholder="人物名称", default="the young woman"),
             io.String.Input("description", display_name="人物描述", placeholder="人物描述", default="A young woman with long black hair wearing a dark red coat.", multiline=True),
             io.String.Input("preservation", display_name="一致性要求", placeholder="一致性要求", default="Preserve her identity and appearance throughout the video.", multiline=True),
-            io.String.Input("default_position", display_name="默认位置", placeholder="默认位置", default="She stands in the center of the frame.", multiline=True),
-            io.String.Input("default_pose", display_name="默认姿态", placeholder="默认姿态", default="She stands naturally with a relaxed posture.", multiline=True),
-            io.String.Input("default_emotion", display_name="默认表情", placeholder="默认表情", default="She has a calm expression.", multiline=True),
+            io.String.Input("default_position", display_name="默认位置", placeholder="只写状态，例如：站在画面中央", default="stands in the center of the frame", multiline=True),
+            io.String.Input("default_pose", display_name="默认姿态", placeholder="只写状态，例如：自然放松地站立", default="stands naturally with a relaxed posture", multiline=True),
+            io.String.Input("default_emotion", display_name="默认表情", placeholder="只写状态，例如：神情平静", default="has a calm expression", multiline=True),
             io.Combo.Input("style_priority", display_name="风格优先级", options=["character", "global"], default="global"),
             io.String.Input("default_appearance", display_name="默认外观", placeholder="默认外观", default="", multiline=True, optional=True),
             io.String.Input("character_style", display_name="人物风格", placeholder="人物风格", default="", multiline=True, optional=True),
@@ -445,16 +466,17 @@ class MiniMaxH3Camera(io.ComfyNode):
         return io.Schema(node_id="MiniMaxH3Camera", display_name="MiniMax H3 摄像机动作片段（Camera Clip）", category=CATEGORY, inputs=[
             io.Float.Input("start_time", display_name="开始时间（秒）", default=0.0, min=0.0, max=60.0, step=0.05),
             io.Float.Input("end_time", display_name="结束时间（秒）", default=5.0, min=0.0, max=60.0, step=0.05),
-            io.String.Input("framing_and_angle", display_name="景别与角度", placeholder="景别与角度", default="The camera begins at eye level in a medium shot.", multiline=True),
-            io.String.Input("movement", display_name="摄像机运动", placeholder="摄像机运动", default="It slowly pushes toward the character.", multiline=True),
-            io.String.Input("focus", display_name="对焦与景深", placeholder="对焦与景深", default="A shallow depth of field keeps the face sharp.", multiline=True),
-            io.String.Input("result", display_name="结束状态", placeholder="结束状态", default="The camera holds on the final framing.", multiline=True, optional=True)],
+            io.String.Input("framing_and_angle", display_name="景别与角度", placeholder="可用 {actor} 引用关联人物", default="The camera begins at eye level in a medium shot, keeping {actor} centered.", multiline=True),
+            io.String.Input("movement", display_name="摄像机运动", placeholder="可用 {actor} 引用关联人物", default="It slowly pushes toward {actor}.", multiline=True),
+            io.String.Input("focus", display_name="对焦与景深", placeholder="可用 {actor} 引用关联人物", default="A shallow depth of field keeps {actor}'s face sharp.", multiline=True),
+            io.String.Input("result", display_name="结束状态", placeholder="可用 {actor} 引用关联人物", default="The camera holds on the final framing.", multiline=True, optional=True),
+            H3_ACTOR_INSTANCE.Input("subject", display_name="关联人物", optional=True)],
             outputs=[H3_TIMELINE_CLIP.Output(display_name="clip")])
 
     @classmethod
-    def execute(cls, start_time, end_time, framing_and_angle, movement, focus, result=""):
+    def execute(cls, start_time, end_time, framing_and_angle, movement, focus, result="", subject=None):
         content = " ".join(map(_sentence, filter(_text, (framing_and_angle, movement, focus))))
-        return io.NodeOutput(TimelineClipData("camera", start_time, end_time, content, "", _sentence(result)))
+        return io.NodeOutput(TimelineClipData("camera", start_time, end_time, content, "", _sentence(result), target=subject))
 
 
 class MiniMaxH3LightingAction(io.ComfyNode):
@@ -463,14 +485,16 @@ class MiniMaxH3LightingAction(io.ComfyNode):
         return io.Schema(node_id="MiniMaxH3LightingAction", display_name="MiniMax H3 灯光动作片段（Lighting Clip）", category=CATEGORY, inputs=[
             io.Float.Input("start_time", display_name="开始时间（秒）", default=0.0, min=0.0, max=60.0, step=0.05),
             io.Float.Input("end_time", display_name="结束时间（秒）", default=5.0, min=0.0, max=60.0, step=0.05),
-            io.String.Input("lighting", display_name="灯光描述", placeholder="灯光描述", default="Cool city light is broken by restrained amber highlights.", multiline=True),
-            io.String.Input("transition", display_name="灯光变化", placeholder="灯光变化", default="The lighting remains stable without flicker.", multiline=True, optional=True),
-            io.String.Input("result", display_name="结束状态", placeholder="结束状态", default="The final lighting state remains stable.", multiline=True, optional=True)],
+            io.String.Input("lighting", display_name="灯光描述", placeholder="可用 {actor} 引用关联人物", default="Cool city light separates {actor} from the background.", multiline=True),
+            io.String.Input("transition", display_name="灯光变化", placeholder="可用 {actor} 引用关联人物", default="The lighting remains stable without flicker.", multiline=True, optional=True),
+            io.String.Input("result", display_name="结束状态", placeholder="可用 {actor} 引用关联人物", default="The final lighting state remains stable.", multiline=True, optional=True),
+            H3_ACTOR_INSTANCE.Input("subject", display_name="关联人物", optional=True)],
             outputs=[H3_TIMELINE_CLIP.Output(display_name="clip")])
 
     @classmethod
-    def execute(cls, start_time, end_time, lighting, transition="", result=""):
-        return io.NodeOutput(TimelineClipData("lighting", start_time, end_time, _text(lighting), _sentence(transition), _sentence(result)))
+    def execute(cls, start_time, end_time, lighting, transition="", result="", subject=None):
+        return io.NodeOutput(TimelineClipData("lighting", start_time, end_time, _text(lighting), _sentence(transition),
+                                              _sentence(result), target=subject))
 
 
 class MiniMaxH3AudioAction(io.ComfyNode):
@@ -480,14 +504,16 @@ class MiniMaxH3AudioAction(io.ComfyNode):
             io.Combo.Input("audio_type", display_name="音频种类", options=["ambient", "sound effect", "music", "off-screen sound"], default="ambient"),
             io.Float.Input("start_time", display_name="开始时间（秒）", default=0.0, min=0.0, max=60.0, step=0.05),
             io.Float.Input("end_time", display_name="结束时间（秒）", default=5.0, min=0.0, max=60.0, step=0.05),
-            io.String.Input("description", display_name="声音描述", placeholder="声音描述", default="Rain, wind, and distant traffic remain naturally audible.", multiline=True),
-            io.String.Input("volume_and_space", display_name="音量与空间", placeholder="音量与空间", default="The sound remains soft and spatially coherent.", multiline=True, optional=True),
-            io.String.Input("fade", display_name="淡入淡出", placeholder="淡入淡出", default="", multiline=True, optional=True)], outputs=[H3_TIMELINE_CLIP.Output(display_name="clip")])
+            io.String.Input("description", display_name="声音描述", placeholder="可用 {actor} 引用关联人物", default="Rain, wind, and distant traffic remain naturally audible.", multiline=True),
+            io.String.Input("volume_and_space", display_name="音量与空间", placeholder="可用 {actor} 引用关联人物", default="The sound remains soft and spatially coherent.", multiline=True, optional=True),
+            io.String.Input("fade", display_name="淡入淡出", placeholder="可用 {actor} 引用关联人物", default="", multiline=True, optional=True),
+            H3_ACTOR_INSTANCE.Input("subject", display_name="关联人物", optional=True)], outputs=[H3_TIMELINE_CLIP.Output(display_name="clip")])
 
     @classmethod
-    def execute(cls, audio_type, start_time, end_time, description, volume_and_space="", fade=""):
+    def execute(cls, audio_type, start_time, end_time, description, volume_and_space="", fade="", subject=None):
         quality = " ".join(filter(_text, map(_sentence, (volume_and_space, fade))))
-        return io.NodeOutput(TimelineClipData("audio", start_time, end_time, _text(description), quality, "", audio_type=audio_type))
+        return io.NodeOutput(TimelineClipData("audio", start_time, end_time, _text(description), quality, "",
+                                              target=subject, audio_type=audio_type))
 
 
 class MiniMaxH3EnvironmentAction(io.ComfyNode):
@@ -599,6 +625,8 @@ def _validate_timeline(timeline):
                 raise ValueError(f"{track.owner_kind} clip {clip_index} must satisfy 0 <= start_time < end_time")
             if clip.end_time > timeline.duration + 1e-6:
                 raise ValueError(f"{track.owner_kind} clip {clip_index} exceeds the timeline duration")
+            if clip.target is not None and id(clip.target) not in actor_ids:
+                raise ValueError(f"{track.owner_kind} clip {clip_index} references an undeclared actor")
             if clip.kind != "audio":
                 intervals.setdefault((owner, clip.kind), []).append(clip)
     for (owner, kind), clips in intervals.items():
@@ -610,34 +638,39 @@ def _validate_timeline(timeline):
 
 def _render_clip(track, clip, labels):
     prefix = f"From {_time(clip.start_time)} to {_time(clip.end_time)} seconds, "
+    context = f"{clip.kind} clip"
+    content = _bind_actor(clip.content, clip.target if track.owner_kind != "actor" else None, labels, context)
+    quality = _sentence(_bind_actor(clip.quality, clip.target if track.owner_kind != "actor" else None, labels, context))
+    end_state = _bind_actor(clip.result, clip.target if track.owner_kind != "actor" else None, labels, context)
     if track.owner_kind == "actor":
         label = labels[id(track.owner)]
+        end_state = _actor_state(label, clip.result, "")
         if clip.kind == "speech":
             details = ", ".join(filter(None, (clip.language.variant, clip.language.accent, clip.language.pronunciation)))
             voice = f" using {details}" if details else ""
             delivery = f" {_text(clip.delivery)}" if clip.delivery else ""
             mode = " says in an off-screen voiceover" if clip.speech_type == "off-screen voiceover" else " says"
-            text = f"{label}{mode}{voice}{delivery}: <d>[{clip.language.language}] {clip.content}</d>"
+            text = f"{label}{mode}{voice}{delivery}: <d>[{clip.language.language}] {content}</d>"
         else:
-            text = f"{label} {clip.content}"
+            text = f"{label} {content}"
             if clip.target is not None:
                 if id(clip.target) not in labels:
                     raise ValueError(f"{label}'s action targets an undeclared actor")
                 text += f" in relation to {labels[id(clip.target)]}"
     elif track.owner_kind == "environment":
-        text = f"the environment changes: {clip.content}"
+        text = f"the environment changes: {content}"
     elif clip.kind == "lighting":
-        text = f"the lighting changes: {clip.content}"
+        text = f"the lighting changes: {content}"
     elif clip.kind == "audio":
-        text = f"the {clip.audio_type} sound is heard: {clip.content}"
+        text = f"the {clip.audio_type} sound is heard: {content}"
     else:
-        text = clip.content
+        text = content
     result = prefix + _sentence(text)
-    if clip.quality:
-        result += " " + clip.quality
-    if clip.result:
+    if quality:
+        result += " " + quality
+    if end_state:
         state_name = "post-speech state" if clip.kind == "speech" else f"{clip.kind} state"
-        result += " " + _sentence(f"At {_time(clip.end_time)} seconds, {clip.result} This resulting {state_name} persists until the next {clip.kind} action")
+        result += " " + _sentence(f"At {_time(clip.end_time)} seconds, {end_state} This resulting {state_name} persists until the next {clip.kind} action")
     return result
 
 
@@ -689,9 +722,9 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
                     f"<Subject {{number}}> is {card.name}, whose identity and appearance come from <Picture {{number}}>. {card.description}",
                     "fully_preserved", card.preservation)
             character_lines.append(_sentence(f"{label} is <Subject {number}>" if number else f"{label} is {card.description}"))
-            character_lines.extend(filter(_text, (_resolved(card.default_position, actor.position_override),
-                _resolved(card.default_pose, actor.pose_override), _resolved(card.default_emotion, actor.emotion_override),
-                _resolved(card.default_appearance, actor.appearance_override))))
+            character_lines.extend(filter(_text, (_actor_state(label, card.default_position, actor.position_override),
+                _actor_state(label, card.default_pose, actor.pose_override), _actor_state(label, card.default_emotion, actor.emotion_override),
+                _actor_state(label, card.default_appearance, actor.appearance_override))))
             if card.character_style:
                 rule = "prioritize this character-specific style over conflicting global style" if card.style_priority == "character" else "the global style takes priority; use this character style only where compatible"
                 character_lines.append(_sentence(f"For {label}, {rule}: {card.character_style}"))
@@ -729,7 +762,8 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
                 else:
                     timed_events.append(event)
                 if clip.kind == "audio":
-                    timed = f"From {_time(clip.start_time)} to {_time(clip.end_time)} seconds, {_sentence(clip.content)}"
+                    audio_text = _bind_actor(clip.content, clip.target, labels, "audio clip")
+                    timed = f"From {_time(clip.start_time)} to {_time(clip.end_time)} seconds, {_sentence(audio_text)}"
                     (music if clip.audio_type == "music" else soundscape).append(timed)
         continuous_events.sort(key=lambda item: (item[2], item[3]))
         timed_events.sort(key=lambda item: (item[0], item[2], item[3]))
