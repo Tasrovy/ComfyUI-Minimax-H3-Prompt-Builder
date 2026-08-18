@@ -1091,7 +1091,8 @@ class MiniMaxH3MultiSegmentGenerate(io.ComfyNode):
     @classmethod
     def define_schema(cls):
         return io.Schema(node_id="MiniMaxH3MultiSegmentGenerate", display_name="MiniMax H3 多段生成（Decoded Video）",
-            category=CATEGORY, inputs=[io.Model.Input("model"), io.Clip.Input("clip"), io.Vae.Input("video_vae"),
+            category=CATEGORY, description="自动逐段生成、解码并拼接；节点内显示当前片段、阶段和总体进度。",
+            inputs=[io.Model.Input("model"), io.Clip.Input("clip"), io.Vae.Input("video_vae"),
             io.Vae.Input("audio_vae"), io.Sampler.Input("sampler"), H3_GENERATION_JOB.Input("generation_job")],
             outputs=[io.Video.Output(display_name="video")], enable_expand=True)
 
@@ -1099,43 +1100,54 @@ class MiniMaxH3MultiSegmentGenerate(io.ComfyNode):
     def execute(cls, model, clip, video_vae, audio_vae, sampler, generation_job):
         ranges = _segment_ranges(generation_job.timeline)
         graph = GraphBuilder()
+        parent_node_id = cls.hidden.unique_id if cls.hidden is not None else None
+
+        def stage_node(class_type, node_id, **inputs):
+            node = graph.node(class_type, id=node_id, **inputs)
+            if parent_node_id is not None:
+                node.set_override_display_id(parent_node_id)
+            return node
+
         accumulated_images = None
         accumulated_audio = None
         previous_tail_video = None
         for index in range(len(ranges)):
+            stage = f"segment_{index + 1}_of_{len(ranges)}"
             conditioning_inputs = {"clip": clip, "video_vae": video_vae, "audio_vae": audio_vae,
                 "generation_job": generation_job, "segment_index": index}
             if previous_tail_video is not None:
                 conditioning_inputs["previous_tail_video"] = previous_tail_video
-            conditioning = graph.node("MiniMaxH3SegmentConditioning", **conditioning_inputs)
-            noise = graph.node("RandomNoise", noise_seed=(generation_job.seed + index) & 0xffffffffffffffff)
-            guider = graph.node("BasicGuider", model=model, conditioning=conditioning.out(0))
-            sigmas = graph.node("BasicScheduler", model=model, scheduler=generation_job.scheduler,
+            conditioning = stage_node("MiniMaxH3SegmentConditioning", f"{stage}_conditioning", **conditioning_inputs)
+            noise = stage_node("RandomNoise", f"{stage}_noise",
+                noise_seed=(generation_job.seed + index) & 0xffffffffffffffff)
+            guider = stage_node("BasicGuider", f"{stage}_guider", model=model, conditioning=conditioning.out(0))
+            sigmas = stage_node("BasicScheduler", f"{stage}_scheduler", model=model, scheduler=generation_job.scheduler,
                 steps=generation_job.steps, denoise=generation_job.denoise)
-            sampled = graph.node("SamplerCustomAdvanced", noise=noise.out(0), guider=guider.out(0), sampler=sampler,
-                sigmas=sigmas.out(0), latent_image=conditioning.out(1))
-            images = graph.node("VAEDecode", samples=sampled.out(0), vae=video_vae).out(0)
-            audio = graph.node("VAEDecodeAudio", samples=sampled.out(0), vae=audio_vae).out(0)
+            sampled = stage_node("SamplerCustomAdvanced", f"{stage}_sampling", noise=noise.out(0),
+                guider=guider.out(0), sampler=sampler, sigmas=sigmas.out(0), latent_image=conditioning.out(1))
+            images = stage_node("VAEDecode", f"{stage}_video_decode", samples=sampled.out(0), vae=video_vae).out(0)
+            audio = stage_node("VAEDecodeAudio", f"{stage}_audio_decode", samples=sampled.out(0), vae=audio_vae).out(0)
             segment_duration = ranges[index][1] - ranges[index][0]
             if index > 0:
                 segment_duration += generation_job.overlap_seconds
-            trimmed = graph.node("MiniMaxH3SegmentTrim", images=images, audio=audio,
+            trimmed = stage_node("MiniMaxH3SegmentTrim", f"{stage}_trim", images=images, audio=audio,
                 duration_seconds=segment_duration)
             images = trimmed.out(0)
             audio = trimmed.out(1)
             if index < len(ranges) - 1:
-                previous_tail_video = graph.node("MiniMaxH3ContinuityTail", images=images,
+                previous_tail_video = stage_node("MiniMaxH3ContinuityTail", f"{stage}_continuity", images=images,
                     continuity_seconds=generation_job.continuity_seconds).out(0)
             if accumulated_images is None:
                 accumulated_images = images
                 accumulated_audio = audio
             else:
-                joined = graph.node("MiniMaxH3SegmentJoin", previous_images=accumulated_images,
+                joined = stage_node("MiniMaxH3SegmentJoin", f"{stage}_join", previous_images=accumulated_images,
                     previous_audio=accumulated_audio, current_images=images, current_audio=audio,
                     overlap_seconds=generation_job.overlap_seconds)
                 accumulated_images = joined.out(0)
                 accumulated_audio = joined.out(1)
-        video = graph.node("CreateVideo", images=accumulated_images, fps=float(FPS), audio=accumulated_audio)
+        video = stage_node("CreateVideo", f"segment_{len(ranges)}_of_{len(ranges)}_final_video",
+            images=accumulated_images, fps=float(FPS), audio=accumulated_audio)
         return io.NodeOutput(video.out(0), expand=graph.finalize())
 
 
