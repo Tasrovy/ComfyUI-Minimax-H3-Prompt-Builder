@@ -890,6 +890,33 @@ def _motion_references(timeline, first_video_number):
     return references, " ".join(instructions)
 
 
+def _compile_generation_segment(generation_job, segment_index, has_previous_segment):
+    ranges = _segment_ranges(generation_job.timeline)
+    if segment_index < 0 or segment_index >= len(ranges):
+        raise ValueError(f"分段编号超出范围：{segment_index}")
+    start, end = ranges[segment_index]
+    leading_seconds = generation_job.overlap_seconds if has_previous_segment else 0.0
+    timeline = _segment_timeline(generation_job.timeline, start, end, leading_seconds)
+    state = _persistent_state(generation_job.timeline, start)
+    first_video_number = 2 if has_previous_segment else 1
+    motion_references, motion_instructions = _motion_references(timeline, first_video_number)
+    continuity_instruction = ""
+    if has_previous_segment:
+        continuity_instruction = _sentence(
+            f"The opening {_time(leading_seconds)} seconds must continue the end of <Video 1>: preserve the same subjects, "
+            "poses, spatial arrangement, movement direction, velocity, environment, lighting, and camera state. "
+            "After this overlap, perform the current segment's actions in their stated order. "
+            "Do not replay earlier dialogue or completed actions"
+        )
+    total_videos = len(motion_references) + (1 if has_previous_segment else 0)
+    if total_videos > 3:
+        raise ValueError("单个生成片段最多支持 3 段参考视频；后续片段需为连续性视频保留 1 个位置，因此最多连接 2 个动作参考视频")
+    additional = " ".join(filter(_text, (state, continuity_instruction, motion_instructions)))
+    compiled = MiniMaxH3FinalPrompt.execute(timeline, generation_job.megapixels, generation_job.aspect_ratio,
+        prompt_format="Ref", additional_instructions=additional)[0]
+    return compiled, motion_references
+
+
 class MiniMaxH3GenerationJob(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -929,29 +956,8 @@ class MiniMaxH3SegmentConditioning(io.ComfyNode):
 
     @classmethod
     def execute(cls, clip, video_vae, audio_vae, generation_job, segment_index, previous_tail_video=None):
-        ranges = _segment_ranges(generation_job.timeline)
-        if segment_index < 0 or segment_index >= len(ranges):
-            raise ValueError(f"分段编号超出范围：{segment_index}")
-        start, end = ranges[segment_index]
-        leading_seconds = generation_job.overlap_seconds if previous_tail_video is not None else 0.0
-        timeline = _segment_timeline(generation_job.timeline, start, end, leading_seconds)
-        state = _persistent_state(generation_job.timeline, start)
-        first_video_number = 2 if previous_tail_video is not None else 1
-        motion_references, motion_instructions = _motion_references(timeline, first_video_number)
-        continuity_instruction = ""
-        if previous_tail_video is not None:
-            continuity_instruction = _sentence(
-                f"The opening {_time(leading_seconds)} seconds must continue the end of <Video 1>: preserve the same subjects, "
-                "poses, spatial arrangement, movement direction, velocity, environment, lighting, and camera state. "
-                "After this overlap, perform the current segment's actions in their stated order. "
-                "Do not replay earlier dialogue or completed actions"
-            )
-        total_videos = len(motion_references) + (1 if previous_tail_video is not None else 0)
-        if total_videos > 3:
-            raise ValueError("单个生成片段最多支持 3 段参考视频；后续片段需为连续性视频保留 1 个位置，因此最多连接 2 个动作参考视频")
-        additional = " ".join(filter(_text, (state, continuity_instruction, motion_instructions)))
-        compiled = MiniMaxH3FinalPrompt.execute(timeline, generation_job.megapixels, generation_job.aspect_ratio,
-            prompt_format="Ref", additional_instructions=additional)[0]
+        compiled, motion_references = _compile_generation_segment(generation_job, segment_index,
+            previous_tail_video is not None)
         settings = compiled.video_settings
         ref_videos = {}
         ref_video_audios = {}
@@ -969,6 +975,39 @@ class MiniMaxH3SegmentConditioning(io.ComfyNode):
             ref_image_size=generation_job.ref_image_size,
             ref_images={f"ref_image_{index}": item.image for index, item in enumerate(compiled.references)},
             ref_videos=ref_videos, ref_video_audios=ref_video_audios)
+
+
+class MiniMaxH3PromptPreview(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(node_id="MiniMaxH3PromptPreview", display_name="MiniMax H3 最终提示词预览（Final Prompt Preview）",
+            category=CATEGORY, description="按实际多段 Ref2VA 生成顺序预览每个片段的最终完整提示词。",
+            inputs=[H3_GENERATION_JOB.Input("generation_job")], outputs=[io.String.Output(display_name="final_prompts")],
+            is_output_node=True)
+
+    @classmethod
+    def execute(cls, generation_job):
+        if not isinstance(generation_job, GenerationJobData):
+            raise TypeError("最终提示词预览需要 MiniMax H3 生成任务包")
+        ranges = _segment_ranges(generation_job.timeline)
+        sections = []
+        for index, (start, end) in enumerate(ranges):
+            has_previous = index > 0
+            compiled, motion_references = _compile_generation_segment(generation_job, index, has_previous)
+            references = []
+            if has_previous:
+                references.append("<Video 1> = 上一片段尾部连续性视频")
+            first_motion_number = 2 if has_previous else 1
+            references.extend(f"<Video {first_motion_number + offset}> = 当前片段动作参考视频 {offset + 1}"
+                for offset in range(len(motion_references)))
+            generated_duration = end - start + (generation_job.overlap_seconds if has_previous else 0.0)
+            header = [f"========== 片段 {index + 1}/{len(ranges)} ==========",
+                f"原时间轴范围：{_time(start)}–{_time(end)} 秒",
+                f"本次生成时长：{_time(generated_duration)} 秒",
+                *(references or ["参考视频：无"]), "", compiled.text]
+            sections.append("\n".join(header))
+        preview = "\n\n".join(sections)
+        return io.NodeOutput(preview, ui={"text": (preview,)})
 
 
 class MiniMaxH3ContinuityTail(io.ComfyNode):
@@ -1108,7 +1147,7 @@ class MiniMaxH3PromptBuilderExtension(ComfyExtension):
             MiniMaxH3AudioAction, MiniMaxH3EnvironmentAction, MiniMaxH3ActorTrack, MiniMaxH3EnvironmentTrack,
             MiniMaxH3SystemTrack, MiniMaxH3TrackList, MiniMaxH3Timeline, MiniMaxH3FinalPrompt,
             MiniMaxH3PromptParser, MiniMaxH3Ref2VAAdapter, MiniMaxH3GenerationJob, MiniMaxH3MotionReference,
-            MiniMaxH3SegmentConditioning, MiniMaxH3ContinuityTail, MiniMaxH3SegmentTrim, MiniMaxH3SegmentJoin,
+            MiniMaxH3PromptPreview, MiniMaxH3SegmentConditioning, MiniMaxH3ContinuityTail, MiniMaxH3SegmentTrim, MiniMaxH3SegmentJoin,
             MiniMaxH3MultiSegmentGenerate]
 
 

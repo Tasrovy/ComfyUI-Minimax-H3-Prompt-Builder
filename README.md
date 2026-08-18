@@ -12,6 +12,7 @@ Camera / Lighting / Audio Clips -> System Tracks ----------------> Track List
 Style Card + Character Group + Environment Instance + Track List -> Timeline
 Timeline -> REF Timeline Compiler -> Prompt Parser -> Ref2VA Adapter
 Timeline -> Generation Job -> Multi-Segment Generate -> VIDEO
+                         \-> Final Prompt Preview
 ```
 
 All collection nodes use native autogrow sockets. Connecting the last socket creates the next socket automatically.
@@ -43,6 +44,8 @@ The generator derives any number of generation segments from the timeline clips 
 Every segment uses Ref2VA. A later segment receives the preceding segment's tail as `<Video 1>` for continuity, followed by the motion-reference videos attached to its current action clips. The beginning of the new segment deliberately regenerates a short overlap; the join node finds the closest visual and motion match inside that overlap, removes the duplicate prefix, and then appends the remaining frames and audio. The expanded graph reuses ComfyUI's native guider, scheduler, sampler, VAE decoders, and video container. Its only output is a decoded `VIDEO` containing both frames and audio.
 
 Use **MiniMax H3 Motion Reference** to trim a native `VIDEO` to the desired action, choose whether it controls only body motion or also camera, performance, or sound, and connect it to an Action clip. Ref2VA accepts at most three reference videos in one segment. Later segments reserve `<Video 1>` for continuity, so they can use at most two action-reference videos.
+
+Connect the same Generation Job to **MiniMax H3 Final Prompt Preview** to inspect the exact complete Ref2VA prompt for every generated segment. The preview includes the original timeline range, regenerated overlap duration, continuity-video assignment, and action-reference video numbering used by the real generation path.
 
 ## Output
 
