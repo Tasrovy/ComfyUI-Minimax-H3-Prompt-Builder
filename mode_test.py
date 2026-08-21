@@ -33,6 +33,21 @@ track = s.TimelineTrackData("actor", actor, (clip,))
 tracks = s.TrackListData((track,))
 timeline = s.TimelineData(group, style, env, tracks, 5.0)
 
+motion_frames = torch.arange(48, dtype=torch.float32).reshape(48, 1, 1, 1).expand(-1, 16, 16, 3)
+motion_audio = {"waveform": torch.zeros(1, 2, 64000), "sample_rate": 32000}
+motion = s.MotionReferenceData(motion_frames, motion_audio, "仅动作", 2.0, 2.0)
+aligned_clip = mod.MiniMaxH3Action.execute("body", 0.0, 4.0, "follows the dance", motion_reference=motion)[0]
+assert aligned_clip.motion_reference.frames.shape[0] == 90
+assert torch.equal(aligned_clip.motion_reference.frames[0], motion_frames[0])
+assert torch.equal(aligned_clip.motion_reference.frames[-1], motion_frames[-1])
+assert aligned_clip.motion_reference.audio["waveform"].shape[-1] == 120000
+aligned_track = s.TimelineTrackData("actor", actor, (aligned_clip,))
+aligned_timeline = s.TimelineData(group, style, env, s.TrackListData((aligned_track,)), 4.0)
+aligned_references, aligned_instructions = mod.segments._motion_references(aligned_timeline, 1)
+assert len(aligned_references) == 1
+assert "from 0.00 to 3.75 seconds one-to-one" in aligned_instructions
+assert "exactly at the action end" in aligned_instructions
+
 result_components = mod.checkpoints.Types.VideoComponents(torch.zeros(150, 32, 48, 3), Fraction(30),
     {"waveform": torch.zeros(1, 1, 220500), "sample_rate": 44100})
 result_video = mod.checkpoints.InputImpl.VideoFromComponents(result_components)

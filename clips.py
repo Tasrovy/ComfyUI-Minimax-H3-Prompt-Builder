@@ -11,6 +11,33 @@ from .schema import (ACTOR_KINDS, CATEGORY, FPS, H3_ACTOR_INSTANCE, H3_ENVIRONME
 from .utils import _autogrow, _sentence, _text, _values
 
 
+def _nearest_reference_frame_count(duration):
+    wanted = max(5, round(duration * FPS))
+    lower = max(5, 5 + 17 * ((wanted - 5) // 17))
+    upper = lower + 17
+    maximum = 5 + 17 * ((round(15.0 * FPS) - 5) // 17)
+    return min(maximum, lower if wanted - lower <= upper - wanted else upper)
+
+
+def _align_motion_reference(reference, duration):
+    target_frames = _nearest_reference_frame_count(duration)
+    source_frames = reference.frames
+    positions = torch.linspace(0, source_frames.shape[0] - 1, target_frames,
+        device=source_frames.device).round().long()
+    frames = source_frames.index_select(0, positions)
+    aligned_duration = target_frames / FPS
+    audio = reference.audio
+    if audio is not None:
+        sample_count = max(1, round(aligned_duration * audio["sample_rate"]))
+        waveform = audio["waveform"]
+        shape = waveform.shape
+        waveform = torch.nn.functional.interpolate(waveform.reshape(-1, 1, shape[-1]),
+            size=sample_count, mode="linear", align_corners=False).reshape(*shape[:-1], sample_count)
+        audio = {**audio, "waveform": waveform}
+    source_duration = reference.source_duration or source_frames.shape[0] / FPS
+    return MotionReferenceData(frames, audio, reference.role, source_duration, aligned_duration)
+
+
 class MiniMaxH3MotionReference(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -44,7 +71,7 @@ class MiniMaxH3MotionReference(io.ComfyNode):
             first_sample = round(trim_start * sample_rate)
             last_sample = min(audio["waveform"].shape[-1], round(end * sample_rate))
             audio = {**audio, "waveform": audio["waveform"][..., first_sample:last_sample]}
-        return io.NodeOutput(MotionReferenceData(frames, audio, role))
+        return io.NodeOutput(MotionReferenceData(frames, audio, role, duration, frames.shape[0] / FPS))
 
 
 class MiniMaxH3Action(io.ComfyNode):
@@ -74,6 +101,10 @@ class MiniMaxH3Action(io.ComfyNode):
             raise TypeError("Action target must be an actor instance")
         if motion_reference is not None and not isinstance(motion_reference, MotionReferenceData):
             raise TypeError("动作参考必须来自 MiniMax H3 动作参考视频节点")
+        if motion_reference is not None:
+            if end_time <= start_time:
+                raise ValueError("带动作参考视频的动作片段结束时间必须晚于开始时间")
+            motion_reference = _align_motion_reference(motion_reference, end_time - start_time)
         return io.NodeOutput(TimelineClipData(action_type, start_time, end_time, _text(content), _sentence(quality),
             _sentence(result), language, _text(delivery), speech_type, target, "", motion_reference))
 

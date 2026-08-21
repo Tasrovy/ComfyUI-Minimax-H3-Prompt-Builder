@@ -145,8 +145,14 @@ def _motion_references(timeline, first_video_number):
             if reference is None or not _text(clip.content):
                 continue
             owner = labels.get(id(track.owner), "the character")
+            reference_duration = reference.aligned_duration or reference.frames.shape[0] / 24.0
             line = (f"For {owner}'s action from {_time(clip.start_time)} to {_time(clip.end_time)} seconds, "
-                    f"use <Video {video_number}> as the motion reference. {role_text[reference.role]} "
+                    f"map the complete motion sequence in <Video {video_number}> from 0.00 to "
+                    f"{_time(reference_duration)} seconds one-to-one onto that target interval. Uniformly retime the "
+                    "reference so its first pose begins exactly at the action start and its final pose is reached "
+                    "exactly at the action end. Reproduce the ordered pose sequence, limb trajectories, footwork, "
+                    "rhythm, weight shifts, body orientation, balance, and contact timing. Do not replace, simplify, "
+                    f"reorder, omit, loop, or improvise any movement. {role_text[reference.role]} "
                     f"The performer in the reference video is replaced by {owner}: render {owner}'s identity, "
                     "face, hair, body, clothing, and environment from the declared references instead.")
             if reference.audio is not None:
@@ -320,8 +326,8 @@ class MiniMaxH3PromptPreview(io.ComfyNode):
             for ref_item in compiled.references:
                 references.append(f"<Picture {ref_item.picture_number}> = [{ref_item.role}] ({ref_item.usage or 'Default'})")
             references.extend(
-                f"<Video {1 + offset}> = 当前片段动作参考视频 {offset + 1}"
-                for offset in range(len(motion_references))
+                f"<Video {1 + offset}> = 当前片段动作参考视频 {offset + 1}（已对齐为 {_time(reference.aligned_duration or reference.frames.shape[0] / 24.0)} 秒）"
+                for offset, reference in enumerate(motion_references)
             )
             if context_frames:
                 references.insert(0,
