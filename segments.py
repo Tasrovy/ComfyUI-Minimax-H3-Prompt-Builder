@@ -3,6 +3,7 @@ from dataclasses import replace
 import torch
 import comfy.samplers
 import comfy.nested_tensor
+import torchaudio
 import torchvision.transforms.functional as TF
 from PIL import Image, ImageDraw, ImageFont
 from comfy_api.latest import io
@@ -66,6 +67,15 @@ def _context_frame_count(seconds, available_frames):
     return 5 + 17 * ((wanted - 5) // 17)
 
 
+def _encode_context_audio(audio_vae, audio):
+    waveform = audio["waveform"]
+    sample_rate = int(audio["sample_rate"])
+    vae_sample_rate = int(getattr(audio_vae, "audio_sample_rate", 32000))
+    if sample_rate != vae_sample_rate:
+        waveform = torchaudio.functional.resample(waveform, sample_rate, vae_sample_rate)
+    return audio_vae.encode(waveform[:1].movedim(1, -1))
+
+
 def _lock_context_prefix(latent, previous_images, previous_audio, video_vae, audio_vae,
                          context_frames, width, height):
     video, audio = (stream.clone() for stream in latent["samples"].unbind())
@@ -88,7 +98,7 @@ def _lock_context_prefix(latent, previous_images, previous_audio, video_vae, aud
         sample_rate = int(previous_audio["sample_rate"])
         audio_samples = max(1, round((context_frames / 24.0) * sample_rate))
         tail_audio = {**previous_audio, "waveform": previous_audio["waveform"][..., -audio_samples:]}
-        audio_latent, _ = NativeRef2VA._encode_ref_audio(audio_vae, tail_audio)
+        audio_latent = _encode_context_audio(audio_vae, tail_audio)
         audio_latent = audio_latent.to(device=audio.device, dtype=audio.dtype)
         audio_steps = min(audio_latent.shape[-1], audio.shape[-1] - 1)
         audio[..., :audio_steps] = audio_latent[..., :audio_steps]
