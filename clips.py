@@ -11,31 +11,38 @@ from .schema import (ACTOR_KINDS, CATEGORY, FPS, H3_ACTOR_INSTANCE, H3_ENVIRONME
 from .utils import _autogrow, _sentence, _text, _values
 
 
-def _nearest_reference_frame_count(duration):
+def _aligned_reference_frame_count(duration):
     wanted = max(5, round(duration * FPS))
-    lower = max(5, 5 + 17 * ((wanted - 5) // 17))
-    upper = lower + 17
+    remainder = (wanted - 5) % 17
+    aligned = wanted if remainder == 0 else wanted + 17 - remainder
     maximum = 5 + 17 * ((round(15.0 * FPS) - 5) // 17)
-    return min(maximum, lower if wanted - lower <= upper - wanted else upper)
+    if aligned > maximum:
+        raise ValueError("带动作参考视频的单个动作片段不能超过 15 秒，请拆分动作片段")
+    return wanted, aligned
 
 
 def _align_motion_reference(reference, duration):
-    target_frames = _nearest_reference_frame_count(duration)
+    motion_frames, aligned_frames = _aligned_reference_frame_count(duration)
     source_frames = reference.frames
-    positions = torch.linspace(0, source_frames.shape[0] - 1, target_frames,
+    positions = torch.linspace(0, source_frames.shape[0] - 1, motion_frames,
         device=source_frames.device).round().long()
     frames = source_frames.index_select(0, positions)
-    aligned_duration = target_frames / FPS
+    if aligned_frames > motion_frames:
+        frames = torch.cat((frames, frames[-1:].repeat(aligned_frames - motion_frames, 1, 1, 1)), dim=0)
+    motion_duration = motion_frames / FPS
+    aligned_duration = aligned_frames / FPS
     audio = reference.audio
     if audio is not None:
-        sample_count = max(1, round(aligned_duration * audio["sample_rate"]))
+        motion_samples = max(1, round(motion_duration * audio["sample_rate"]))
+        aligned_samples = max(motion_samples, round(aligned_duration * audio["sample_rate"]))
         waveform = audio["waveform"]
         shape = waveform.shape
         waveform = torch.nn.functional.interpolate(waveform.reshape(-1, 1, shape[-1]),
-            size=sample_count, mode="linear", align_corners=False).reshape(*shape[:-1], sample_count)
+            size=motion_samples, mode="linear", align_corners=False).reshape(*shape[:-1], motion_samples)
+        waveform = torch.nn.functional.pad(waveform, (0, aligned_samples - motion_samples))
         audio = {**audio, "waveform": waveform}
     source_duration = reference.source_duration or source_frames.shape[0] / FPS
-    return MotionReferenceData(frames, audio, reference.role, source_duration, aligned_duration)
+    return MotionReferenceData(frames, audio, reference.role, source_duration, aligned_duration, motion_duration)
 
 
 class MiniMaxH3MotionReference(io.ComfyNode):
@@ -71,7 +78,7 @@ class MiniMaxH3MotionReference(io.ComfyNode):
             first_sample = round(trim_start * sample_rate)
             last_sample = min(audio["waveform"].shape[-1], round(end * sample_rate))
             audio = {**audio, "waveform": audio["waveform"][..., first_sample:last_sample]}
-        return io.NodeOutput(MotionReferenceData(frames, audio, role, duration, frames.shape[0] / FPS))
+        return io.NodeOutput(MotionReferenceData(frames, audio, role, duration, frames.shape[0] / FPS, duration))
 
 
 class MiniMaxH3Action(io.ComfyNode):
