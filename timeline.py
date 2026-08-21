@@ -113,7 +113,8 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
 
     @classmethod
     def execute(cls, timeline, megapixels, aspect_ratio, prompt_format="Ref", first_frame=None, last_frame=None,
-                additional_instructions="", motion_instructions="", empty_sections="不输出", continuity_keyframe=False):
+                additional_instructions="", motion_instructions="", empty_sections="不输出", continuity_keyframe=False,
+                suppress_initial_state=False):
         if not isinstance(timeline, TimelineData):
             raise TypeError("Timeline compiler requires TimelineData")
         _validate_timeline(timeline)
@@ -153,8 +154,7 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
             if identity:
                 character_lines.append(_sentence(identity))
                 
-            # 关键修复：当处于续写段 (continuity_keyframe=True) 时，屏蔽默认初始站姿，完全交由上一段尾帧接管姿态
-            if not continuity_keyframe:
+            if not suppress_initial_state:
                 character_lines.extend(filter(_text, (_actor_state(label, card.default_position, actor.position_override),
                     _actor_state(label, card.default_pose, actor.pose_override), _actor_state(label, card.default_emotion, actor.emotion_override),
                     _actor_state(label, card.default_appearance, actor.appearance_override))))

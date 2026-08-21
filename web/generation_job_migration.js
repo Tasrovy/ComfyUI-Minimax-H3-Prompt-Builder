@@ -18,7 +18,7 @@ function migrateGenerationJob(info) {
         && typeof values[5] === "number"
         && typeof values[6] === "number"
         && ["match", "max"].includes(values[7])
-        && typeof values[8] === "number"
+        && ["不输出", "输出 N/A"].includes(values[8])
         && typeof values[9] === "number";
     if (!oldInput && validCurrent) {
         return;
@@ -36,6 +36,12 @@ function migrateGenerationJob(info) {
         (value) => typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1,
     ) ?? 1.0;
     const refImageSize = values.find((value) => value === "match" || value === "max") ?? "match";
+    const refIndex = values.indexOf(refImageSize);
+    const afterRef = refIndex >= 0 ? values.slice(refIndex + 1) : [];
+    const emptySections = afterRef.find((value) => value === "不输出" || value === "输出 N/A") ?? "不输出";
+    const continuity = afterRef.find(
+        (value) => typeof value === "number" && Number.isFinite(value) && value >= 0.21,
+    ) ?? 0.92;
     info.widgets_values = [
         typeof values[0] === "number" && Number.isFinite(values[0]) ? values[0] : 0.98,
         typeof values[1] === "string" ? values[1] : "16:9",
@@ -45,12 +51,12 @@ function migrateGenerationJob(info) {
         steps,
         denoise,
         refImageSize,
-        2.0,
-        0.5,
+        emptySections,
+        continuity,
     ];
     if (Array.isArray(info.inputs)) {
         info.inputs = info.inputs.filter(
-            (input) => input.name !== "target_segment_seconds" && input.name !== "handoff_tail_frames",
+            (input) => !["target_segment_seconds", "handoff_tail_frames", "overlap_seconds"].includes(input.name),
         );
     }
 }

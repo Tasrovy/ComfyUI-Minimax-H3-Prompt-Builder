@@ -1,62 +1,131 @@
-# MiniMax H3 REF Timeline Prompt Builder
+# MiniMax H3 REF 时间轴提示词构建器
 
-This custom-node package builds a single-shot MiniMax H3 Ref2VA prompt from reusable cards, instances, timed clips, and a unified track list.
+这是一个 ComfyUI 自定义节点包，用人物卡、人物实例、环境卡、时间轴片段和统一轨道数组构建 MiniMax H3 Ref2VA 提示词，并支持自动多段生成、段间连续性、实时预览和分段缓存。
 
-## Data flow
+## 数据流
 
 ```text
-Character Card -> Actor Instance -> Character Group
-                               \-> Actor Track --\
-Environment Card -> Environment Instance -> Environment Track \
-Camera / Lighting / Audio Clips -> System Tracks ----------------> Track List
-Style Card + Character Group + Environment Instance + Track List -> Timeline
-Timeline -> REF Timeline Compiler -> Prompt Parser -> Ref2VA Adapter
-Timeline -> Generation Job -> Multi-Segment Generate -> VIDEO
-                         \-> Final Prompt Preview
+人物卡 -> 人物实例 -> 人物组
+                    \-> 人物轨道 --\
+环境卡 -> 环境实例 -> 环境轨道 --------\
+摄像机 / 灯光 / 音频片段 -> 系统轨道 ----> 轨道数组
+风格卡 + 人物组 + 环境实例 + 轨道数组 -> 时间轴
+时间轴 -> 最终提示词 -> 提示词解析 -> Ref2VA 适配器
+时间轴 -> 生成任务包 -> 多段生成 -> VIDEO
+                      \-> 最终提示词预览
 ```
 
-All collection nodes use native autogrow sockets. Connecting the last socket creates the next socket automatically.
+所有集合节点都使用 ComfyUI 原生自动增长插槽。连接最后一个插槽后，会自动出现下一个插槽。
 
-## Cards and instances
+## 卡片与实例
 
-- A Character Card stores identity, reference image, preservation rules, default initial state, and character-specific style.
-- An Actor Instance inherits the card's initial state. Each non-empty instance field overrides the matching card field.
-- A Character Group declares actor instances in connection order and assigns `S1`, `S2`, and so on automatically.
-- An Environment Card and Environment Instance use the same inheritance and override rule.
-- A Style Card supplies the global visual style. Each Character Card chooses whether its character-specific style or the global style wins when they conflict.
+- 人物卡保存人物身份、参考图、保持规则、默认初始状态和人物专属风格。
+- 人物实例继承人物卡的初始状态。实例中非空的字段会覆盖人物卡的对应字段。
+- 人物组按照插槽连接顺序声明人物实例，并自动分配 `S1`、`S2` 等编号。
+- 环境卡和环境实例采用相同的继承与覆盖规则。
+- 风格卡提供全局视觉风格。人物卡可以设置人物专属风格与全局风格冲突时的优先级。
 
-Character Card and Actor Instance state fields are predicates, so write `stands beneath a streetlight` instead of `L stands beneath a streetlight`. The compiler prefixes the current actor label automatically. This keeps cards reusable when a character is renamed or assigned a different `S` number.
+人物卡和人物实例中的状态字段应写成谓语，例如写 `站在路灯下`，而不是 `L 站在路灯下`。编译器会自动补上当前人物名称和编号，因此人物改名或改变 `S` 编号后仍可复用卡片。
 
-Actor placeholders use the exact Character Group socket names. `{actor_0}` is the Actor Instance connected to `actor_0` and becomes its declared label such as `Lapsrk (S1)`; `{actor_1}` maps to `actor_1` and becomes `Name (S2)`, and so on. These placeholders can be used anywhere in the final prompt source, including camera, lighting, audio, and additional instructions. Compilation stops if an index exceeds the group size. Global style and environment fields should normally remain actor-independent.
+人物占位符与人物组插槽名称严格对应。`{actor_0}` 指向连接到 `actor_0` 的人物实例，编译后会变成 `Lapsrk (S1)` 之类的声明名称；`{actor_1}` 对应 `actor_1`，并变成 `Name (S2)`，依此类推。摄像机、灯光、音频和附加指令等最终提示词来源都可以使用这些占位符。占位符编号超出人物组数量时会停止编译。全局风格和环境字段通常不应依赖具体人物。
 
-## Timeline
+## 时间轴
 
-Actor action clips have a selectable kind: `body`, `expression`, `gaze`, or `speech`. Language is an input of a `speech` action. Camera, lighting, audio, and environment nodes also produce the common `MINIMAX_H3_TIMELINE_CLIP` type.
+人物动作片段可以选择以下种类：
 
-Tracks all output `MINIMAX_H3_TIMELINE_TRACK`. The Track List therefore accepts a uniform array rather than separate actor, camera, lighting, audio, or environment inputs.
+- `body`：身体动作
+- `expression`：表情
+- `gaze`：视线
+- `speech`：说话
 
-Time is edited in seconds and compared as half-open intervals `[start, end)`. A clip's process ends at `end`, while its non-empty `result` remains in effect until the next action of the same kind. Audio ends with its interval and may overlap other audio.
+语言是 `speech` 动作的输入。摄像机、灯光、音频和环境节点也会输出统一的 `MINIMAX_H3_TIMELINE_CLIP` 类型。
 
-Compilation fails when non-audio clips with the same owner and kind overlap, when a clip exceeds the timeline duration, or when a track references an undeclared actor or another environment instance.
+所有轨道统一输出 `MINIMAX_H3_TIMELINE_TRACK`，因此轨道数组接收统一的轨道列表，不需要分别设置人物、摄像机、灯光、音频和环境输入。
 
-## Multi-segment generation
+时间单位为秒，并按照左闭右开区间 `[开始, 结束)` 判断。动作过程在结束时间停止；非空的“结束状态”会持续到同一种类的下一个动作开始。音频只在自身时间范围内生效，并且允许不同音频相互重叠。
 
-The native model loaders and patch nodes stay outside this package. Connect the patched `MODEL`, `CLIP`, video `VAE`, audio `VAE`, and `SAMPLER` directly to **MiniMax H3 Multi-Segment Generate**. Prompt, reference, size, seed, sampling, and segmentation settings are packed once by **MiniMax H3 Generation Job**.
+以下情况会停止编译并报告错误：
 
-The generator derives any number of generation segments from the timeline clips rather than from a target duration. Non-overlapping actor clips become sequential generation segments, while actor clips that overlap in time are generated together. If there are no actor clips, environment-change clips provide the segment structure. Camera, lighting, and audio tracks are supporting controls and are sliced into the affected segments without creating boundaries of their own.
+- 同一对象、同一种类的非音频片段发生重叠。
+- 片段超出时间轴总时长。
+- 轨道引用了人物组中未声明的人物。
+- 环境轨道引用了时间轴之外的其他环境实例。
 
-During automatic multi-segment generation, the node keeps a multiline timing history for every completed internal stage and shows the current stage's live elapsed time, sampling step, estimated overall percentage, and total elapsed time. Internal expanded-graph progress is mapped back to the visible Multi-Segment Generate node, so the existing compact workflow does not need to be split into manual chains.
+## 多段生成
 
-Every segment uses Ref2VA. A later segment receives the preceding segment's tail as `<Video 1>` for continuity, followed by the motion-reference videos attached to its current action clips. The beginning of the new segment deliberately regenerates a short overlap; the join node finds the closest visual and motion match inside that overlap, removes the duplicate prefix, and then appends the remaining frames and audio. The expanded graph reuses ComfyUI's native guider, scheduler, sampler, VAE decoders, and video container. Its only output is a decoded `VIDEO` containing both frames and audio.
+模型加载器和模型补丁节点继续使用 ComfyUI 原生节点。将处理后的 `MODEL`、`CLIP`、视频 `VAE`、音频 `VAE` 和 `SAMPLER` 直接连接到 **MiniMax H3 多段生成（Decoded Video）**。提示词、参考素材、尺寸、种子、采样和分段参数由 **MiniMax H3 生成任务包（Generation Job）** 一次性打包。
 
-Use **MiniMax H3 Motion Reference** to trim a native `VIDEO` to the desired action, choose whether it controls only body motion or also camera, performance, or sound, and connect it to an Action clip. Ref2VA accepts at most three reference videos in one segment. Later segments reserve `<Video 1>` for continuity, so they can use at most two action-reference videos.
+生成片段由时间轴动作自动划分，而不是按固定时长切割：
 
-The Generation Job's reference-media size applies to both images and videos. `match` scales each reference down to the generated segment's pixel area, while `max` keeps the native high-quality reference canvas. Use `match` on limited VRAM because every reference-video token participates in every sampling step.
+- 不重叠的人物动作形成前后相继的生成片段。
+- 时间重叠的人物动作在同一个片段中一起生成。
+- 没有人物动作时，由环境变化片段提供分段结构。
+- 摄像机、灯光和音频是辅助控制轨道，只会被裁入其覆盖的片段，不会单独创建分段边界。
 
-Connect the same Generation Job to **MiniMax H3 Final Prompt Preview** to inspect the exact complete Ref2VA prompt for every generated segment. The preview includes the original timeline range, regenerated overlap duration, continuity-video assignment, and action-reference video numbering used by the real generation path.
+多段生成节点会保留每个内部步骤的耗时记录，并实时显示当前步骤、采样步数、总体百分比和累计耗时。内部展开图的进度会映射回可见的多段生成节点，不需要把紧凑工作流手动拆成多条采样链。
 
-## Output
+采样期间会按照“实时预览间隔（步）”发送低分辨率潜空间多帧预览。每个片段完成后，会立即连同音频保存到：
 
-The standalone compiler produces a continuous single-shot `Ref` prompt with the six Ref2VA sections. Reference images are numbered automatically and returned in matching order by Prompt Parser. Multi-segment generation also compiles every segment as `Ref`; it no longer switches continuation segments to FL/I2VA.
+```text
+ComfyUI/output/video/MiniMax H3 Segments
+```
 
-Width and height are calculated from megapixels and aspect ratio, rounded to multiples of 32. Duration is converted at 24 fps and snapped upward to MiniMax H3's `17k+5` frame grid.
+保存完成的片段会显示在多段生成节点的视频预览列表中。点击“停止生成并保留已完成片段”或使用 ComfyUI 的停止功能后，已经完成的片段不会丢失，当前尚未完成的片段不会保存。
+
+设置 `分段缓存 = 复用已完成片段` 后，再次执行会读取内容匹配的片段，从第一个缺失或变化的片段继续。缓存标识包含提示词、时间范围、参考素材、生成设置、模型结构和上游片段。更换模型、CLIP、VAE 或采样器实现后，需要增加“缓存版本”。选择“重新生成全部片段”可以在本次执行中忽略已有缓存。
+
+## 直接使用已经生成的片段
+
+使用 **MiniMax H3 动作片段结果扩展（Use Result）** 可以让某个生成片段直接采用已有视频，不再执行模型采样：
+
+```text
+人物动作片段 -> 动作片段结果扩展 -> 人物轨道
+加载视频 -----------------------> 已生成结果
+```
+
+该结果会覆盖动作所在的整个生成片段。首次使用时，节点会将它统一为当前任务的分辨率、24 FPS、片段时长和双声道音频，然后保存到分段缓存。以后缓存命中时会直接读取视频。
+
+直接结果也是一个连续性重置点，因此它之前的内容发生变化时，不会使这个固定结果及其后续片段失效；它后面的片段会使用该结果的尾部作为段间引导。替换输入视频后，需要增加扩展节点上的“结果版本”，从而使当前结果和依赖它的后续缓存失效。
+
+同一个生成片段只能绑定一个直接结果。输入视频不能短于对应片段；较长视频会按照片段时长截取。
+
+## 段间连续性
+
+每个生成片段都使用 Ref2VA。后续片段会将上一片段尾部的画面和音频编码后写入新片段的潜变量前缀，并使用零降噪遮罩将这部分内容硬锁定。连续性不再依赖模型理解 `<Video 1>` 之类的文字说明。
+
+模型会先处理被锁定的上下文，再生成当前可见动作。解码后会移除前置上下文，只拼接当前片段的可见部分，不进行交叉淡化。段间连续性前缀不会占用 Ref2VA 的动作参考视频插槽。
+
+展开后的生成图继续复用 ComfyUI 原生的引导器、调度器、采样器、VAE 解码器和视频容器。节点最终输出包含画面和音频的原生 `VIDEO`。
+
+## 动作参考视频
+
+使用 **MiniMax H3 动作参考视频（Motion Reference）** 可以截取原生 `VIDEO` 中需要的动作，并选择参考范围：
+
+- 仅动作
+- 动作与镜头
+- 完整表演
+- 动作与声音
+
+将其连接到人物动作片段即可。每个生成片段最多支持三个动作参考视频；硬锁定的段间连续性前缀不会占用这三个插槽。
+
+生成任务包中的“参考媒体尺寸”同时控制参考图片和动作参考视频：
+
+- `match`：按照生成片段的像素面积缩小参考素材，同时保持原始宽高比。
+- `max`：保留参考素材的原始高质量画布。
+
+显存有限时建议使用 `match`，因为每个参考视频的 Token 都会参与每一步采样。
+
+## 最终提示词预览
+
+把同一个生成任务包连接到 **MiniMax H3 最终提示词预览（Final Prompt Preview）**，可以检查每个实际生成片段的完整 Ref2VA 提示词。预览内容包括：
+
+- 原时间轴范围和输出时长。
+- 硬锁定段间上下文的长度。
+- 动作参考视频编号。
+- 是否使用已有结果并跳过模型采样。
+
+## 输出与尺寸
+
+独立提示词编译器会生成包含六个 Ref2VA 部分的连续单镜头 `Ref` 提示词。提示词解析节点自动为参考图片编号，并按照相同顺序输出图片。多段生成的每个片段也统一编译为 `Ref`，后续片段不会切换成 FL/I2VA。
+
+宽度和高度按照百万像素与宽高比计算，并取最接近的 32 倍数。时长按照 24 FPS 转换为帧数，再向上对齐到 MiniMax H3 使用的 `17k+5` 帧数规则。

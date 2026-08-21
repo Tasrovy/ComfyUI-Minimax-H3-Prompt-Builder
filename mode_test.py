@@ -1,6 +1,8 @@
 import importlib.util
 import pathlib
 import sys
+import tempfile
+from fractions import Fraction
 
 import torch
 
@@ -31,6 +33,18 @@ track = s.TimelineTrackData("actor", actor, (clip,))
 tracks = s.TrackListData((track,))
 timeline = s.TimelineData(group, style, env, tracks, 5.0)
 
+result_components = mod.checkpoints.Types.VideoComponents(torch.zeros(150, 32, 48, 3), Fraction(30),
+    {"waveform": torch.zeros(1, 1, 220500), "sample_rate": 44100})
+result_video = mod.checkpoints.InputImpl.VideoFromComponents(result_components)
+result_clip = mod.MiniMaxH3ActionResult.execute(clip, result_video, 2)[0]
+result_track = s.TimelineTrackData("actor", actor, (result_clip,))
+result_timeline = s.TimelineData(group, style, env, s.TrackListData((result_track,)), 5.0)
+assert mod.segments._segment_result(result_timeline, 0.0, 5.0) == (result_video, 2)
+prepared_images, prepared_audio = mod.MiniMaxH3SegmentResultPrepare.execute(result_video, 5.0, 64, 64)[:2]
+assert prepared_images.shape == (120, 64, 64, 3)
+assert prepared_audio["waveform"].shape == (1, 2, 160000)
+assert prepared_audio["sample_rate"] == 32000
+
 omit = mod.MiniMaxH3FinalPrompt.execute(timeline, 0.98, "16:9", "Ref", None, None, "",
     empty_sections="不输出")[0].text
 na = mod.MiniMaxH3FinalPrompt.execute(timeline, 0.98, "16:9", "Ref", None, None, "",
@@ -38,11 +52,51 @@ na = mod.MiniMaxH3FinalPrompt.execute(timeline, 0.98, "16:9", "Ref", None, None,
 
 assert "overall_soundscape" not in omit
 assert "non_diegetic_music" not in omit
-assert "Continuous non-character controls" not in omit
 assert "overall_soundscape" in na
 assert "non_diegetic_music" in na
-assert "Continuous non-character controls" in na
 assert "N/A" in na
+
+assert mod.segments._context_frame_count(0.92, 124) == 22
+assert mod.segments._context_frame_count(2.0, 124) == 39
+assert mod.segments._context_frame_count(0.1, 124) == 0
+
+class VideoVAE:
+    def encode(self, frames):
+        return torch.ones(1, 24, 7, 4, 4)
+
+class AudioVAE:
+    audio_sample_rate = 32000
+
+    def encode(self, waveform):
+        return torch.ones(1, 32, 2, 37)
+
+latent = {"samples": mod.segments.comfy.nested_tensor.NestedTensor((
+    torch.zeros(1, 24, 12, 4, 4), torch.zeros(1, 32, 2, 100)))}
+previous_images = torch.zeros(30, 64, 64, 3)
+previous_audio = {"waveform": torch.zeros(1, 2, 40000), "sample_rate": 32000}
+locked = mod.segments._lock_context_prefix(latent, previous_images, previous_audio,
+    VideoVAE(), AudioVAE(), 22, 64, 64)
+video, audio = locked["samples"].unbind()
+video_mask, audio_mask = locked["noise_mask"].unbind()
+assert torch.all(video[:, :, :7] == 1)
+assert torch.all(video_mask[:, :, :7] == 0) and torch.all(video_mask[:, :, 7:] == 1)
+assert torch.all(audio[..., :37] == 1)
+assert torch.all(audio_mask[..., :37] == 0) and torch.all(audio_mask[..., 37:] == 1)
+
+old_output = mod.checkpoints.folder_paths.get_output_directory()
+with tempfile.TemporaryDirectory() as temp_output:
+    mod.checkpoints.folder_paths.set_output_directory(temp_output)
+    try:
+        cache_name = "segment_001_0123456789abcdef01234567.mp4"
+        components = mod.checkpoints.Types.VideoComponents(torch.zeros(5, 32, 32, 3),
+            Fraction(24), {"waveform": torch.zeros(1, 2, 7000), "sample_rate": 32000})
+        video = mod.checkpoints.InputImpl.VideoFromComponents(components)
+        saved = mod.MiniMaxH3SegmentCheckpoint.execute(video, cache_name, f'["{cache_name}"]')[0]
+        assert mod.checkpoints._cache_path(cache_name).is_file()
+        loaded = mod.MiniMaxH3SegmentCheckpointLoad.execute(cache_name, f'["{cache_name}"]')[0]
+        assert saved.get_dimensions() == loaded.get_dimensions() == (32, 32)
+    finally:
+        mod.checkpoints.folder_paths.set_output_directory(old_output)
 
 empty_card = s.CharacterCardData("", "", "", None, "", "", "", "", "", "global")
 empty_actor = s.ActorInstanceData(empty_card, "", "", "", "")

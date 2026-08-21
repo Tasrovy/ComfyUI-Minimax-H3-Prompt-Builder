@@ -4,10 +4,12 @@ from comfy_api.latest import ComfyExtension
 
 from .cards import (MiniMaxH3ActorInstance, MiniMaxH3Character, MiniMaxH3CharacterGroup,
     MiniMaxH3Environment, MiniMaxH3EnvironmentInstance, MiniMaxH3Language, MiniMaxH3Visual)
-from .clips import (MiniMaxH3Action, MiniMaxH3ActorTrack, MiniMaxH3AudioAction, MiniMaxH3Camera,
+from .clips import (MiniMaxH3Action, MiniMaxH3ActionResult, MiniMaxH3ActorTrack, MiniMaxH3AudioAction, MiniMaxH3Camera,
     MiniMaxH3EnvironmentAction, MiniMaxH3EnvironmentTrack, MiniMaxH3LightingAction,
     MiniMaxH3MotionReference, MiniMaxH3SystemTrack, MiniMaxH3TrackList)
-from .pipeline import (MiniMaxH3ContinuityTail, MiniMaxH3MultiSegmentGenerate, MiniMaxH3SegmentJoin,
+from .checkpoints import (MiniMaxH3PreviewSampler, MiniMaxH3SegmentCheckpoint,
+    MiniMaxH3SegmentCheckpointLoad)
+from .pipeline import (MiniMaxH3MultiSegmentGenerate, MiniMaxH3SegmentJoin, MiniMaxH3SegmentResultPrepare,
     MiniMaxH3SegmentTrim)
 from .segments import (MiniMaxH3GenerationJob, MiniMaxH3PromptPreview, MiniMaxH3SegmentConditioning)
 from .timeline import (MiniMaxH3FinalPrompt, MiniMaxH3PromptParser, MiniMaxH3Ref2VAAdapter, MiniMaxH3Timeline)
@@ -20,11 +22,14 @@ class MiniMaxH3PromptBuilderExtension(ComfyExtension):
     @override
     async def get_node_list(self):
         return [MiniMaxH3Character, MiniMaxH3ActorInstance, MiniMaxH3CharacterGroup, MiniMaxH3Language, MiniMaxH3Visual,
-            MiniMaxH3Environment, MiniMaxH3EnvironmentInstance, MiniMaxH3Action, MiniMaxH3Camera, MiniMaxH3LightingAction,
+            MiniMaxH3Environment, MiniMaxH3EnvironmentInstance, MiniMaxH3Action, MiniMaxH3ActionResult,
+            MiniMaxH3Camera, MiniMaxH3LightingAction,
             MiniMaxH3AudioAction, MiniMaxH3EnvironmentAction, MiniMaxH3ActorTrack, MiniMaxH3EnvironmentTrack,
             MiniMaxH3SystemTrack, MiniMaxH3TrackList, MiniMaxH3Timeline, MiniMaxH3FinalPrompt,
             MiniMaxH3PromptParser, MiniMaxH3Ref2VAAdapter, MiniMaxH3GenerationJob, MiniMaxH3MotionReference,
-            MiniMaxH3PromptPreview, MiniMaxH3SegmentConditioning, MiniMaxH3ContinuityTail, MiniMaxH3SegmentTrim, MiniMaxH3SegmentJoin,
+            MiniMaxH3PromptPreview, MiniMaxH3SegmentConditioning, MiniMaxH3SegmentTrim, MiniMaxH3SegmentJoin,
+            MiniMaxH3SegmentResultPrepare,
+            MiniMaxH3PreviewSampler, MiniMaxH3SegmentCheckpoint, MiniMaxH3SegmentCheckpointLoad,
             MiniMaxH3MultiSegmentGenerate]
 
 

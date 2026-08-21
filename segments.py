@@ -1,10 +1,13 @@
 from dataclasses import replace
 
+import torch
 import comfy.samplers
+import comfy.nested_tensor
 import torchvision.transforms.functional as TF
 from PIL import Image, ImageDraw, ImageFont
 from comfy_api.latest import io
-from comfy_extras.nodes_minimax_h3 import MiniMaxH3ReferenceToVideo as NativeRef2VA
+from comfy_extras.nodes_minimax_h3 import (MiniMaxH3ReferenceToVideo as NativeRef2VA,
+    _resize as resize_h3_image)
 
 from .schema import (ASPECT_RATIOS, CATEGORY, EMPTY_SECTION_MODES, EMPTY_SECTION_OPTIONS,
     H3_GENERATION_JOB, H3_TIMELINE, GenerationJobData, TimelineData, TrackListData)
@@ -31,6 +34,17 @@ def _segment_ranges(timeline):
     return tuple((points[index], points[index + 1]) for index in range(len(points) - 1))
 
 
+def _segment_result(timeline, start, end):
+    results = [clip for track in timeline.tracks.tracks if track.owner_kind == "actor" for clip in track.clips
+        if clip.rendered_video is not None and clip.end_time > start + 1e-6 and clip.start_time < end - 1e-6]
+    if len(results) > 1:
+        raise ValueError(f"时间轴 {start:g}–{end:g} 秒的同一生成片段只能绑定一个已生成结果")
+    if not results:
+        return None
+    clip = results[0]
+    return clip.rendered_video, clip.rendered_video_version
+
+
 def _segment_timeline(timeline, start, end, leading_seconds=0.0):
     tracks = []
     for track in timeline.tracks.tracks:
@@ -43,6 +57,47 @@ def _segment_timeline(timeline, start, end, leading_seconds=0.0):
         if clips:
             tracks.append(replace(track, clips=tuple(clips)))
     return replace(timeline, tracks=TrackListData(tuple(tracks)), duration=end - start + leading_seconds)
+
+
+def _context_frame_count(seconds, available_frames):
+    wanted = min(max(0, round(seconds * 24)), max(0, int(available_frames)))
+    if wanted < 5:
+        return 0
+    return 5 + 17 * ((wanted - 5) // 17)
+
+
+def _lock_context_prefix(latent, previous_images, previous_audio, video_vae, audio_vae,
+                         context_frames, width, height):
+    video, audio = (stream.clone() for stream in latent["samples"].unbind())
+    tail = previous_images[-context_frames:, ..., :3]
+    if tail.shape[1] != height or tail.shape[2] != width:
+        tail = resize_h3_image(tail, width, height, "disabled")
+    tail_latent = video_vae.encode(tail).to(device=video.device, dtype=video.dtype)
+    video_steps = min(tail_latent.shape[2], video.shape[2] - 1)
+    video[:, :, :video_steps] = tail_latent[:, :, :video_steps]
+    video_mask = torch.ones_like(video)
+    video_mask[:, :, :video_steps] = 0
+    for offset, weight in enumerate((0.55, 0.34, 0.16)):
+        step = video_steps + offset
+        if step >= video.shape[2]:
+            break
+        video[:, :, step] = video[:, :, step] * (1.0 - weight) + video[:, :, step - 1] * weight
+
+    audio_mask = torch.ones_like(audio)
+    if previous_audio is not None:
+        sample_rate = int(previous_audio["sample_rate"])
+        audio_samples = max(1, round((context_frames / 24.0) * sample_rate))
+        tail_audio = {**previous_audio, "waveform": previous_audio["waveform"][..., -audio_samples:]}
+        audio_latent, _ = NativeRef2VA._encode_ref_audio(audio_vae, tail_audio)
+        audio_latent = audio_latent.to(device=audio.device, dtype=audio.dtype)
+        audio_steps = min(audio_latent.shape[-1], audio.shape[-1] - 1)
+        audio[..., :audio_steps] = audio_latent[..., :audio_steps]
+        audio_mask[..., :audio_steps] = 0
+
+    out = dict(latent)
+    out["samples"] = comfy.nested_tensor.NestedTensor((video, audio))
+    out["noise_mask"] = comfy.nested_tensor.NestedTensor((video_mask, audio_mask))
+    return out
 
 
 def _persistent_state(timeline, start):
@@ -93,38 +148,28 @@ def _motion_references(timeline, first_video_number):
     return references, " ".join(instructions)
 
 
-def _compile_generation_segment(generation_job, segment_index, has_previous_segment):
+def _compile_generation_segment(generation_job, segment_index, context_frames=0):
     ranges = _segment_ranges(generation_job.timeline)
     if segment_index < 0 or segment_index >= len(ranges):
         raise ValueError(f"分段编号超出范围：{segment_index}")
     start, end = ranges[segment_index]
     
-    timeline = _segment_timeline(generation_job.timeline, start, end, leading_seconds=0.0)
+    timeline = _segment_timeline(generation_job.timeline, start, end, leading_seconds=context_frames / 24.0)
     state = _persistent_state(generation_job.timeline, start)
-    first_video_number = 2 if has_previous_segment else 1
-    motion_references, motion_instructions = _motion_references(timeline, first_video_number)
-    
-    continuity_instruction = ""
-    if has_previous_segment:
-        continuity_instruction = _sentence(
-            "Seamlessly continue the motion, posture, lighting, and camera velocity from <Video 1>. "
-            "Execute the segment's actions starting immediately from 0.00 seconds without pause or replay"
-        )
-    
-    total_videos = len(motion_references) + (1 if has_previous_segment else 0)
-    if total_videos > 3:
-        raise ValueError("单个生成片段最多支持 3 段参考视频；后续片段需为连续性视频保留 1 个位置，因此最多连接 2 个动作参考视频")
+    motion_references, motion_instructions = _motion_references(timeline, 1)
+    if len(motion_references) > 3:
+        raise ValueError("单个生成片段最多支持 3 段动作参考视频")
         
-    additional = " ".join(filter(_text, (state, continuity_instruction)))
     compiled = MiniMaxH3FinalPrompt.execute(
         timeline, 
         generation_job.megapixels, 
         generation_job.aspect_ratio,
         prompt_format="Ref", 
-        additional_instructions=additional, 
+        additional_instructions=state,
         motion_instructions=motion_instructions,
-        empty_sections=generation_job.empty_sections, 
-        continuity_keyframe=has_previous_segment
+        empty_sections=generation_job.empty_sections,
+        continuity_keyframe=False,
+        suppress_initial_state=context_frames > 0
     )[0]
     return compiled, motion_references
 
@@ -153,20 +198,19 @@ class MiniMaxH3GenerationJob(io.ComfyNode):
             io.Float.Input("denoise", display_name="降噪强度", default=1.0, min=0.0, max=1.0, step=0.01),
             io.Combo.Input("ref_image_size", display_name="参考媒体尺寸", options=["match", "max"], default="match"),
             io.Combo.Input("empty_sections", display_name="空节处理", options=EMPTY_SECTION_OPTIONS, default="不输出"),
-            io.Float.Input("continuity_seconds", display_name="连续性参考长度（秒）", default=2.0, min=0.25, max=15.0, step=0.25),
-            io.Float.Input("overlap_seconds", display_name="重叠匹配长度（秒）", default=0.5, min=0.1, max=2.0, step=0.05)],
+            io.Float.Input("continuity_seconds", display_name="段间引导长度（秒）", default=0.92, min=0.21, max=2.33, step=0.01)],
             outputs=[H3_GENERATION_JOB.Output(display_name="generation_job")])
 
     @classmethod
     def execute(cls, timeline, megapixels, aspect_ratio, seed, scheduler, steps, denoise, ref_image_size,
-                continuity_seconds, overlap_seconds, empty_sections="不输出"):
+                continuity_seconds, empty_sections="不输出"):
         if not isinstance(timeline, TimelineData):
             raise TypeError("生成任务包需要 MiniMax H3 时间轴")
         empty_sections = _empty_sections_mode(empty_sections)
         _validate_timeline(timeline)
         _segment_ranges(timeline)
         return io.NodeOutput(GenerationJobData(timeline, megapixels, aspect_ratio, seed, scheduler, steps, denoise,
-            ref_image_size, continuity_seconds, overlap_seconds, empty_sections))
+            ref_image_size, continuity_seconds, empty_sections))
 
 
 class MiniMaxH3SegmentConditioning(io.ComfyNode):
@@ -175,36 +219,35 @@ class MiniMaxH3SegmentConditioning(io.ComfyNode):
         return io.Schema(node_id="MiniMaxH3SegmentConditioning", display_name="MiniMax H3 分段条件（内部）",
             category=f"{CATEGORY}/内部", inputs=[io.Clip.Input("clip"), io.Vae.Input("video_vae"),
             io.Vae.Input("audio_vae"), H3_GENERATION_JOB.Input("generation_job"), io.Int.Input("segment_index"),
-            io.Image.Input("previous_tail_video", optional=True)],
-            outputs=[io.Conditioning.Output(display_name="positive"), io.Latent.Output()])
+            io.Image.Input("previous_images", optional=True), io.Audio.Input("previous_audio", optional=True)],
+            outputs=[io.Conditioning.Output(display_name="positive"), io.Latent.Output(),
+                io.Int.Output(display_name="context_frames")])
 
     @classmethod
-    def execute(cls, clip, video_vae, audio_vae, generation_job, segment_index, previous_tail_video=None):
-        compiled, motion_references = _compile_generation_segment(generation_job, segment_index,
-            previous_tail_video is not None)
+    def execute(cls, clip, video_vae, audio_vae, generation_job, segment_index, previous_images=None, previous_audio=None):
+        context_frames = _context_frame_count(generation_job.continuity_seconds,
+            previous_images.shape[0] if previous_images is not None else 0)
+        compiled, motion_references = _compile_generation_segment(generation_job, segment_index, context_frames)
         settings = compiled.video_settings
         ref_videos = {}
         ref_video_audios = {}
         ref_images = {f"ref_image_{index}": item.image for index, item in enumerate(compiled.references)}
-        video_index = 0
-        if previous_tail_video is not None:
-            tail_video = (_match_reference_video(previous_tail_video, settings.width, settings.height)
-                if generation_job.ref_image_size == "match" else previous_tail_video)
-            ref_videos["ref_video_0"] = tail_video
-            ref_images[f"ref_image_{len(compiled.references)}"] = tail_video[-1:]
-            video_index = 1
-        for reference in motion_references:
+        for video_index, reference in enumerate(motion_references):
             frames = (_match_reference_video(reference.frames, settings.width, settings.height)
                 if generation_job.ref_image_size == "match" else reference.frames)
             ref_videos[f"ref_video_{video_index}"] = frames
             if reference.audio is not None:
                 ref_video_audios[f"ref_video_audio_{video_index}"] = reference.audio
-            video_index += 1
-        return NativeRef2VA.execute(clip=clip, vae=video_vae, audio_vae=audio_vae, prompt=compiled.text,
+        native = NativeRef2VA.execute(clip=clip, vae=video_vae, audio_vae=audio_vae, prompt=compiled.text,
             width=settings.width, height=settings.height, length=settings.length,
             ref_image_size=generation_job.ref_image_size,
             ref_images=ref_images,
             ref_videos=ref_videos, ref_video_audios=ref_video_audios)
+        positive, latent = native[0], native[1]
+        if context_frames:
+            latent = _lock_context_prefix(latent, previous_images, previous_audio, video_vae, audio_vae,
+                context_frames, settings.width, settings.height)
+        return io.NodeOutput(positive, latent, context_frames)
 
 
 def _draw_picture_label(tensor_image, label_text):
@@ -220,35 +263,6 @@ def _draw_picture_label(tensor_image, label_text):
     draw.rectangle((bbox[0] - 6, bbox[1] - 6, bbox[2] + 6, bbox[3] + 6), fill=(0, 0, 0, 210), outline=(255, 215, 0), width=2)
     draw.text((12, 12), label_text, fill=(255, 255, 255), font=font)
     return TF.to_tensor(pil_img).permute(1, 2, 0).unsqueeze(0)
-
-
-def _create_placeholder_image(width, height, title, subtitle):
-    img = Image.new("RGB", (width, height), color=(25, 28, 36))
-    draw = ImageDraw.Draw(img)
-    draw.rectangle([8, 8, width - 9, height - 9], outline=(70, 80, 100), width=2)
-    draw.line([(0, 0), (width, height)], fill=(40, 45, 60), width=1)
-    draw.line([(0, height), (width, 0)], fill=(40, 45, 60), width=1)
-    
-    font_title_size = max(22, int(height * 0.055))
-    font_sub_size = max(14, int(height * 0.035))
-    try:
-        font_t = ImageFont.truetype("arial.ttf", font_title_size)
-        font_s = ImageFont.truetype("arial.ttf", font_sub_size)
-    except Exception:
-        font_t = ImageFont.load_default()
-        font_s = font_t
-        
-    t_box = draw.textbbox((0, 0), title, font=font_t)
-    s_box = draw.textbbox((0, 0), subtitle, font=font_s)
-    
-    t_x, t_y = (width - (t_box[2] - t_box[0])) // 2, height // 2 - 30
-    s_x, s_y = (width - (s_box[2] - s_box[0])) // 2, height // 2 + 15
-    
-    draw.rectangle([min(t_x, s_x) - 16, t_y - 12, max(t_x + t_box[2], s_x + s_box[2]) + 16, s_y + s_box[3] + 12],
-                   fill=(15, 18, 22), outline=(0, 200, 255), width=2)
-    draw.text((t_x, t_y), title, fill=(0, 220, 255), font=font_t)
-    draw.text((s_x, s_y), subtitle, fill=(180, 190, 205), font=font_s)
-    return TF.to_tensor(img).permute(1, 2, 0).unsqueeze(0)
 
 
 class MiniMaxH3PromptPreview(io.ComfyNode):
@@ -278,8 +292,10 @@ class MiniMaxH3PromptPreview(io.ComfyNode):
         seen_numbers = set()
 
         for index, (start, end) in enumerate(ranges):
-            has_previous = index > 0
-            compiled, motion_references = _compile_generation_segment(generation_job, index, has_previous)
+            available = round((ranges[index - 1][1] - ranges[index - 1][0]) * 24) if index else 0
+            context_frames = _context_frame_count(generation_job.continuity_seconds, available)
+            compiled, motion_references = _compile_generation_segment(generation_job, index, context_frames)
+            rendered = _segment_result(generation_job.timeline, start, end)
             settings = compiled.video_settings
             
             # 1. 静态参考图输出
@@ -289,40 +305,27 @@ class MiniMaxH3PromptPreview(io.ComfyNode):
                     label = f"<Picture {ref_item.picture_number}>: {ref_item.role}"
                     labeled_images.append(_draw_picture_label(ref_item.image, label))
 
-            # 2. 动态尾帧占位图
-            continuity_pic_num = len(compiled.references) + 1
-            if has_previous and continuity_pic_num not in seen_numbers:
-                seen_numbers.add(continuity_pic_num)
-                placeholder = _create_placeholder_image(
-                    width=settings.width,
-                    height=settings.height,
-                    title=f"<Picture {continuity_pic_num}>: Dynamic Opening Frame",
-                    subtitle="[Auto-captured from previous segment tail at runtime]"
-                )
-                labeled_images.append(placeholder)
-
-            # 3. 文本清单
+            # 2. 媒体与段间引导清单
             references = []
             for ref_item in compiled.references:
                 references.append(f"<Picture {ref_item.picture_number}> = [{ref_item.role}] ({ref_item.usage or 'Default'})")
-            if has_previous:
-                references.append("<Video 1> = 上一片段尾部连续性视频")
-                references.append(f"<Picture {continuity_pic_num}> = 上一片段尾帧（运行时自动填入）")
-                
-            first_motion_number = 2 if has_previous else 1
             references.extend(
-                f"<Video {first_motion_number + offset}> = 当前片段动作参考视频 {offset + 1}"
+                f"<Video {1 + offset}> = 当前片段动作参考视频 {offset + 1}"
                 for offset in range(len(motion_references))
             )
+            if context_frames:
+                references.insert(0,
+                    f"段间引导 = 硬锁定上一片段末尾 {context_frames} 帧及对应音频（不占用参考视频槽位）")
             
-            header = [
-                f"========== 片段 {index + 1}/{len(ranges)} ==========",
-                f"时间轴范围：{_time(start)}–{_time(end)} 秒 | 生成时长：{_time(end - start)} 秒",
-                "【媒体绑定清单】：",
+            header = [f"========== 片段 {index + 1}/{len(ranges)} ==========",
+                f"时间轴范围：{_time(start)}–{_time(end)} 秒 | 输出时长：{_time(end - start)} 秒"]
+            if rendered:
+                header.append(f"生成方式：使用已生成结果（版本 {rendered[1]}），跳过模型采样")
+            header.extend(["【媒体绑定清单】：",
                 *(references or ["参考媒体：无"]),
                 "",
                 compiled.text
-            ]
+            ])
             sections.append("\n".join(header))
 
         preview_text = "\n\n".join(sections)

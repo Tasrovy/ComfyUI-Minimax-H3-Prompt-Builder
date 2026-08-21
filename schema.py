@@ -121,6 +121,8 @@ class TimelineClipData:
     target: ActorInstanceData | None = None
     audio_type: str = ""
     motion_reference: MotionReferenceData | None = None
+    rendered_video: object | None = None
+    rendered_video_version: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,7 +175,6 @@ class GenerationJobData:
     denoise: float
     ref_image_size: str
     continuity_seconds: float
-    overlap_seconds: float
     empty_sections: str
 
 

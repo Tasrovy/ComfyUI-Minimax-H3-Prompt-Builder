@@ -3,7 +3,7 @@ import { app } from "/scripts/app.js";
 import { ComfyWidgets } from "/scripts/widgets.js";
 
 const STAGE_LABELS = {
-    conditioning: "准备提示词与参考素材",
+    conditioning: "准备提示词、参考素材与段间引导",
     noise: "准备噪声",
     guider: "准备引导器",
     scheduler: "准备采样计划",
@@ -11,8 +11,12 @@ const STAGE_LABELS = {
     video_decode: "解码画面",
     audio_decode: "解码声音",
     trim: "裁切片段",
-    continuity: "提取连续性尾部",
-    join: "重叠匹配与拼接",
+    result_prepare: "整理已生成结果（跳过采样）",
+    segment_video: "封装当前片段",
+    checkpoint: "保存当前片段",
+    cache_load: "读取已完成片段",
+    components: "读取片段音视频",
+    join: "连续片段拼接",
     final_video: "封装最终视频",
 };
 
@@ -25,7 +29,11 @@ const STAGE_PROGRESS = {
     video_decode: 0.88,
     audio_decode: 0.92,
     trim: 0.95,
-    continuity: 0.97,
+    result_prepare: 0.95,
+    segment_video: 0.96,
+    checkpoint: 0.97,
+    cache_load: 0.97,
+    components: 0.98,
     join: 0.99,
     final_video: 1.0,
 };
@@ -33,7 +41,7 @@ const STAGE_PROGRESS = {
 const STAGE_ORDER = Object.keys(STAGE_LABELS);
 
 function parseStage(nodeId) {
-    const match = String(nodeId).match(/segment_(\d+)_of_(\d+)_(conditioning|noise|guider|scheduler|sampling|video_decode|audio_decode|trim|continuity|join|final_video)$/);
+    const match = String(nodeId).match(/segment_(\d+)_of_(\d+)_(conditioning|noise|guider|scheduler|sampling|video_decode|audio_decode|trim|result_prepare|segment_video|checkpoint|cache_load|components|join|final_video)$/);
     return match ? { segment: Number(match[1]), total: Number(match[2]), stage: match[3] } : null;
 }
 
@@ -199,8 +207,11 @@ app.registerExtension({
             this.segmentProgressWidget.inputEl.placeholder = "执行后显示每一步的进度和耗时";
             this.segmentProgressWidget.serializeValue = async () => "";
             this.segmentProgressWidget.value = "等待执行";
+            this.addWidget("button", "停止生成并保留已完成片段", null, () => {
+                void api.interrupt();
+            });
             resetTiming(this);
-            this.setSize([Math.max(this.size[0], 560), Math.max(this.size[1], 400)]);
+            this.setSize([Math.max(this.size[0], 640), Math.max(this.size[1], 520)]);
         };
     },
 });

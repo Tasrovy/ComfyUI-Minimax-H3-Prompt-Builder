@@ -1,10 +1,13 @@
+from dataclasses import replace
+
 import torch
 
 from comfy_api.latest import io
 
 from .schema import (ACTOR_KINDS, CATEGORY, FPS, H3_ACTOR_INSTANCE, H3_ENVIRONMENT_INSTANCE,
     H3_LANGUAGE, H3_MOTION_REFERENCE, H3_TIMELINE_CLIP, H3_TIMELINE_TRACK, H3_TRACK_LIST,
-    SYSTEM_KINDS, MotionReferenceData, TimelineClipData, TimelineTrackData, TrackListData)
+    SYSTEM_KINDS, ActorInstanceData, LanguageData, MotionReferenceData, TimelineClipData,
+    TimelineTrackData, TrackListData)
 from .utils import _autogrow, _sentence, _text, _values
 
 
@@ -73,6 +76,24 @@ class MiniMaxH3Action(io.ComfyNode):
             raise TypeError("动作参考必须来自 MiniMax H3 动作参考视频节点")
         return io.NodeOutput(TimelineClipData(action_type, start_time, end_time, _text(content), _sentence(quality),
             _sentence(result), language, _text(delivery), speech_type, target, "", motion_reference))
+
+
+class MiniMaxH3ActionResult(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(node_id="MiniMaxH3ActionResult", display_name="MiniMax H3 动作片段结果扩展（Use Result）",
+            category=CATEGORY, description="给动作片段绑定已经生成的视频；命中该片段时跳过模型采样。",
+            inputs=[H3_TIMELINE_CLIP.Input("clip", display_name="动作片段"),
+                io.Video.Input("video", display_name="已生成结果"),
+                io.Int.Input("result_version", display_name="结果版本", default=0, min=0, max=1000000,
+                    tooltip="替换输入视频后递增此值，使当前片段及后续连续片段不再复用旧缓存。")],
+            outputs=[H3_TIMELINE_CLIP.Output(display_name="clip")])
+
+    @classmethod
+    def execute(cls, clip, video, result_version):
+        if not isinstance(clip, TimelineClipData) or clip.kind not in ACTOR_KINDS:
+            raise TypeError("动作片段结果扩展只能连接人物动作片段")
+        return io.NodeOutput(replace(clip, rendered_video=video, rendered_video_version=int(result_version)))
 
 
 class MiniMaxH3Camera(io.ComfyNode):
