@@ -115,7 +115,7 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
     def execute(cls, timeline, megapixels, aspect_ratio, prompt_format="Ref", first_frame=None, last_frame=None,
                 additional_instructions="", motion_instructions="", empty_sections="不输出", continuity_keyframe=False,
                 suppress_initial_state=False, generation_duration=None, motion_definitions="",
-                motion_retentions="", motion_summary=""):
+                motion_retentions="", motion_summary="", suppress_actor_state_ids=()):
         if not isinstance(timeline, TimelineData):
             raise TypeError("Timeline compiler requires TimelineData")
         _validate_timeline(timeline)
@@ -157,8 +157,10 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
                 character_lines.append(_sentence(identity))
                 
             if not suppress_initial_state:
-                character_lines.extend(filter(_text, (_actor_state(label, card.default_position, actor.position_override),
-                    _actor_state(label, card.default_pose, actor.pose_override), _actor_state(label, card.default_emotion, actor.emotion_override),
+                use_defaults = id(actor) not in suppress_actor_state_ids
+                character_lines.extend(filter(_text, (_actor_state(label, card.default_position if use_defaults else "", actor.position_override),
+                    _actor_state(label, card.default_pose if use_defaults else "", actor.pose_override),
+                    _actor_state(label, card.default_emotion if use_defaults else "", actor.emotion_override),
                     _actor_state(label, card.default_appearance, actor.appearance_override))))
                     
             if card.character_style:

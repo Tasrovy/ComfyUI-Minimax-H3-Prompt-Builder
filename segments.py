@@ -13,7 +13,7 @@ from comfy_extras.nodes_minimax_h3 import (MiniMaxH3ReferenceToVideo as NativeRe
 from .schema import (ASPECT_RATIOS, CATEGORY, EMPTY_SECTION_MODES, EMPTY_SECTION_OPTIONS, FPS,
     H3_GENERATION_JOB, H3_TIMELINE, GenerationJobData, TimelineData, TrackListData)
 from .timeline import MiniMaxH3FinalPrompt, _validate_timeline
-from .utils import _match_reference_video, _sentence, _text, _time
+from .utils import _match_reference_video, _same_image, _sentence, _text, _time
 
 
 def _segment_ranges(timeline):
@@ -249,12 +249,22 @@ def _align_motion_context(timeline, previous_timeline, references, context_frame
     return aligned
 
 
-def _motion_references(timeline, first_video_number, has_context=False):
+def _reference_subject_count(timeline):
+    references = [actor.card.reference for actor in timeline.characters.actors]
+    references.extend((timeline.style.reference, timeline.environment.card.reference))
+    unique = []
+    for reference in filter(None, references):
+        if not any(_same_image(reference.image, item.image) for item in unique):
+            unique.append(reference)
+    return len(unique)
+
+
+def _motion_references(timeline, first_video_number, first_subject_number, has_context=False):
     role_text = {
-        "仅动作": "body motion",
-        "动作与镜头": "body motion and camera behavior",
-        "完整表演": "performance and camera behavior",
-        "动作与声音": "performance and synchronized sound",
+        "仅动作": ("body motion", False),
+        "动作与镜头": ("body motion", True),
+        "完整表演": ("complete performance", True),
+        "动作与声音": ("performance", False),
     }
     labels = {id(actor): f"{actor.card.name} (S{index})" for index, actor in enumerate(timeline.characters.actors, 1)}
     references = []
@@ -262,8 +272,10 @@ def _motion_references(timeline, first_video_number, has_context=False):
     definitions = []
     retentions = []
     summary_labels = []
+    camera_labels = []
     video_number = first_video_number
     audio_number = 1
+    subject_number = first_subject_number
     for track in timeline.tracks.tracks:
         if track.owner_kind != "actor":
             continue
@@ -272,19 +284,26 @@ def _motion_references(timeline, first_video_number, has_context=False):
             if reference is None or not _text(clip.content):
                 continue
             owner = labels.get(id(track.owner), "the character")
-            responsibility = role_text[reference.role]
+            responsibility, uses_camera = role_text[reference.role]
             if has_context:
-                definition = f"<Video {video_number}> is {owner}'s shot-aligned reference for continuity followed by {responsibility}."
-                line = (f"Use <Video {video_number}> to continue the preceding motion, then reproduce {owner}'s current "
+                subject_definition = (f"<Subject {subject_number}> is {owner}'s motion sequence derived from <Video {video_number}>, "
+                    f"beginning with continuity and followed by the current {responsibility}.")
+                line = (f"Transfer <Subject {subject_number}> to {owner}: continue the preceding motion, then reproduce the current "
                     f"{responsibility} in the supplied order. Preserve {owner}'s declared identity, clothing, and scene.")
             else:
-                definition = f"<Video {video_number}> is {owner}'s shot-aligned reference for {responsibility}."
-                line = (f"Use <Video {video_number}> as {owner}'s {responsibility} reference. Preserve its complete order, "
+                subject_definition = f"<Subject {subject_number}> is {owner}'s {responsibility} derived from <Video {video_number}>."
+                line = (f"Transfer <Subject {subject_number}> to {owner}. Preserve its complete order, "
                     f"timing, and final pose while rendering {owner}'s declared identity, clothing, and scene.")
-            definitions.append(definition)
-            retentions.append(f"<Video {video_number}> (action reference in [Shot 1]): attribute_transfer - "
-                f"Transfer its aligned motion and timing to {owner}.")
-            summary_labels.append(f"<Video {video_number}>")
+            definitions.append(subject_definition)
+            retentions.append(f"<Subject {subject_number}> (appears in [Shot 1]): attribute_transfer - "
+                f"Transfer its aligned performance and timing to {owner}.")
+            summary_labels.append(f"<Subject {subject_number}>")
+            if uses_camera:
+                definitions.append(f"<Video {video_number}> provides the camera behavior and temporal structure for [Shot 1].")
+                retentions.append(f"<Video {video_number}> (camera and temporal structure in [Shot 1]): partially_preserved - "
+                    "Preserve its camera behavior and temporal order.")
+                line += f" Follow <Video {video_number}>'s camera behavior and temporal structure."
+                camera_labels.append(f"<Video {video_number}>")
             if reference.audio is not None:
                 line += f" Use its synchronized <Audio {audio_number}>."
                 definitions.append(f"<Audio {audio_number}> is the synchronized sound reference paired with <Video {video_number}>.")
@@ -293,7 +312,10 @@ def _motion_references(timeline, first_video_number, has_context=False):
             instructions.append(_sentence(line))
             references.append(reference)
             video_number += 1
+            subject_number += 1
     summary = "" if not summary_labels else f"The action is guided by {' and '.join(summary_labels)}."
+    if camera_labels:
+        summary += f" The camera and temporal structure are guided by {' and '.join(camera_labels)}."
     return references, " ".join(instructions), "\n".join(definitions), "\n".join(retentions), summary
 
 
@@ -309,7 +331,9 @@ def _compile_generation_segment(generation_job, segment_index, context_frames=0,
         if segment_index else None)
     state = _persistent_state(generation_job.timeline, start)
     motion_references, motion_instructions, motion_definitions, motion_retentions, motion_summary = _motion_references(
-        timeline, 1, context_frames > 0)
+        timeline, 1, _reference_subject_count(timeline) + 1, context_frames > 0)
+    full_performance_actors = {id(track.owner) for track in timeline.tracks.tracks if track.owner_kind == "actor"
+        for clip in track.clips if clip.motion_reference is not None and clip.motion_reference.role == "完整表演"}
     if len(motion_references) > 3:
         raise ValueError("单个生成片段最多支持 3 段动作参考视频")
         
@@ -326,6 +350,7 @@ def _compile_generation_segment(generation_job, segment_index, context_frames=0,
         empty_sections=generation_job.empty_sections,
         continuity_keyframe=False,
         suppress_initial_state=context_frames > 0,
+        suppress_actor_state_ids=full_performance_actors,
         generation_duration=timeline.duration + context_frames / FPS
     )[0]
     motion_references = _align_motion_context(timeline, previous_timeline, motion_references, context_frames,

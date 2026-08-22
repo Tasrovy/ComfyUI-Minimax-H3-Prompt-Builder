@@ -45,14 +45,45 @@ assert aligned_clip.motion_reference.motion_duration == 4.0
 assert aligned_clip.motion_reference.audio["waveform"].shape[-1] == round((107 / 24) * 32000)
 aligned_track = s.TimelineTrackData("actor", actor, (aligned_clip,))
 aligned_timeline = s.TimelineData(group, style, env, s.TrackListData((aligned_track,)), 4.0)
-aligned_references, aligned_instructions, aligned_definitions, aligned_retentions, aligned_summary = mod.segments._motion_references(aligned_timeline, 1)
+style_reference = s.StyleCardData("", "", "", "", u._reference(torch.ones_like(image), "visual style"))
+referenced_timeline = s.TimelineData(group, style_reference, env, s.TrackListData((aligned_track,)), 4.0)
+assert mod.segments._reference_subject_count(referenced_timeline) == 2
+aligned_references, aligned_instructions, aligned_definitions, aligned_retentions, aligned_summary = mod.segments._motion_references(
+    aligned_timeline, 1, 2)
 assert len(aligned_references) == 1
-assert "Use <Video 1> as Luluka (S1)'s body motion reference" in aligned_instructions
+assert "Transfer <Subject 2> to Luluka (S1)" in aligned_instructions
 assert "complete order, timing, and final pose" in aligned_instructions
 assert "format padding" not in aligned_instructions
-assert "<Video 1> is Luluka (S1)'s shot-aligned reference for body motion." in aligned_definitions
-assert "<Video 1> (action reference in [Shot 1]): attribute_transfer" in aligned_retentions
-assert aligned_summary == "The action is guided by <Video 1>."
+assert "<Subject 2> is Luluka (S1)'s body motion derived from <Video 1>." in aligned_definitions
+assert "<Subject 2> (appears in [Shot 1]): attribute_transfer" in aligned_retentions
+assert aligned_summary == "The action is guided by <Subject 2>."
+
+full_motion = s.MotionReferenceData(motion_frames, motion_audio, "完整表演", 2.0, 2.0)
+full_clip = mod.MiniMaxH3Action.execute("body", 0.0, 4.0, "follows the complete performance",
+    motion_reference=full_motion)[0]
+full_track = s.TimelineTrackData("actor", actor, (full_clip,))
+full_timeline = s.TimelineData(group, style, env, s.TrackListData((full_track,)), 4.0)
+full_job = s.GenerationJobData(full_timeline, 0.4, "16:9", 0, "simple", 4, 1.0, "match", 0.92, "不输出")
+full_prompt = mod.segments._compile_generation_segment(full_job, 0)[0].text
+assert "stands in the center of the frame" not in full_prompt
+assert "stands naturally" not in full_prompt
+assert "has a calm expression" not in full_prompt
+assert "<Subject 2> is Luluka (S1)'s complete performance derived from <Video 1>." in full_prompt
+assert "<Subject 2> (appears in [Shot 1]): attribute_transfer" in full_prompt
+assert "<Video 1> provides the camera behavior and temporal structure for [Shot 1]." in full_prompt
+assert "<Video 1> (camera and temporal structure in [Shot 1]): partially_preserved" in full_prompt
+assert "The camera and temporal structure are guided by <Video 1>." in full_prompt
+
+overridden_actor = s.ActorInstanceData(card, "starts beside the window", "", "", "")
+overridden_group = s.CharacterGroupData((overridden_actor,))
+overridden_track = s.TimelineTrackData("actor", overridden_actor, (full_clip,))
+overridden_timeline = s.TimelineData(overridden_group, style, env, s.TrackListData((overridden_track,)), 4.0)
+overridden_job = s.GenerationJobData(overridden_timeline, 0.4, "16:9", 0, "simple", 4, 1.0, "match", 0.92,
+    "不输出")
+overridden_prompt = mod.segments._compile_generation_segment(overridden_job, 0)[0].text
+assert "starts beside the window" in overridden_prompt
+assert "stands naturally" not in overridden_prompt
+assert "has a calm expression" not in overridden_prompt
 
 result_components = mod.checkpoints.Types.VideoComponents(torch.zeros(150, 32, 48, 3), Fraction(30),
     {"waveform": torch.zeros(1, 1, 220500), "sample_rate": 44100})
@@ -130,9 +161,9 @@ assert torch.all(segment_reference.audio["waveform"][..., 180000:] == 0)
 assert "1.62" not in compiled_segment.text and "5.62" not in compiled_segment.text
 assert "Generate a continuous single shot." in compiled_segment.text
 assert "The target video is a 4-second" not in compiled_segment.text
-assert "<Video 1> is Luluka (S1)'s shot-aligned reference for continuity followed by body motion." in compiled_segment.text
-assert "continue the preceding motion, then reproduce Luluka (S1)'s current body motion" in compiled_segment.text
-assert "<Video 1> (action reference in [Shot 1]): attribute_transfer" in compiled_segment.text
+assert "<Subject 2> is Luluka (S1)'s motion sequence derived from <Video 1>" in compiled_segment.text
+assert "Transfer <Subject 2> to Luluka (S1): continue the preceding motion" in compiled_segment.text
+assert "<Subject 2> (appears in [Shot 1]): attribute_transfer" in compiled_segment.text
 
 previous_without_reference = s.TimelineClipData("body", 0.0, 4.0, "walks forward", "", "", lang, "",
     "on-screen", None, "", None)
