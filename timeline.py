@@ -272,10 +272,11 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
             if primary is None:
                 primary = next(((track, clip) for track in timeline.tracks.tracks if track.owner_kind == "actor"
                     for clip in track.clips if _text(clip.content)), None)
-            summary = f"{summary_tag} The target video is a {_time(timeline.duration)}-second continuous single shot."
+            summary = (f"{summary_tag} Generate a continuous single shot." if generation_duration is not None else
+                f"{summary_tag} The target video is a {_time(timeline.duration)}-second continuous single shot.")
             if primary is not None:
                 track, clip = primary
-                summary += f" Its main action shows {labels[id(track.owner)]} {_lower_first(_text(clip.content))}."
+                summary += f" Main visible action: {labels[id(track.owner)]} {_lower_first(_text(clip.content))}."
             summary += f" It uses {subject_text} as the referenced content."
             if motion_summary:
                 summary += " " + motion_summary

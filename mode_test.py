@@ -47,10 +47,10 @@ aligned_track = s.TimelineTrackData("actor", actor, (aligned_clip,))
 aligned_timeline = s.TimelineData(group, style, env, s.TrackListData((aligned_track,)), 4.0)
 aligned_references, aligned_instructions, aligned_definitions, aligned_retentions, aligned_summary = mod.segments._motion_references(aligned_timeline, 1)
 assert len(aligned_references) == 1
-assert "Use <Video 1> as Luluka (S1)'s shot-aligned body-action reference" in aligned_instructions
-assert "complete motion order, timing, and final pose" in aligned_instructions
+assert "Use <Video 1> as Luluka (S1)'s body motion reference" in aligned_instructions
+assert "complete order, timing, and final pose" in aligned_instructions
 assert "format padding" not in aligned_instructions
-assert "<Video 1> is Luluka (S1)'s shot-aligned body-action reference." in aligned_definitions
+assert "<Video 1> is Luluka (S1)'s shot-aligned reference for body motion." in aligned_definitions
 assert "<Video 1> (action reference in [Shot 1]): attribute_transfer" in aligned_retentions
 assert aligned_summary == "The action is guided by <Video 1>."
 
@@ -78,7 +78,7 @@ assert "non_diegetic_music" in na
 assert "N/A" in na
 assert "Strict chronological timeline" not in na
 assert "Do not anticipate" not in na
-assert "Its main action shows Luluka (S1) dances." in na
+assert "Main visible action: Luluka (S1) dances." in na
 
 audio_clip = s.TimelineClipData("audio", 0.0, 5.0, "Steady rain ambience", "", "", None, "", "on-screen",
     None, "ambience", None, None, 0)
@@ -128,8 +128,10 @@ assert torch.all(segment_reference.audio["waveform"][..., :52000] == 1)
 assert torch.all(segment_reference.audio["waveform"][..., 52000:180000] == 2)
 assert torch.all(segment_reference.audio["waveform"][..., 180000:] == 0)
 assert "1.62" not in compiled_segment.text and "5.62" not in compiled_segment.text
-assert "The target video is a 4-second continuous single shot." in compiled_segment.text
-assert "<Video 1> is Luluka (S1)'s shot-aligned body-action reference." in compiled_segment.text
+assert "Generate a continuous single shot." in compiled_segment.text
+assert "The target video is a 4-second" not in compiled_segment.text
+assert "<Video 1> is Luluka (S1)'s shot-aligned reference for continuity followed by body motion." in compiled_segment.text
+assert "continue the preceding motion, then reproduce Luluka (S1)'s current body motion" in compiled_segment.text
 assert "<Video 1> (action reference in [Shot 1]): attribute_transfer" in compiled_segment.text
 
 previous_without_reference = s.TimelineClipData("body", 0.0, 4.0, "walks forward", "", "", lang, "",

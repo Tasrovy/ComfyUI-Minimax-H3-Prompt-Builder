@@ -249,12 +249,12 @@ def _align_motion_context(timeline, previous_timeline, references, context_frame
     return aligned
 
 
-def _motion_references(timeline, first_video_number):
+def _motion_references(timeline, first_video_number, has_context=False):
     role_text = {
-        "仅动作": "body-action reference",
-        "动作与镜头": "body-action and camera reference",
-        "完整表演": "performance and camera reference",
-        "动作与声音": "body-action and performance-timing reference",
+        "仅动作": "body motion",
+        "动作与镜头": "body motion and camera behavior",
+        "完整表演": "performance and camera behavior",
+        "动作与声音": "performance and synchronized sound",
     }
     labels = {id(actor): f"{actor.card.name} (S{index})" for index, actor in enumerate(timeline.characters.actors, 1)}
     references = []
@@ -272,9 +272,16 @@ def _motion_references(timeline, first_video_number):
             if reference is None or not _text(clip.content):
                 continue
             owner = labels.get(id(track.owner), "the character")
-            line = (f"Use <Video {video_number}> as {owner}'s shot-aligned {role_text[reference.role]}. Preserve its "
-                f"complete motion order, timing, and final pose while rendering {owner}'s declared identity, clothing, and scene.")
-            definitions.append(f"<Video {video_number}> is {owner}'s shot-aligned {role_text[reference.role]}.")
+            responsibility = role_text[reference.role]
+            if has_context:
+                definition = f"<Video {video_number}> is {owner}'s shot-aligned reference for continuity followed by {responsibility}."
+                line = (f"Use <Video {video_number}> to continue the preceding motion, then reproduce {owner}'s current "
+                    f"{responsibility} in the supplied order. Preserve {owner}'s declared identity, clothing, and scene.")
+            else:
+                definition = f"<Video {video_number}> is {owner}'s shot-aligned reference for {responsibility}."
+                line = (f"Use <Video {video_number}> as {owner}'s {responsibility} reference. Preserve its complete order, "
+                    f"timing, and final pose while rendering {owner}'s declared identity, clothing, and scene.")
+            definitions.append(definition)
             retentions.append(f"<Video {video_number}> (action reference in [Shot 1]): attribute_transfer - "
                 f"Transfer its aligned motion and timing to {owner}.")
             summary_labels.append(f"<Video {video_number}>")
@@ -301,7 +308,8 @@ def _compile_generation_segment(generation_job, segment_index, context_frames=0,
     previous_timeline = (_segment_timeline(generation_job.timeline, *ranges[segment_index - 1])
         if segment_index else None)
     state = _persistent_state(generation_job.timeline, start)
-    motion_references, motion_instructions, motion_definitions, motion_retentions, motion_summary = _motion_references(timeline, 1)
+    motion_references, motion_instructions, motion_definitions, motion_retentions, motion_summary = _motion_references(
+        timeline, 1, context_frames > 0)
     if len(motion_references) > 3:
         raise ValueError("单个生成片段最多支持 3 段动作参考视频")
         
