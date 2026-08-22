@@ -56,7 +56,7 @@ def _validate_timeline(timeline):
                 raise ValueError(f"Timeline conflict: {owner[0]} {kind} clips overlap")
 
 
-def _render_clip(track, clip, labels):
+def _render_clip(track, clip, labels, timeline_duration):
     content = _text(clip.content)
     quality = clip.quality
     end_state = clip.result
@@ -91,11 +91,11 @@ def _render_clip(track, clip, labels):
     if quality:
         parts.append(quality)
     if end_state:
-        state_name = "post-speech state" if clip.kind == "speech" else f"{clip.kind} state"
-        parts.append(_sentence(f"At {_time(clip.end_time)} seconds, {end_state} This resulting {state_name} persists until the next {clip.kind} action"))
+        parts.append(_sentence(f"Afterward, {end_state}"))
     if not parts:
         return ""
-    prefix = f"From {_time(clip.start_time)} to {_time(clip.end_time)} seconds, " if content else ""
+    covers_shot = clip.start_time <= 1e-6 and clip.end_time >= timeline_duration - 1e-6
+    prefix = "" if covers_shot or not content else f"From {_time(clip.start_time)} to {_time(clip.end_time)} seconds, "
     return prefix + " ".join(parts)
 
 
@@ -149,7 +149,8 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
             if prompt_format == "Ref":
                 number = add_reference(card.reference,
                     f"<Subject {{number}}> is {card.name}, whose identity and appearance come from <Picture {{number}}>. {card.name} is {_lower_first(description)}",
-                    "fully_preserved", card.preservation)
+                    "fully_preserved", card.preservation or
+                    "Preserve identity and appearance while allowing new pose and framing.")
             identity = f"{label} is <Subject {number}>" if number else (f"{label} is {_lower_first(description)}" if description else "")
             if identity:
                 character_lines.append(_sentence(identity))
@@ -168,10 +169,12 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
         if prompt_format == "Ref":
             style_number = add_reference(timeline.style.reference,
                 "<Subject {number}> is the visual style derived from <Picture {number}>.", "partially_preserved",
-                timeline.style.reference.usage if timeline.style.reference else "")
+                (timeline.style.reference.usage or "Use its visual style without preserving its subjects or composition.")
+                if timeline.style.reference else "")
             environment_number = add_reference(timeline.environment.card.reference,
-                f"<Subject {{number}}> is the {timeline.environment.card.name} environment and spatial layout derived from <Picture {{number}}>.",
-                "partially_preserved", timeline.environment.card.preservation)
+                f"<Subject {{number}}> is the {timeline.environment.card.name} environment derived from <Picture {{number}}>.",
+                "partially_preserved", timeline.environment.card.preservation or
+                "Preserve the recognizable environment while allowing new framing and subject placement.")
         if prompt_format == "Ref" and not references:
             raise ValueError("Ref mode requires at least one character, style, or environment reference image")
 
@@ -189,39 +192,32 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
         continuous_events, timed_events, soundscape, music = [], [], [], []
         for track_index, track in enumerate(timeline.tracks.tracks):
             for clip_index, clip in enumerate(track.clips):
-                rendered = _render_clip(track, clip, labels)
+                if clip.kind == "audio" and _text(clip.content):
+                    covers_shot = clip.start_time <= 1e-6 and clip.end_time >= timeline.duration - 1e-6
+                    timed = (_sentence(clip.content) if covers_shot else
+                        f"From {_time(clip.start_time)} to {_time(clip.end_time)} seconds, {_sentence(clip.content)}")
+                    (music if clip.audio_type == "music" else soundscape).append(timed)
+                    continue
+                rendered = _render_clip(track, clip, labels, timeline.duration)
                 event = (clip.start_time, clip.end_time, track_index, clip_index, track, rendered)
                 if track.owner_kind != "actor" and clip.start_time <= 1e-6 and clip.end_time >= timeline.duration - 1e-6:
                     continuous_events.append(event)
                 else:
                     timed_events.append(event)
-                if clip.kind == "audio" and _text(clip.content):
-                    timed = f"From {_time(clip.start_time)} to {_time(clip.end_time)} seconds, {_sentence(clip.content)}"
-                    (music if clip.audio_type == "music" else soundscape).append(timed)
         continuous_events.sort(key=lambda item: (item[2], item[3]))
-        timed_events.sort(key=lambda item: (item[0], item[2], item[3]))
+        owner_priority = {"actor": 0, "environment": 1, "camera": 2, "lighting": 3}
+        timed_events.sort(key=lambda item: (item[0], owner_priority.get(item[4].owner_kind, 4), item[2], item[3]))
         timeline_lines = []
-        actor_steps = {}
         actor_end_times = {}
         for start_time, end_time, _, _, track, rendered in timed_events:
+            if not _text(rendered):
+                continue
+            if track.owner_kind == "actor" and id(track.owner) in actor_end_times:
+                relation = "Then, " if start_time >= actor_end_times[id(track.owner)] - 1e-6 else "Meanwhile, "
+                rendered = relation + _lower_first(rendered)
             if track.owner_kind == "actor":
-                owner = id(track.owner)
-                step = actor_steps.get(owner, 0)
-                if step == 0:
-                    marker = f"For {labels[owner]}, first"
-                elif start_time >= actor_end_times[owner] - 1e-6:
-                    marker = f"For {labels[owner]}, then, only after the preceding action has ended"
-                else:
-                    marker = f"For {labels[owner]}, meanwhile at {_time(start_time)} seconds"
-                actor_steps[owner] = step + 1
-                actor_end_times[owner] = max(end_time, actor_end_times.get(owner, end_time))
-            else:
-                marker = f"At {_time(start_time)} seconds"
-            timeline_lines.append(f"{marker}: {rendered}")
-        order_rule = (
-            "The timeline order is mandatory. Do not anticipate, swap, or perform any later action before its stated start time. "
-            "Actions marked 'then' begin only after the preceding action has completely ended."
-        )
+                actor_end_times[id(track.owner)] = max(end_time, actor_end_times.get(id(track.owner), end_time))
+            timeline_lines.append(rendered)
         continuity_number = len(references) + 1 if continuity_keyframe else None
         continuity_parts = []
         if continuity_keyframe:
@@ -231,9 +227,9 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
                 _sentence(f"At 0.00 seconds the frame is exactly <Picture {continuity_number}> without reinterpretation.")])
         if empty_sections == "输出 N/A":
             detailed_parts = [*continuity_parts, "[Shot 1]", *style_parts, *environment_parts, *character_lines,
-                "Strict chronological timeline:", order_rule, *timeline_lines]
+                *timeline_lines]
             if continuous_events:
-                detailed_parts.extend(["Continuous non-character controls:", *(item[5] for item in continuous_events)])
+                detailed_parts.extend(item[5] for item in continuous_events)
             if additional_instructions:
                 detailed_parts.append(_sentence(additional_instructions))
             if motion_instructions:
@@ -242,9 +238,9 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
         else:
             body_parts = [*continuity_parts, *style_parts, *environment_parts, *character_lines]
             if timeline_lines:
-                body_parts.extend(["Strict chronological timeline:", order_rule, *timeline_lines])
+                body_parts.extend(timeline_lines)
             if continuous_events:
-                body_parts.extend(["Continuous non-character controls:", *(item[5] for item in continuous_events)])
+                body_parts.extend(item[5] for item in continuous_events)
             if additional_instructions:
                 body_parts.append(_sentence(additional_instructions))
             if motion_instructions:
@@ -266,8 +262,18 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
                     f"the first frame of this segment must match it. "
                     f"<Video 1>: partially_preserved - motion continuity reference; continue the preceding movement; do not restart it.")
             summary_tag = "[keyframe completion + reference generation]" if continuity_keyframe else "[reference generation]"
+            primary = next(((track, clip) for track in timeline.tracks.tracks if track.owner_kind == "actor"
+                for clip in track.clips if clip.kind == "body" and _text(clip.content)), None)
+            if primary is None:
+                primary = next(((track, clip) for track in timeline.tracks.tracks if track.owner_kind == "actor"
+                    for clip in track.clips if _text(clip.content)), None)
+            summary = f"{summary_tag} The target video is a {_time(timeline.duration)}-second continuous single shot."
+            if primary is not None:
+                track, clip = primary
+                summary += f" Its main action is {labels[id(track.owner)]} {_lower_first(_text(clip.content))}."
+            summary += f" It uses {subject_text} as the referenced content."
             result = ["subject_definitions:\n" + definitions_text,
-                "summary:\n" + f"{summary_tag} The target video is a {_time(timeline.duration)}-second continuous single shot, using {subject_text} as the referenced visible content.",
+                "summary:\n" + summary,
                 "retention_analysis:\n" + retentions_text]
             if empty_sections == "输出 N/A":
                 result.extend(["detailed_description:\n" + detailed,

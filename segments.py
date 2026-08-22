@@ -127,10 +127,10 @@ def _persistent_state(timeline, start):
 
 def _motion_references(timeline, first_video_number):
     role_text = {
-        "仅动作": "Use it only for body mechanics, motion trajectory, timing, weight transfer, contact timing, and gesture rhythm. Do not copy identity, face, hair, clothing, background, lighting, or camera composition from it.",
-        "动作与镜头": "Use it for body mechanics, motion timing, and camera movement. Do not copy identity, face, hair, clothing, background, or lighting from it.",
-        "完整表演": "Use it for body mechanics, facial performance, interaction timing, and camera movement. Preserve the declared subjects' identities, clothing, and environment instead of copying those elements from it.",
-        "动作与声音": "Use it for body mechanics, performance timing, and its paired reference audio. Do not copy identity, clothing, or background from it.",
+        "仅动作": "body-action reference",
+        "动作与镜头": "body-action and camera reference",
+        "完整表演": "performance and camera reference",
+        "动作与声音": "body-action and performance-timing reference",
     }
     labels = {id(actor): f"{actor.card.name} (S{index})" for index, actor in enumerate(timeline.characters.actors, 1)}
     references = []
@@ -145,23 +145,12 @@ def _motion_references(timeline, first_video_number):
             if reference is None or not _text(clip.content):
                 continue
             owner = labels.get(id(track.owner), "the character")
-            motion_duration = reference.motion_duration or clip.end_time - clip.start_time
-            aligned_duration = reference.aligned_duration or reference.frames.shape[0] / 24.0
-            line = (f"For {owner}'s action from {_time(clip.start_time)} to {_time(clip.end_time)} seconds, "
-                    f"map the complete motion sequence in <Video {video_number}> from 0.00 to "
-                    f"{_time(motion_duration)} seconds one-to-one onto that target interval. Uniformly retime the "
-                    "reference so its first pose begins exactly at the action start and its final pose is reached "
-                    "exactly at the action end. Reproduce the ordered pose sequence, limb trajectories, footwork, "
-                    "rhythm, weight shifts, body orientation, balance, and contact timing. Do not replace, simplify, "
-                    f"reorder, omit, loop, or improvise any movement. {role_text[reference.role]} "
-                    f"The performer in the reference video is replaced by {owner}: render {owner}'s identity, "
-                    "face, hair, body, clothing, and environment from the declared references instead.")
-            if aligned_duration > motion_duration + 1e-6:
-                line += (f" Frames from {_time(motion_duration)} to {_time(aligned_duration)} seconds in "
-                    f"<Video {video_number}> are format padding that holds the final pose; do not interpret them as "
-                    "additional motion or extend the target action.")
+            interval = ("During this shot" if clip.start_time <= 1e-6 and clip.end_time >= timeline.duration - 1e-6
+                else f"From {_time(clip.start_time)} to {_time(clip.end_time)} seconds")
+            line = (f"{interval}, use <Video {video_number}> as {owner}'s {role_text[reference.role]}. Preserve its "
+                f"complete motion order, timing, and final pose while rendering {owner}'s declared identity, clothing, and scene.")
             if reference.audio is not None:
-                line += f" Its paired sound is <Audio {audio_number}>."
+                line += f" Use its synchronized <Audio {audio_number}>."
                 audio_number += 1
             instructions.append(_sentence(line))
             references.append(reference)

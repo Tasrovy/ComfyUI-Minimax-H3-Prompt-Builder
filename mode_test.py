@@ -47,9 +47,10 @@ aligned_track = s.TimelineTrackData("actor", actor, (aligned_clip,))
 aligned_timeline = s.TimelineData(group, style, env, s.TrackListData((aligned_track,)), 4.0)
 aligned_references, aligned_instructions = mod.segments._motion_references(aligned_timeline, 1)
 assert len(aligned_references) == 1
-assert "from 0.00 to 4 seconds one-to-one" in aligned_instructions
-assert "exactly at the action end" in aligned_instructions
-assert "are format padding that holds the final pose" in aligned_instructions
+assert "During this shot" in aligned_instructions
+assert "use <Video 1> as Luluka (S1)'s body-action reference" in aligned_instructions
+assert "complete motion order, timing, and final pose" in aligned_instructions
+assert "format padding" not in aligned_instructions
 
 result_components = mod.checkpoints.Types.VideoComponents(torch.zeros(150, 32, 48, 3), Fraction(30),
     {"waveform": torch.zeros(1, 1, 220500), "sample_rate": 44100})
@@ -73,6 +74,29 @@ assert "non_diegetic_music" not in omit
 assert "overall_soundscape" in na
 assert "non_diegetic_music" in na
 assert "N/A" in na
+assert "Strict chronological timeline" not in na
+assert "Do not anticipate" not in na
+assert "Its main action is Luluka (S1) dances." in na
+
+audio_clip = s.TimelineClipData("audio", 0.0, 5.0, "Steady rain ambience", "", "", None, "", "on-screen",
+    None, "ambience", None, None, 0)
+audio_track = s.TimelineTrackData("audio", None, (audio_clip,))
+audio_timeline = s.TimelineData(group, style, env, s.TrackListData((track, audio_track)), 5.0)
+audio_prompt = mod.MiniMaxH3FinalPrompt.execute(audio_timeline, 0.98, "16:9", "Ref", None, None, "",
+    empty_sections="输出 N/A")[0].text
+assert audio_prompt.count("Steady rain ambience") == 1
+assert "overall_soundscape:\nSteady rain ambience." in audio_prompt
+
+first_action = s.TimelineClipData("body", 0.0, 2.5, "walks to the window", "", "", lang, "", "on-screen",
+    None, "", None, None, 0)
+second_action = s.TimelineClipData("body", 2.5, 5.0, "looks outside", "", "", lang, "", "on-screen",
+    None, "", None, None, 0)
+ordered_track = s.TimelineTrackData("actor", actor, (first_action, second_action))
+ordered_timeline = s.TimelineData(group, style, env, s.TrackListData((ordered_track,)), 5.0)
+ordered_prompt = mod.MiniMaxH3FinalPrompt.execute(ordered_timeline, 0.98, "16:9", "Ref", None, None, "",
+    empty_sections="输出 N/A")[0].text
+assert ordered_prompt.index("walks to the window") < ordered_prompt.index("Then, from 2.5 to 5 seconds")
+assert "Do not" not in ordered_prompt
 
 assert mod.segments._context_frame_count(0.92, 124) == 22
 assert mod.segments._context_frame_count(2.0, 124) == 39
