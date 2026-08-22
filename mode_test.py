@@ -109,6 +109,15 @@ assert prepared_images.shape == (120, 64, 64, 3)
 assert prepared_audio["waveform"].shape == (1, 2, 160000)
 assert prepared_audio["sample_rate"] == 32000
 
+
+class FakePreviewer:
+    def decode_latent_to_preview(self, latent):
+        return int(latent[0, 0, 0, 0, 0])
+
+
+preview_latent = torch.arange(9, dtype=torch.float32).reshape(1, 1, 9, 1, 1)
+assert mod.checkpoints._latent_video_frames(FakePreviewer(), preview_latent) == list(range(9))
+
 omit = mod.MiniMaxH3FinalPrompt.execute(timeline, 0.98, "16:9", "Ref", None, None, "",
     empty_sections="不输出")[0].text
 na = mod.MiniMaxH3FinalPrompt.execute(timeline, 0.98, "16:9", "Ref", None, None, "",

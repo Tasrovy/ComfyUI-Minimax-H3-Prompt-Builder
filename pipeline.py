@@ -7,9 +7,9 @@ from comfy_api.latest import io
 from comfy_execution.graph_utils import GraphBuilder
 
 from .schema import CATEGORY, FPS, H3_GENERATION_JOB
-from .segments import _segment_ranges, _segment_result
+from .segments import _context_frame_count, _segment_ranges, _segment_result
 from .checkpoints import _cache_path, segment_cache_files
-from .utils import _video_size
+from .utils import _video_length, _video_size
 
 
 class MiniMaxH3SegmentResultPrepare(io.ComfyNode):
@@ -178,14 +178,19 @@ class MiniMaxH3MultiSegmentGenerate(io.ComfyNode):
                 guider = stage_node("BasicGuider", f"{stage}_guider", model=model, conditioning=conditioning.out(0))
                 sigmas = stage_node("BasicScheduler", f"{stage}_scheduler", model=model,
                     scheduler=generation_job.scheduler, steps=generation_job.steps, denoise=generation_job.denoise)
+                segment_duration = ranges[index][1] - ranges[index][0]
+                available_frames = round((ranges[index - 1][1] - ranges[index - 1][0]) * FPS) if index else 0
+                context_frames = _context_frame_count(generation_job.continuity_seconds, available_frames)
+                preview_duration = _video_length(segment_duration + context_frames / FPS) / FPS
                 sampled = stage_node("MiniMaxH3PreviewSampler", f"{stage}_sampling", noise=noise.out(0),
                     guider=guider.out(0), sampler=sampler, sigmas=sigmas.out(0), latent_image=conditioning.out(1),
-                    preview_every_steps=preview_every_steps)
+                    preview_every_steps=preview_every_steps, preview_node_id=str(parent_node_id or ""),
+                    segment_index=index + 1, segment_total=len(ranges),
+                    preview_duration_seconds=preview_duration)
                 decoded_images = stage_node("VAEDecode", f"{stage}_video_decode",
                     samples=sampled.out(0), vae=video_vae).out(0)
                 decoded_audio = stage_node("VAEDecodeAudio", f"{stage}_audio_decode",
                     samples=sampled.out(0), vae=audio_vae).out(0)
-                segment_duration = ranges[index][1] - ranges[index][0]
                 trimmed = stage_node("MiniMaxH3SegmentTrim", f"{stage}_trim", images=decoded_images,
                     audio=decoded_audio, context_frames=conditioning.out(2), duration_seconds=segment_duration)
                 segment_video = stage_node("CreateVideo", f"{stage}_segment_video", images=trimmed.out(0),
