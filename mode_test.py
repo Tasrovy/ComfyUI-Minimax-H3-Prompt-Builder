@@ -45,12 +45,14 @@ assert aligned_clip.motion_reference.motion_duration == 4.0
 assert aligned_clip.motion_reference.audio["waveform"].shape[-1] == round((107 / 24) * 32000)
 aligned_track = s.TimelineTrackData("actor", actor, (aligned_clip,))
 aligned_timeline = s.TimelineData(group, style, env, s.TrackListData((aligned_track,)), 4.0)
-aligned_references, aligned_instructions = mod.segments._motion_references(aligned_timeline, 1)
+aligned_references, aligned_instructions, aligned_definitions, aligned_retentions, aligned_summary = mod.segments._motion_references(aligned_timeline, 1)
 assert len(aligned_references) == 1
-assert "During this shot" in aligned_instructions
-assert "use <Video 1> as Luluka (S1)'s body-action reference" in aligned_instructions
+assert "Use <Video 1> as Luluka (S1)'s shot-aligned body-action reference" in aligned_instructions
 assert "complete motion order, timing, and final pose" in aligned_instructions
 assert "format padding" not in aligned_instructions
+assert "<Video 1> is Luluka (S1)'s shot-aligned body-action reference." in aligned_definitions
+assert "<Video 1> (action reference in [Shot 1]): attribute_transfer" in aligned_retentions
+assert aligned_summary == "The action is guided by <Video 1>."
 
 result_components = mod.checkpoints.Types.VideoComponents(torch.zeros(150, 32, 48, 3), Fraction(30),
     {"waveform": torch.zeros(1, 1, 220500), "sample_rate": 44100})
@@ -76,7 +78,7 @@ assert "non_diegetic_music" in na
 assert "N/A" in na
 assert "Strict chronological timeline" not in na
 assert "Do not anticipate" not in na
-assert "Its main action is Luluka (S1) dances." in na
+assert "Its main action shows Luluka (S1) dances." in na
 
 audio_clip = s.TimelineClipData("audio", 0.0, 5.0, "Steady rain ambience", "", "", None, "", "on-screen",
     None, "ambience", None, None, 0)
@@ -101,6 +103,48 @@ assert "Do not" not in ordered_prompt
 assert mod.segments._context_frame_count(0.92, 124) == 22
 assert mod.segments._context_frame_count(2.0, 124) == 39
 assert mod.segments._context_frame_count(0.1, 124) == 0
+
+previous_motion = s.MotionReferenceData(torch.ones(107, 16, 16, 3),
+    {"waveform": torch.ones(1, 2, 142667), "sample_rate": 32000}, "仅动作", 4.0, 107 / 24, 4.0)
+current_motion = s.MotionReferenceData(torch.full((107, 16, 16, 3), 2.0),
+    {"waveform": torch.full((1, 2, 142667), 2.0), "sample_rate": 32000}, "仅动作", 4.0, 107 / 24, 4.0)
+previous_clip = s.TimelineClipData("body", 0.0, 4.0, "walks forward", "", "", lang, "", "on-screen",
+    None, "", previous_motion)
+current_clip = s.TimelineClipData("body", 4.0, 8.0, "performs the dance", "", "", lang, "", "on-screen",
+    None, "", current_motion)
+segmented_track = s.TimelineTrackData("actor", actor, (previous_clip, current_clip))
+segmented_timeline = s.TimelineData(group, style, env, s.TrackListData((segmented_track,)), 8.0)
+job = s.GenerationJobData(segmented_timeline, 0.4, "16:9", 0, "simple", 4, 1.0, "match", 2.0, "不输出")
+compiled_segment, segment_references = mod.segments._compile_generation_segment(job, 1, 39)
+segment_reference = segment_references[0]
+assert compiled_segment.video_settings.length == 141
+assert segment_reference.frames.shape[0] == 141
+assert torch.all(segment_reference.frames[:39] == 1)
+assert torch.all(segment_reference.frames[39:135] == 2)
+assert torch.all(segment_reference.frames[135:] == 2)
+assert segment_reference.context_duration == 39 / 24
+assert segment_reference.audio["waveform"].shape[-1] == 188000
+assert torch.all(segment_reference.audio["waveform"][..., :52000] == 1)
+assert torch.all(segment_reference.audio["waveform"][..., 52000:180000] == 2)
+assert torch.all(segment_reference.audio["waveform"][..., 180000:] == 0)
+assert "1.62" not in compiled_segment.text and "5.62" not in compiled_segment.text
+assert "The target video is a 4-second continuous single shot." in compiled_segment.text
+assert "<Video 1> is Luluka (S1)'s shot-aligned body-action reference." in compiled_segment.text
+assert "<Video 1> (action reference in [Shot 1]): attribute_transfer" in compiled_segment.text
+
+previous_without_reference = s.TimelineClipData("body", 0.0, 4.0, "walks forward", "", "", lang, "",
+    "on-screen", None, "", None)
+fallback_track = s.TimelineTrackData("actor", actor, (previous_without_reference, current_clip))
+fallback_timeline = s.TimelineData(group, style, env, s.TrackListData((fallback_track,)), 8.0)
+fallback_job = s.GenerationJobData(fallback_timeline, 0.4, "16:9", 0, "simple", 4, 1.0, "match", 2.0, "不输出")
+generated_tail = torch.full((96, 16, 16, 3), 3.0)
+generated_audio = {"waveform": torch.full((1, 2, 128000), 3.0), "sample_rate": 32000}
+_, fallback_references = mod.segments._compile_generation_segment(fallback_job, 1, 39,
+    generated_tail, generated_audio)
+fallback_reference = fallback_references[0]
+assert torch.all(fallback_reference.frames[:39] == 3)
+assert torch.all(fallback_reference.frames[39:135] == 2)
+assert torch.all(fallback_reference.audio["waveform"][..., :52000] == 3)
 
 class VideoVAE:
     def encode(self, frames):

@@ -114,14 +114,15 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
     @classmethod
     def execute(cls, timeline, megapixels, aspect_ratio, prompt_format="Ref", first_frame=None, last_frame=None,
                 additional_instructions="", motion_instructions="", empty_sections="不输出", continuity_keyframe=False,
-                suppress_initial_state=False):
+                suppress_initial_state=False, generation_duration=None, motion_definitions="",
+                motion_retentions="", motion_summary=""):
         if not isinstance(timeline, TimelineData):
             raise TypeError("Timeline compiler requires TimelineData")
         _validate_timeline(timeline)
         if prompt_format == "Ref" and (first_frame is not None or last_frame is not None):
             raise ValueError("Ref mode does not use first_frame or last_frame")
         width, height = _video_size(megapixels, aspect_ratio)
-        length = _video_length(timeline.duration)
+        length = _video_length(generation_duration if generation_duration is not None else timeline.duration)
         settings = VideoSettingsData("Ref2VA" if prompt_format == "Ref" else "I2VA-continuation", width, height, length,
                                      length / FPS, first_frame, last_frame)
         references, definitions, retentions = [], {}, {}
@@ -254,6 +255,10 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
             subject_text = subjects[0] if len(subjects) == 1 else " and ".join(subjects) if len(subjects) == 2 else ", ".join(subjects[:-1]) + f", and {subjects[-1]}"
             definitions_text = "\n".join(definitions[number] for number in numbers)
             retentions_text = "\n".join(f"<Subject {number}> (appears in [Shot 1]): {retentions[number][0]} - {retentions[number][1] or 'Preserve only the defined reference role.'}" for number in numbers)
+            if motion_definitions:
+                definitions_text += "\n" + motion_definitions
+            if motion_retentions:
+                retentions_text += "\n" + motion_retentions
             if continuity_keyframe:
                 definitions_text += (f"\n<Picture {continuity_number}> is the exact opening frame of this segment at 0.00 seconds, "
                     f"extracted from the last frame of the previous segment without reinterpretation. "
@@ -270,8 +275,10 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
             summary = f"{summary_tag} The target video is a {_time(timeline.duration)}-second continuous single shot."
             if primary is not None:
                 track, clip = primary
-                summary += f" Its main action is {labels[id(track.owner)]} {_lower_first(_text(clip.content))}."
+                summary += f" Its main action shows {labels[id(track.owner)]} {_lower_first(_text(clip.content))}."
             summary += f" It uses {subject_text} as the referenced content."
+            if motion_summary:
+                summary += " " + motion_summary
             result = ["subject_definitions:\n" + definitions_text,
                 "summary:\n" + summary,
                 "retention_analysis:\n" + retentions_text]

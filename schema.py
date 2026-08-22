@@ -108,6 +108,7 @@ class MotionReferenceData:
     source_duration: float = 0.0
     aligned_duration: float = 0.0
     motion_duration: float = 0.0
+    context_duration: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
