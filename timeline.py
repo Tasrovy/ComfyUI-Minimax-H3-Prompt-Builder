@@ -115,7 +115,7 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
     def execute(cls, timeline, megapixels, aspect_ratio, prompt_format="Ref", first_frame=None, last_frame=None,
                 additional_instructions="", motion_instructions="", empty_sections="不输出", continuity_keyframe=False,
                 suppress_initial_state=False, generation_duration=None, motion_definitions="",
-                motion_retentions="", motion_summary="", suppress_actor_state_ids=()):
+                motion_retentions="", motion_summary="", suppress_actor_state_ids=(), suppress_camera_tracks=False):
         if not isinstance(timeline, TimelineData):
             raise TypeError("Timeline compiler requires TimelineData")
         _validate_timeline(timeline)
@@ -194,6 +194,8 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
 
         continuous_events, timed_events, soundscape, music = [], [], [], []
         for track_index, track in enumerate(timeline.tracks.tracks):
+            if suppress_camera_tracks and track.owner_kind == "camera":
+                continue
             for clip_index, clip in enumerate(track.clips):
                 if clip.kind == "audio" and _text(clip.content):
                     covers_shot = clip.start_time <= 1e-6 and clip.end_time >= timeline.duration - 1e-6

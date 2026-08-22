@@ -300,8 +300,8 @@ def _motion_references(timeline, first_video_number, first_subject_number, has_c
             summary_labels.append(f"<Subject {subject_number}>")
             if uses_camera:
                 definitions.append(f"<Video {video_number}> provides the camera behavior and temporal structure for [Shot 1].")
-                retentions.append(f"<Video {video_number}> (camera and temporal structure in [Shot 1]): partially_preserved - "
-                    "Preserve its camera behavior and temporal order.")
+                retentions.append(f"<Video {video_number}> (camera and temporal structure in [Shot 1]): fully_preserved - "
+                    "Strictly preserve its camera behavior and temporal order.")
                 line += f" Follow <Video {video_number}>'s camera behavior and temporal structure."
                 camera_labels.append(f"<Video {video_number}>")
             if reference.audio is not None:
@@ -334,6 +334,10 @@ def _compile_generation_segment(generation_job, segment_index, context_frames=0,
         timeline, 1, _reference_subject_count(timeline) + 1, context_frames > 0)
     full_performance_actors = {id(track.owner) for track in timeline.tracks.tracks if track.owner_kind == "actor"
         for clip in track.clips if clip.motion_reference is not None and clip.motion_reference.role == "完整表演"}
+    camera_references = [reference for reference in motion_references if reference.role in ("动作与镜头", "完整表演")]
+    if len(camera_references) > 1:
+        raise ValueError("同一生成片段只能有一个包含镜头的动作参考视频")
+    uses_reference_camera = bool(camera_references)
     if len(motion_references) > 3:
         raise ValueError("单个生成片段最多支持 3 段动作参考视频")
         
@@ -351,6 +355,7 @@ def _compile_generation_segment(generation_job, segment_index, context_frames=0,
         continuity_keyframe=False,
         suppress_initial_state=context_frames > 0,
         suppress_actor_state_ids=full_performance_actors,
+        suppress_camera_tracks=uses_reference_camera,
         generation_duration=timeline.duration + context_frames / FPS
     )[0]
     motion_references = _align_motion_context(timeline, previous_timeline, motion_references, context_frames,

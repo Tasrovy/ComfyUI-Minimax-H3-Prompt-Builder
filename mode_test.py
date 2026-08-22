@@ -62,7 +62,10 @@ full_motion = s.MotionReferenceData(motion_frames, motion_audio, "完整表演",
 full_clip = mod.MiniMaxH3Action.execute("body", 0.0, 4.0, "follows the complete performance",
     motion_reference=full_motion)[0]
 full_track = s.TimelineTrackData("actor", actor, (full_clip,))
-full_timeline = s.TimelineData(group, style, env, s.TrackListData((full_track,)), 4.0)
+camera_clip = mod.MiniMaxH3Camera.execute(0.0, 4.0, "A low-angle wide shot frames Luluka.",
+    "The camera orbits clockwise.", "Deep focus keeps the stage sharp.")[0]
+camera_track = s.TimelineTrackData("camera", None, (camera_clip,))
+full_timeline = s.TimelineData(group, style, env, s.TrackListData((full_track, camera_track)), 4.0)
 full_job = s.GenerationJobData(full_timeline, 0.4, "16:9", 0, "simple", 4, 1.0, "match", 0.92, "不输出")
 full_prompt = mod.segments._compile_generation_segment(full_job, 0)[0].text
 assert "stands in the center of the frame" not in full_prompt
@@ -71,8 +74,17 @@ assert "has a calm expression" not in full_prompt
 assert "<Subject 2> is Luluka (S1)'s complete performance derived from <Video 1>." in full_prompt
 assert "<Subject 2> (appears in [Shot 1]): attribute_transfer" in full_prompt
 assert "<Video 1> provides the camera behavior and temporal structure for [Shot 1]." in full_prompt
-assert "<Video 1> (camera and temporal structure in [Shot 1]): partially_preserved" in full_prompt
+assert "<Video 1> (camera and temporal structure in [Shot 1]): fully_preserved" in full_prompt
 assert "The camera and temporal structure are guided by <Video 1>." in full_prompt
+assert "A low-angle wide shot frames Luluka" not in full_prompt
+assert "The camera orbits clockwise" not in full_prompt
+
+action_camera_timeline = s.TimelineData(group, style, env, s.TrackListData((aligned_track, camera_track)), 4.0)
+action_camera_job = s.GenerationJobData(action_camera_timeline, 0.4, "16:9", 0, "simple", 4, 1.0, "match", 0.92,
+    "不输出")
+action_camera_prompt = mod.segments._compile_generation_segment(action_camera_job, 0)[0].text
+assert "A low-angle wide shot frames Luluka" in action_camera_prompt
+assert "The camera orbits clockwise" in action_camera_prompt
 
 overridden_actor = s.ActorInstanceData(card, "starts beside the window", "", "", "")
 overridden_group = s.CharacterGroupData((overridden_actor,))
