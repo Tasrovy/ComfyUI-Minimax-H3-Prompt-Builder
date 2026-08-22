@@ -2,19 +2,11 @@ import hashlib
 import json
 import os
 import re
-from base64 import b64encode
-from io import BytesIO
 from pathlib import Path
 
-import comfy.model_management
-import comfy.nested_tensor
-import comfy.sample
-import comfy.utils
 import folder_paths
-import latent_preview
 import torch
 from comfy_api.latest import InputImpl, Types, io, ui
-from server import PromptServer
 
 from .segments import (_compile_generation_segment, _context_frame_count, _segment_ranges,
     _segment_result)
@@ -83,10 +75,11 @@ def segment_cache_files(generation_job, model, sampler, cache_version):
             files.append(f"segment_{index + 1:03d}_{previous[:24]}.mp4")
             continue
         available = round((ranges[index - 1][1] - ranges[index - 1][0]) * 24) if index else 0
-        context_frames = _context_frame_count(generation_job.continuity_seconds, available)
+        context_frames = _context_frame_count(generation_job.continuity_seconds, available,
+            round((end - start) * 24))
         compiled, motion_references = _compile_generation_segment(generation_job, index, context_frames)
         payload = {
-            "pipeline": "locked-av-context-v1",
+            "pipeline": "raw-aligned-av-context-v2",
             "index": index,
             "range": [start, end],
             "prompt": compiled.text,
@@ -111,32 +104,6 @@ def segment_cache_files(generation_job, model, sampler, cache_version):
         previous = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
         files.append(f"segment_{index + 1:03d}_{previous[:24]}.mp4")
     return tuple(files)
-
-
-def _latent_video_frames(previewer, video):
-    return [previewer.decode_latent_to_preview(video[:, :, index:index + 1])
-        for index in range(int(video.shape[2]))]
-
-
-def _jpeg_b64(frame):
-    buffer = BytesIO()
-    frame.convert("RGB").save(buffer, format="JPEG", quality=72)
-    return b64encode(buffer.getvalue()).decode("ascii")
-
-
-def _send_step_video_preview(node_id, segment_index, segment_total, step, total_steps, duration_seconds, frames):
-    if not node_id or not frames:
-        return
-    server = PromptServer.instance
-    server.send_sync("minimax_h3_step_video_preview", {
-        "node_id": str(node_id),
-        "segment_index": int(segment_index),
-        "segment_total": int(segment_total),
-        "step": int(step),
-        "total_steps": int(total_steps),
-        "duration_seconds": float(duration_seconds),
-        "frames": [_jpeg_b64(frame) for frame in frames],
-    }, server.client_id)
 
 
 class MiniMaxH3SegmentCheckpoint(io.ComfyNode):
@@ -178,56 +145,3 @@ class MiniMaxH3SegmentCheckpointLoad(io.ComfyNode):
         files = json.loads(preview_files)
         video = InputImpl.VideoFromFile(str(path))
         return io.NodeOutput(video, ui=ui.PreviewVideo(_saved_results(files)))
-
-
-class MiniMaxH3PreviewSampler(io.ComfyNode):
-    @classmethod
-    def define_schema(cls):
-        return io.Schema(node_id="MiniMaxH3PreviewSampler", display_name="MiniMax H3 实时预览采样（内部）",
-            category="MiniMax H3/提示词构建/内部", inputs=[io.Noise.Input("noise"), io.Guider.Input("guider"),
-                io.Sampler.Input("sampler"), io.Sigmas.Input("sigmas"), io.Latent.Input("latent_image"),
-                io.Int.Input("preview_every_steps", min=1, max=20, default=1),
-                io.String.Input("preview_node_id"), io.Int.Input("segment_index", min=1),
-                io.Int.Input("segment_total", min=1),
-                io.Float.Input("preview_duration_seconds", min=0.01, step=0.01)],
-            outputs=[io.Latent.Output(display_name="output"), io.Latent.Output(display_name="denoised_output")])
-
-    @classmethod
-    def execute(cls, noise, guider, sampler, sigmas, latent_image, preview_every_steps, preview_node_id,
-                segment_index, segment_total, preview_duration_seconds):
-        latent = latent_image.copy()
-        samples_in = comfy.sample.fix_empty_latent_channels(guider.model_patcher, latent["samples"],
-            latent.get("downscale_ratio_spacial"), latent.get("downscale_ratio_temporal"))
-        latent["samples"] = samples_in
-        noise_mask = latent.get("noise_mask")
-        x0_output = {}
-        latent_format = guider.model_patcher.model.latent_format
-        previewer = latent_preview.Latent2RGBPreviewer(latent_format.latent_rgb_factors,
-            latent_format.latent_rgb_factors_bias, latent_format.latent_rgb_factors_reshape)
-        progress = comfy.utils.ProgressBar(sigmas.shape[-1] - 1)
-
-        def callback(step, x0, _x, total_steps):
-            x0_output["x0"] = x0
-            if (step + 1) % int(preview_every_steps) == 0 or step + 1 == total_steps:
-                video = x0.tensors[0] if x0.is_nested else x0
-                frames = _latent_video_frames(previewer, video)
-                _send_step_video_preview(preview_node_id, segment_index, segment_total, step + 1,
-                    total_steps, preview_duration_seconds, frames)
-            progress.update_absolute(step + 1, total_steps)
-
-        samples = guider.sample(noise.generate_noise(latent), samples_in, sampler, sigmas,
-            denoise_mask=noise_mask, callback=callback, disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
-            seed=noise.seed).to(comfy.model_management.intermediate_device())
-        out = latent.copy()
-        out.pop("downscale_ratio_spacial", None)
-        out.pop("downscale_ratio_temporal", None)
-        out["samples"] = samples
-        x0 = x0_output.get("x0")
-        if x0 is None:
-            return io.NodeOutput(out, out)
-        if samples.is_nested and not x0.is_nested:
-            shapes = [value.shape for value in samples.unbind()]
-            x0 = comfy.nested_tensor.NestedTensor(comfy.utils.unpack_latents(x0, shapes))
-        denoised = latent.copy()
-        denoised["samples"] = guider.model_patcher.model.process_latent_out(x0.cpu())
-        return io.NodeOutput(out, denoised)

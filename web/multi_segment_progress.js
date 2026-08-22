@@ -10,12 +10,12 @@ const STAGE_LABELS = {
     sampling: "模型采样",
     video_decode: "解码画面",
     audio_decode: "解码声音",
-    trim: "裁切片段",
     result_prepare: "整理已生成结果（跳过采样）",
-    segment_video: "封装当前片段",
-    checkpoint: "保存当前片段",
+    segment_video: "封装未裁剪片段",
+    checkpoint: "保存未裁剪片段",
     cache_load: "读取已完成片段",
     components: "读取片段音视频",
+    trim: "裁切时间轴可见部分",
     join: "连续片段拼接",
     final_video: "封装最终视频",
 };
@@ -28,12 +28,12 @@ const STAGE_PROGRESS = {
     sampling: 0.1,
     video_decode: 0.88,
     audio_decode: 0.92,
-    trim: 0.95,
-    result_prepare: 0.95,
-    segment_video: 0.96,
-    checkpoint: 0.97,
-    cache_load: 0.97,
-    components: 0.98,
+    result_prepare: 0.92,
+    segment_video: 0.93,
+    checkpoint: 0.95,
+    cache_load: 0.95,
+    components: 0.96,
+    trim: 0.97,
     join: 0.99,
     final_video: 1.0,
 };
@@ -188,68 +188,6 @@ function progressText(node, detail) {
     return lines.join("\n");
 }
 
-function stopStepPreview(node) {
-    if (node.stepPreviewAnimation) {
-        cancelAnimationFrame(node.stepPreviewAnimation);
-        node.stepPreviewAnimation = null;
-    }
-}
-
-function clearStepPreview(node, label = "等待采样预览") {
-    stopStepPreview(node);
-    node.stepPreviewToken = (node.stepPreviewToken ?? 0) + 1;
-    node.stepPreviewFrames = [];
-    if (node.stepPreviewStatus) {
-        node.stepPreviewStatus.textContent = label;
-    }
-    const canvas = node.stepPreviewCanvas;
-    if (canvas) {
-        const context = canvas.getContext("2d");
-        context.fillStyle = "#111";
-        context.fillRect(0, 0, canvas.width, canvas.height);
-    }
-}
-
-function drawPreviewFrame(canvas, image) {
-    const context = canvas.getContext("2d");
-    context.fillStyle = "#111";
-    context.fillRect(0, 0, canvas.width, canvas.height);
-    const scale = Math.min(canvas.width / image.naturalWidth, canvas.height / image.naturalHeight);
-    const width = image.naturalWidth * scale;
-    const height = image.naturalHeight * scale;
-    context.drawImage(image, (canvas.width - width) / 2, (canvas.height - height) / 2, width, height);
-}
-
-async function setStepPreview(node, detail) {
-    const encoded = Array.isArray(detail?.frames) ? detail.frames : [];
-    if (!encoded.length || !node.stepPreviewCanvas) {
-        return;
-    }
-    const token = (node.stepPreviewToken ?? 0) + 1;
-    node.stepPreviewToken = token;
-    const frames = await Promise.all(encoded.map((value) => new Promise((resolve, reject) => {
-        const image = new Image();
-        image.onload = () => resolve(image);
-        image.onerror = reject;
-        image.src = `data:image/jpeg;base64,${value}`;
-    })));
-    if (node.stepPreviewToken !== token) {
-        return;
-    }
-
-    stopStepPreview(node);
-    node.stepPreviewFrames = frames;
-    node.stepPreviewStatus.textContent = `片段 ${detail.segment_index}/${detail.segment_total} · 采样 ${detail.step}/${detail.total_steps} · 潜空间动态预览`;
-    const duration = Math.max(0.1, Number(detail.duration_seconds) || 1) * 1000;
-    const startedAt = performance.now();
-    const animate = (now) => {
-        const index = Math.floor(((now - startedAt) % duration) / duration * frames.length);
-        drawPreviewFrame(node.stepPreviewCanvas, frames[index]);
-        node.stepPreviewAnimation = requestAnimationFrame(animate);
-    };
-    node.stepPreviewAnimation = requestAnimationFrame(animate);
-}
-
 app.registerExtension({
     name: "MiniMaxH3.MultiSegmentProgress",
     async beforeRegisterNodeDef(nodeType, nodeData, app) {
@@ -269,34 +207,11 @@ app.registerExtension({
             this.segmentProgressWidget.inputEl.placeholder = "执行后显示每一步的进度和耗时";
             this.segmentProgressWidget.serializeValue = async () => "";
             this.segmentProgressWidget.value = "等待执行";
-            const preview = document.createElement("div");
-            preview.style.cssText = "display:flex;flex-direction:column;gap:6px;width:100%;height:100%;box-sizing:border-box;padding:4px;";
-            const status = document.createElement("div");
-            status.style.cssText = "color:var(--input-text,#ddd);font-size:12px;line-height:18px;";
-            status.textContent = "等待采样预览";
-            const canvas = document.createElement("canvas");
-            canvas.width = 576;
-            canvas.height = 324;
-            canvas.style.cssText = "display:block;width:100%;height:auto;max-height:324px;background:#111;border:1px solid #444;border-radius:5px;object-fit:contain;";
-            preview.append(status, canvas);
-            this.stepPreviewStatus = status;
-            this.stepPreviewCanvas = canvas;
-            this.addDOMWidget("逐步视频预览", "preview", preview, {
-                serialize: false,
-                hideOnZoom: false,
-                getMinHeight: () => 360,
-            });
             this.addWidget("button", "停止生成并保留已完成片段", null, () => {
                 void api.interrupt();
             });
-            const onRemoved = this.onRemoved;
-            this.onRemoved = function () {
-                stopStepPreview(this);
-                return onRemoved?.apply(this, arguments);
-            };
             resetTiming(this);
-            clearStepPreview(this);
-            this.setSize([Math.max(this.size[0], 640), Math.max(this.size[1], 880)]);
+            this.setSize([Math.max(this.size[0], 640), Math.max(this.size[1], 520)]);
         };
     },
 });
@@ -308,14 +223,6 @@ api.addEventListener("execution_start", () => {
         }
         resetTiming(node);
         node.segmentProgressWidget.value = "准备执行";
-        clearStepPreview(node, "准备采样");
-    }
-});
-
-api.addEventListener("minimax_h3_step_video_preview", ({ detail }) => {
-    const node = app.graph?.getNodeById(Number(detail?.node_id));
-    if (node?.type === "MiniMaxH3MultiSegmentGenerate") {
-        void setStepPreview(node, detail);
     }
 });
 

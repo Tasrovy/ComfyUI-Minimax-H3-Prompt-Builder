@@ -110,13 +110,10 @@ assert prepared_audio["waveform"].shape == (1, 2, 160000)
 assert prepared_audio["sample_rate"] == 32000
 
 
-class FakePreviewer:
-    def decode_latent_to_preview(self, latent):
-        return int(latent[0, 0, 0, 0, 0])
-
-
-preview_latent = torch.arange(9, dtype=torch.float32).reshape(1, 1, 9, 1, 1)
-assert mod.checkpoints._latent_video_frames(FakePreviewer(), preview_latent) == list(range(9))
+second_pass_source = torch.zeros(5, 32, 64, 4)
+second_pass_resized = mod.MiniMaxH3SecondPassResize.execute(second_pass_source, 0.01, "16:9")[0]
+second_pass_width, second_pass_height = u._video_size(0.01, "16:9")
+assert second_pass_resized.shape == (5, second_pass_height, second_pass_width, 3)
 
 omit = mod.MiniMaxH3FinalPrompt.execute(timeline, 0.98, "16:9", "Ref", None, None, "",
     empty_sections="不输出")[0].text
@@ -152,9 +149,10 @@ ordered_prompt = mod.MiniMaxH3FinalPrompt.execute(ordered_timeline, 0.98, "16:9"
 assert ordered_prompt.index("walks to the window") < ordered_prompt.index("Then, from 2.5 to 5 seconds")
 assert "Do not" not in ordered_prompt
 
-assert mod.segments._context_frame_count(0.92, 124) == 22
-assert mod.segments._context_frame_count(2.0, 124) == 39
-assert mod.segments._context_frame_count(0.1, 124) == 0
+assert mod.segments._context_frame_count(0.92, 124, 96) == 28
+assert mod.segments._context_frame_count(2.0, 124, 96) == 45
+assert mod.segments._context_frame_count(0.1, 124, 96) == 0
+assert mod.segments._context_frame_count(2.0, 40, 96) == 28
 
 previous_motion = s.MotionReferenceData(torch.ones(107, 16, 16, 3),
     {"waveform": torch.ones(1, 2, 142667), "sample_rate": 32000}, "仅动作", 4.0, 107 / 24, 4.0)
@@ -167,18 +165,22 @@ current_clip = s.TimelineClipData("body", 4.0, 8.0, "performs the dance", "", ""
 segmented_track = s.TimelineTrackData("actor", actor, (previous_clip, current_clip))
 segmented_timeline = s.TimelineData(group, style, env, s.TrackListData((segmented_track,)), 8.0)
 job = s.GenerationJobData(segmented_timeline, 0.4, "16:9", 0, "simple", 4, 1.0, "match", 2.0, "不输出")
-compiled_segment, segment_references = mod.segments._compile_generation_segment(job, 1, 39)
+compiled_segment, segment_references = mod.segments._compile_generation_segment(job, 1, 45)
 segment_reference = segment_references[0]
 assert compiled_segment.video_settings.length == 141
 assert segment_reference.frames.shape[0] == 141
-assert torch.all(segment_reference.frames[:39] == 1)
-assert torch.all(segment_reference.frames[39:135] == 2)
-assert torch.all(segment_reference.frames[135:] == 2)
-assert segment_reference.context_duration == 39 / 24
+assert torch.all(segment_reference.frames[:45] == 1)
+assert torch.all(segment_reference.frames[45:] == 2)
+assert segment_reference.context_duration == 45 / 24
 assert segment_reference.audio["waveform"].shape[-1] == 188000
-assert torch.all(segment_reference.audio["waveform"][..., :52000] == 1)
-assert torch.all(segment_reference.audio["waveform"][..., 52000:180000] == 2)
-assert torch.all(segment_reference.audio["waveform"][..., 180000:] == 0)
+assert torch.all(segment_reference.audio["waveform"][..., :60000] == 1)
+assert torch.all(segment_reference.audio["waveform"][..., 60000:] == 2)
+try:
+    mod.segments._validate_motion_alignment((s.MotionReferenceData(
+        segment_reference.frames[:-1], None, "仅动作", 4.0, 140 / 24),), 141)
+    raise AssertionError("Motion reference length mismatch was accepted")
+except ValueError as error:
+    assert "140 帧" in str(error) and "141 帧" in str(error)
 assert "1.62" not in compiled_segment.text and "5.62" not in compiled_segment.text
 assert "Generate a continuous single shot." in compiled_segment.text
 assert "The target video is a 4-second" not in compiled_segment.text
@@ -193,12 +195,12 @@ fallback_timeline = s.TimelineData(group, style, env, s.TrackListData((fallback_
 fallback_job = s.GenerationJobData(fallback_timeline, 0.4, "16:9", 0, "simple", 4, 1.0, "match", 2.0, "不输出")
 generated_tail = torch.full((96, 16, 16, 3), 3.0)
 generated_audio = {"waveform": torch.full((1, 2, 128000), 3.0), "sample_rate": 32000}
-_, fallback_references = mod.segments._compile_generation_segment(fallback_job, 1, 39,
+_, fallback_references = mod.segments._compile_generation_segment(fallback_job, 1, 45,
     generated_tail, generated_audio)
 fallback_reference = fallback_references[0]
-assert torch.all(fallback_reference.frames[:39] == 3)
-assert torch.all(fallback_reference.frames[39:135] == 2)
-assert torch.all(fallback_reference.audio["waveform"][..., :52000] == 3)
+assert torch.all(fallback_reference.frames[:45] == 3)
+assert torch.all(fallback_reference.frames[45:] == 2)
+assert torch.all(fallback_reference.audio["waveform"][..., :60000] == 3)
 
 class VideoVAE:
     def encode(self, frames):
@@ -222,6 +224,13 @@ assert torch.all(video[:, :, :7] == 1)
 assert torch.all(video_mask[:, :, :7] == 0) and torch.all(video_mask[:, :, 7:] == 1)
 assert torch.all(audio[..., :37] == 1)
 assert torch.all(audio_mask[..., :37] == 0) and torch.all(audio_mask[..., 37:] == 1)
+
+try:
+    mod.MiniMaxH3SegmentTrim.execute(torch.zeros(140, 16, 16, 3),
+        {"waveform": torch.zeros(1, 2, 1000), "sample_rate": 32000}, 0, 4.0, 141)
+    raise AssertionError("Decoded video length mismatch was accepted")
+except ValueError as error:
+    assert "140 帧" in str(error) and "141 帧" in str(error)
 
 old_output = mod.checkpoints.folder_paths.get_output_directory()
 with tempfile.TemporaryDirectory() as temp_output:

@@ -60,11 +60,15 @@ def _segment_timeline(timeline, start, end):
     return replace(timeline, tracks=TrackListData(tuple(tracks)), duration=end - start)
 
 
-def _context_frame_count(seconds, available_frames):
+def _context_frame_count(seconds, available_frames, current_frames):
     wanted = min(max(0, round(seconds * 24)), max(0, int(available_frames)))
     if wanted < 5:
         return 0
-    return 5 + 17 * ((wanted - 5) // 17)
+    first = (5 - int(current_frames)) % 17
+    while first < 5:
+        first += 17
+    candidates = range(first, int(available_frames) + 1, 17)
+    return min(candidates, key=lambda value: (abs(value - wanted), -value), default=0)
 
 
 def _encode_context_audio(audio_vae, audio):
@@ -249,6 +253,19 @@ def _align_motion_context(timeline, previous_timeline, references, context_frame
     return aligned
 
 
+def _validate_motion_alignment(references, target_frames):
+    for index, reference in enumerate(references, 1):
+        if reference.frames.shape[0] != target_frames:
+            raise ValueError(f"<Video {index}> 有 {reference.frames.shape[0]} 帧，但本次模型生成需要 {target_frames} 帧")
+        if reference.audio is None:
+            continue
+        sample_rate = int(reference.audio["sample_rate"])
+        expected_samples = round((target_frames / FPS) * sample_rate)
+        actual_samples = reference.audio["waveform"].shape[-1]
+        if actual_samples != expected_samples:
+            raise ValueError(f"<Video {index}> 的音频有 {actual_samples} 个采样点，但等长视频需要 {expected_samples} 个")
+
+
 def _reference_subject_count(timeline):
     references = [actor.card.reference for actor in timeline.characters.actors]
     references.extend((timeline.style.reference, timeline.environment.card.reference))
@@ -360,6 +377,7 @@ def _compile_generation_segment(generation_job, segment_index, context_frames=0,
     )[0]
     motion_references = _align_motion_context(timeline, previous_timeline, motion_references, context_frames,
         compiled.video_settings.length, previous_images, previous_audio)
+    _validate_motion_alignment(motion_references, compiled.video_settings.length)
     return compiled, motion_references
 
 
@@ -414,8 +432,9 @@ class MiniMaxH3SegmentConditioning(io.ComfyNode):
 
     @classmethod
     def execute(cls, clip, video_vae, audio_vae, generation_job, segment_index, previous_images=None, previous_audio=None):
+        start, end = _segment_ranges(generation_job.timeline)[segment_index]
         context_frames = _context_frame_count(generation_job.continuity_seconds,
-            previous_images.shape[0] if previous_images is not None else 0)
+            previous_images.shape[0] if previous_images is not None else 0, round((end - start) * FPS))
         compiled, motion_references = _compile_generation_segment(generation_job, segment_index, context_frames,
             previous_images, previous_audio)
         settings = compiled.video_settings
@@ -462,7 +481,7 @@ class MiniMaxH3PromptPreview(io.ComfyNode):
             node_id="MiniMaxH3PromptPreview", 
             display_name="MiniMax H3 最终提示词预览（Final Prompt Preview）",
             category=CATEGORY, 
-            description="按多段 Ref2VA 生成顺序预览提示词，并输出带标注的静态图及动态帧占位图。",
+            description="按多段 Ref2VA 生成顺序预览提示词，并输出带标注的参考图。",
             inputs=[H3_GENERATION_JOB.Input("generation_job")], 
             outputs=[
                 io.String.Output(display_name="final_prompts"),
@@ -483,7 +502,8 @@ class MiniMaxH3PromptPreview(io.ComfyNode):
 
         for index, (start, end) in enumerate(ranges):
             available = round((ranges[index - 1][1] - ranges[index - 1][0]) * 24) if index else 0
-            context_frames = _context_frame_count(generation_job.continuity_seconds, available)
+            context_frames = _context_frame_count(generation_job.continuity_seconds, available,
+                round((end - start) * FPS))
             compiled, motion_references = _compile_generation_segment(generation_job, index, context_frames)
             rendered = _segment_result(generation_job.timeline, start, end)
             settings = compiled.video_settings
