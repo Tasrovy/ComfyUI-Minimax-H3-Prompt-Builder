@@ -6,9 +6,11 @@ from pathlib import Path
 
 import folder_paths
 import torch
+import comfy.nested_tensor
+import comfy.utils
 from comfy_api.latest import InputImpl, Types, io, ui
 
-from .segments import (_compile_generation_segment, _context_frame_count, _segment_ranges,
+from .segments import (_compile_generation_segment, _segment_frame_plan, _segment_ranges,
     _segment_result)
 from .utils import _video_size
 
@@ -25,6 +27,35 @@ def _cache_path(filename):
     if folder != root and root not in folder.parents:
         raise ValueError("MiniMax H3 分段缓存目录超出输出目录")
     return folder / filename
+
+
+def _latent_path(filename):
+    return _cache_path(filename).with_suffix(".safetensors")
+
+
+def _save_latent(path, latent):
+    streams = list(latent["samples"].unbind())
+    if len(streams) != 2:
+        raise ValueError("分段缓存需要 MiniMax H3 配对的视频和音频 Latent")
+    temporary = path.with_name(f".{path.stem}.{os.getpid()}.tmp.safetensors")
+    try:
+        comfy.utils.save_torch_file({
+            "video": streams[0].detach().to(device="cpu").contiguous(),
+            "audio": streams[1].detach().to(device="cpu").contiguous(),
+        }, temporary, metadata={"format": "minimax-h3-av-latent-v1"})
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _load_latent(path):
+    if not path.is_file():
+        return None
+    tensors = comfy.utils.load_torch_file(str(path), safe_load=True)
+    if "video" not in tensors or "audio" not in tensors:
+        raise ValueError(f"MiniMax H3 分段 Latent 缓存内容不完整：{path.name}")
+    return {"samples": comfy.nested_tensor.NestedTensor((tensors["video"], tensors["audio"]))}
 
 
 def _saved_results(filenames):
@@ -75,11 +106,11 @@ def segment_cache_files(generation_job, model, sampler, cache_version):
             files.append(f"segment_{index + 1:03d}_{previous[:24]}.mp4")
             continue
         available = round((ranges[index - 1][1] - ranges[index - 1][0]) * 24) if index else 0
-        context_frames = _context_frame_count(generation_job.continuity_seconds, available,
+        frame_plan = _segment_frame_plan(generation_job.continuity_seconds, available,
             round((end - start) * 24))
-        compiled, motion_references, standalone_audios = _compile_generation_segment(generation_job, index, context_frames)
+        compiled, motion_references, standalone_audios = _compile_generation_segment(generation_job, index, frame_plan)
         payload = {
-            "pipeline": "raw-aligned-av-context-v2",
+            "pipeline": "latent-locked-dynamic-output-v4",
             "index": index,
             "range": [start, end],
             "prompt": compiled.text,
@@ -91,7 +122,9 @@ def segment_cache_files(generation_job, model, sampler, cache_version):
             "steps": generation_job.steps,
             "denoise": generation_job.denoise,
             "ref_image_size": generation_job.ref_image_size,
-            "context_frames": context_frames,
+            "requested_frames": frame_plan.requested_frames,
+            "current_frames": frame_plan.current_frames,
+            "locked_frames": frame_plan.locked_frames,
             "model": model_signature,
             "previous": previous,
             "images": [_tensor_digest(item.image, memo) for item in compiled.references],
@@ -112,13 +145,17 @@ class MiniMaxH3SegmentCheckpoint(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(node_id="MiniMaxH3SegmentCheckpoint", display_name="MiniMax H3 保存分段（内部）",
             category="MiniMax H3/提示词构建/内部", inputs=[io.Video.Input("video"),
-                io.String.Input("cache_file"), io.String.Input("preview_files")],
-            outputs=[io.Video.Output(display_name="video")], is_output_node=True)
+                io.String.Input("cache_file"), io.String.Input("preview_files"),
+                io.Latent.Input("latent", optional=True)],
+            outputs=[io.Video.Output(display_name="video"), io.Latent.Output(display_name="latent")],
+            is_output_node=True)
 
     @classmethod
-    def execute(cls, video, cache_file, preview_files):
+    def execute(cls, video, cache_file, preview_files, latent=None):
         path = _cache_path(cache_file)
         path.parent.mkdir(parents=True, exist_ok=True)
+        if latent is not None:
+            _save_latent(_latent_path(cache_file), latent)
         temporary = path.with_name(f".{path.stem}.{os.getpid()}.tmp.mp4")
         try:
             video.save_to(temporary, format=Types.VideoContainer.MP4, codec=Types.VideoCodec.H264)
@@ -128,7 +165,7 @@ class MiniMaxH3SegmentCheckpoint(io.ComfyNode):
                 temporary.unlink()
         files = json.loads(preview_files)
         saved_video = InputImpl.VideoFromFile(str(path))
-        return io.NodeOutput(saved_video, ui=ui.PreviewVideo(_saved_results(files)))
+        return io.NodeOutput(saved_video, latent, ui=ui.PreviewVideo(_saved_results(files)))
 
 
 class MiniMaxH3SegmentCheckpointLoad(io.ComfyNode):
@@ -136,7 +173,8 @@ class MiniMaxH3SegmentCheckpointLoad(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(node_id="MiniMaxH3SegmentCheckpointLoad", display_name="MiniMax H3 读取分段（内部）",
             category="MiniMax H3/提示词构建/内部", inputs=[io.String.Input("cache_file"),
-                io.String.Input("preview_files")], outputs=[io.Video.Output(display_name="video")])
+                io.String.Input("preview_files")], outputs=[io.Video.Output(display_name="video"),
+                io.Latent.Output(display_name="latent")])
 
     @classmethod
     def execute(cls, cache_file, preview_files):
@@ -145,4 +183,4 @@ class MiniMaxH3SegmentCheckpointLoad(io.ComfyNode):
             raise FileNotFoundError(f"MiniMax H3 分段缓存不存在：{path.name}")
         files = json.loads(preview_files)
         video = InputImpl.VideoFromFile(str(path))
-        return io.NodeOutput(video, ui=ui.PreviewVideo(_saved_results(files)))
+        return io.NodeOutput(video, _load_latent(_latent_path(cache_file)), ui=ui.PreviewVideo(_saved_results(files)))

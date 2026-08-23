@@ -9,9 +9,9 @@ from comfy_api.latest import io
 from comfy_execution.graph_utils import GraphBuilder
 
 from .schema import ASPECT_RATIOS, CATEGORY, FPS, H3_GENERATION_JOB
-from .segments import _context_frame_count, _segment_ranges, _segment_result
-from .checkpoints import _cache_path, segment_cache_files
-from .utils import _video_length, _video_size
+from .segments import _segment_frame_plan, _segment_ranges, _segment_result
+from .checkpoints import _cache_path, _latent_path, segment_cache_files
+from .utils import _video_size
 
 
 SECOND_PASS_UPSCALE_METHODS = {
@@ -114,11 +114,14 @@ class MiniMaxH3SegmentTrim(io.ComfyNode):
         context_frames = min(max(0, int(context_frames)), max(0, images.shape[0] - 1))
         images = images[context_frames:]
         frame_count = min(images.shape[0], max(1, round(duration_seconds * FPS)))
+        images = images[:frame_count]
         sample_rate = audio["sample_rate"]
         audio_offset = min(audio["waveform"].shape[-1], round((context_frames / FPS) * sample_rate))
         waveform = audio["waveform"][..., audio_offset:]
-        sample_count = min(waveform.shape[-1], round(duration_seconds * sample_rate))
-        return io.NodeOutput(images[:frame_count], {**audio, "waveform": waveform[..., :sample_count]})
+        sample_count = round((frame_count / FPS) * sample_rate)
+        waveform = torch.nn.functional.pad(waveform[..., :sample_count],
+            (0, max(0, sample_count - waveform.shape[-1])))
+        return io.NodeOutput(images, {**audio, "waveform": waveform})
 
 
 class MiniMaxH3SecondPassResize(io.ComfyNode):
@@ -235,6 +238,13 @@ class MiniMaxH3SegmentJoin(io.ComfyNode):
             raise ValueError("分段画面尺寸不一致，无法拼接")
         if previous_audio["sample_rate"] != current_audio["sample_rate"]:
             raise ValueError("分段音频采样率不一致，无法拼接")
+        sample_rate = previous_audio["sample_rate"]
+        previous_samples = round((previous_images.shape[0] / FPS) * sample_rate)
+        current_samples = round((current_images.shape[0] / FPS) * sample_rate)
+        if previous_audio["waveform"].shape[-1] != previous_samples:
+            raise ValueError("上一段音频长度与画面帧数不一致，无法拼接")
+        if current_audio["waveform"].shape[-1] != current_samples:
+            raise ValueError("当前段音频长度与画面帧数不一致，无法拼接")
             
         images = torch.cat((previous_images, current_images), dim=0)
 
@@ -284,6 +294,7 @@ class MiniMaxH3MultiSegmentGenerate(io.ComfyNode):
         accumulated_audio = None
         previous_images = None
         previous_audio = None
+        previous_latent = None
         
         for index in range(len(ranges)):
             stage = f"segment_{index + 1}_of_{len(ranges)}"
@@ -292,13 +303,17 @@ class MiniMaxH3MultiSegmentGenerate(io.ComfyNode):
             segment_duration = end - start
             segment_result = _segment_result(generation_job.timeline, start, end)
             available_frames = round((ranges[index - 1][1] - ranges[index - 1][0]) * FPS) if index else 0
-            context_frames = _context_frame_count(generation_job.continuity_seconds, available_frames,
-                round(segment_duration * FPS)) if segment_result is None else 0
-            generation_frames = (_video_length(segment_duration + context_frames / FPS)
-                if segment_result is None else round(segment_duration * FPS))
+            frame_plan = (_segment_frame_plan(generation_job.continuity_seconds, available_frames,
+                round(segment_duration * FPS)) if segment_result is None else None)
+            context_frames = frame_plan.locked_frames if frame_plan is not None else 0
+            generation_frames = frame_plan.generation_frames if frame_plan is not None else round(segment_duration * FPS)
+            visible_duration = frame_plan.current_frames / FPS if frame_plan is not None else segment_duration
+            checkpoint_latent = None
             if cache_mode == "复用已完成片段" and _cache_path(cache_files[index]).is_file():
                 checkpoint = stage_node("MiniMaxH3SegmentCheckpointLoad", f"{stage}_cache_load",
                     cache_file=cache_files[index], preview_files=preview_files)
+                if _latent_path(cache_files[index]).is_file():
+                    checkpoint_latent = checkpoint.out(1)
             elif segment_result is not None:
                 width, height = _video_size(generation_job.megapixels, generation_job.aspect_ratio)
                 prepared = stage_node("MiniMaxH3SegmentResultPrepare", f"{stage}_result_prepare",
@@ -313,6 +328,8 @@ class MiniMaxH3MultiSegmentGenerate(io.ComfyNode):
                 if previous_images is not None:
                     conditioning_inputs["previous_images"] = previous_images
                     conditioning_inputs["previous_audio"] = previous_audio
+                    if previous_latent is not None:
+                        conditioning_inputs["previous_latent"] = previous_latent
                 conditioning = stage_node("MiniMaxH3SegmentConditioning", f"{stage}_conditioning", **conditioning_inputs)
                 noise = stage_node("RandomNoise", f"{stage}_noise",
                     noise_seed=(generation_job.seed + index) & 0xffffffffffffffff)
@@ -328,18 +345,21 @@ class MiniMaxH3MultiSegmentGenerate(io.ComfyNode):
                 segment_video = stage_node("CreateVideo", f"{stage}_segment_video", images=decoded_images,
                     fps=float(FPS), audio=decoded_audio)
                 checkpoint = stage_node("MiniMaxH3SegmentCheckpoint", f"{stage}_checkpoint",
-                    video=segment_video.out(0), cache_file=cache_files[index], preview_files=preview_files)
+                    video=segment_video.out(0), latent=sampled.out(0), cache_file=cache_files[index],
+                    preview_files=preview_files)
+                checkpoint_latent = sampled.out(0)
             components = stage_node("GetVideoComponents", f"{stage}_components", video=checkpoint.out(0))
             images = components.out(0)
             audio = components.out(1)
             if segment_result is None:
                 trimmed = stage_node("MiniMaxH3SegmentTrim", f"{stage}_trim", images=images,
-                    audio=audio, context_frames=context_frames, duration_seconds=segment_duration,
+                    audio=audio, context_frames=context_frames, duration_seconds=visible_duration,
                     generated_frames=generation_frames)
                 images = trimmed.out(0)
                 audio = trimmed.out(1)
             previous_images = images
             previous_audio = audio
+            previous_latent = checkpoint_latent
                 
             if accumulated_images is None:
                 accumulated_images = images

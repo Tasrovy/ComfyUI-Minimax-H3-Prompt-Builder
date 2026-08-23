@@ -222,10 +222,16 @@ assert ordered_prompt.index("walks to the window") < ordered_prompt.index("Then,
 assert "Do not" not in ordered_prompt
 assert "Luluka (S1)" not in ordered_prompt
 
-assert mod.segments._context_frame_count(0.92, 124, 96) == 28
-assert mod.segments._context_frame_count(2.0, 124, 96) == 45
-assert mod.segments._context_frame_count(0.1, 124, 96) == 0
-assert mod.segments._context_frame_count(2.0, 40, 96) == 28
+short_plan = mod.segments._segment_frame_plan(0.92, 124, 96)
+assert (short_plan.requested_frames, short_plan.current_frames, short_plan.locked_frames,
+    short_plan.generation_frames) == (96, 102, 22, 124)
+long_plan = mod.segments._segment_frame_plan(2.0, 124, 96)
+assert (long_plan.requested_frames, long_plan.current_frames, long_plan.locked_frames,
+    long_plan.generation_frames) == (96, 102, 39, 141)
+first_plan = mod.segments._segment_frame_plan(2.0, 0, 96)
+assert (first_plan.requested_frames, first_plan.current_frames, first_plan.locked_frames,
+    first_plan.generation_frames) == (96, 107, 0, 107)
+assert mod.segments._segment_frame_plan(2.0, 40, 96) == long_plan
 assert mod.segments._empty_sections_mode("不输出") == "自动补全"
 
 previous_source = s.ReferenceVideoData(torch.ones(107, 16, 16, 3),
@@ -244,35 +250,36 @@ current_audio_clip = mod.MiniMaxH3AudioAction.execute("music", 4.0, 8.0, "Curren
 segmented_audio_track = s.TimelineTrackData("audio", None, (previous_audio_clip, current_audio_clip))
 segmented_timeline = s.TimelineData(group, style, env, s.TrackListData((segmented_track, segmented_audio_track)), 8.0)
 job = s.GenerationJobData(segmented_timeline, 0.4, "16:9", 0, "simple", 4, 1.0, "match", 2.0, "不输出")
-compiled_segment, segment_references, segment_audios = mod.segments._compile_generation_segment(job, 1, 45)
+compiled_segment, segment_references, segment_audios = mod.segments._compile_generation_segment(job, 1, long_plan)
 assert not segment_audios
 segment_reference = segment_references[0]
 assert compiled_segment.video_settings.length == 141
 assert segment_reference.frames.shape[0] == 141
-assert torch.all(segment_reference.frames[:45] == 1)
-assert torch.all(segment_reference.frames[45:] == 2)
-assert segment_reference.context_duration == 45 / 24
+assert torch.all(segment_reference.frames[:39] == 1)
+assert torch.all(segment_reference.frames[39:] == 2)
+assert segment_reference.context_duration == 39 / 24
+assert segment_reference.locked_duration == 39 / 24
 assert segment_reference.audio["waveform"].shape[-1] == 188000
-assert torch.all(segment_reference.audio["waveform"][..., :60000] == 1)
-assert torch.all(segment_reference.audio["waveform"][..., 60000:] == 2)
+assert torch.all(segment_reference.audio["waveform"][..., :52000] == 1)
+assert torch.all(segment_reference.audio["waveform"][..., 52000:] == 2)
 try:
     mod.segments._validate_motion_alignment((s.MotionReferenceData(
         segment_reference.frames[:-1], None, "actor", 4.0, 140 / 24),), 141)
     raise AssertionError("Motion reference length mismatch was accepted")
 except ValueError as error:
     assert "140 帧" in str(error) and "141 帧" in str(error)
-assert "1.62" not in compiled_segment.text and "5.62" not in compiled_segment.text
 assert "The target video is a 5.88-second continuous single shot." in compiled_segment.text
 assert "[video continuation + reference generation + audio reference]" in compiled_segment.text
 assert "<Subject 2> is the body performance derived from <Video 1>" in compiled_segment.text
-assert "<Video 1> is the reference for [Shot 1]'s preceding continuity and shot-aligned temporal order" in compiled_segment.text
-assert "The opening 1.88 seconds continue the preceding generated segment" in compiled_segment.text
-assert "At 1.88 seconds, the current action phase begins" in compiled_segment.text
+assert "<Video 1> is the reference for [Shot 1]'s motion-transition context and current shot-aligned temporal order" in compiled_segment.text
+assert "The opening 1.62 seconds are hard-locked to the preceding generated segment" in compiled_segment.text
+assert "At 1.62 seconds, the current action continues directly from the locked final frame" in compiled_segment.text
 assert "Use <Subject 2> as <Subject 1> (Luluka)'s authoritative body performance" in compiled_segment.text
+assert "Transfer only body performance; do not copy the source performer" in compiled_segment.text
 assert "<Subject 2> (appears in [Shot 1]): attribute_transfer" in compiled_segment.text
 assert "Motion references:" not in compiled_segment.text
 details = compiled_segment.text.split("detailed_description:\n", 1)[1]
-assert details.index("The opening 1.88 seconds") < details.index("From 1.88 to 5.88 seconds, Luluka performs the dance")
+assert details.index("The opening 1.62 seconds") < details.index("From 1.62 to 5.88 seconds, Luluka performs the dance")
 
 previous_without_reference = s.TimelineClipData("body", 0.0, 4.0, "walks forward", "", "", lang, "",
     "on-screen", None, "", None)
@@ -281,15 +288,15 @@ fallback_timeline = s.TimelineData(group, style, env, s.TrackListData((fallback_
 fallback_job = s.GenerationJobData(fallback_timeline, 0.4, "16:9", 0, "simple", 4, 1.0, "match", 2.0, "不输出")
 generated_tail = torch.full((96, 16, 16, 3), 3.0)
 generated_audio = {"waveform": torch.full((1, 2, 128000), 3.0), "sample_rate": 32000}
-fallback_compiled, fallback_references, fallback_audios = mod.segments._compile_generation_segment(fallback_job, 1, 45,
+fallback_compiled, fallback_references, fallback_audios = mod.segments._compile_generation_segment(fallback_job, 1, long_plan,
     generated_tail, generated_audio)
 assert not fallback_audios
 fallback_reference = fallback_references[0]
-assert torch.all(fallback_reference.frames[:45] == 3)
-assert torch.all(fallback_reference.frames[45:] == 2)
-assert torch.all(fallback_reference.audio["waveform"][..., :60000] == 3)
+assert torch.all(fallback_reference.frames[:39] == 3)
+assert torch.all(fallback_reference.frames[39:] == 2)
+assert torch.all(fallback_reference.audio["waveform"][..., :52000] == 3)
 assert "[video continuation + reference generation + audio reference]" in fallback_compiled.text
-assert "The opening 1.88 seconds continue the preceding generated segment" in fallback_compiled.text
+assert "The opening 1.62 seconds are hard-locked to the preceding generated segment" in fallback_compiled.text
 
 current_without_reference = s.TimelineClipData("body", 4.0, 8.0, "walks toward the door", "", "", lang, "",
     "on-screen", None, "", None)
@@ -297,11 +304,12 @@ latent_only_track = s.TimelineTrackData("actor", actor, (previous_clip, current_
 latent_only_job = s.GenerationJobData(
     s.TimelineData(group, style, env, s.TrackListData((latent_only_track,)), 8.0),
     0.4, "16:9", 0, "simple", 4, 1.0, "match", 2.0, "不输出")
-latent_only_compiled, latent_only_references, latent_only_audios = mod.segments._compile_generation_segment(latent_only_job, 1, 45)
+latent_only_compiled, latent_only_references, latent_only_audios = mod.segments._compile_generation_segment(latent_only_job, 1,
+    long_plan)
 assert not latent_only_references
 assert not latent_only_audios
 assert "[video continuation + reference generation]" in latent_only_compiled.text
-assert "The opening 1.88 seconds continue the preceding generated segment" in latent_only_compiled.text
+assert "The opening 1.62 seconds are hard-locked to the preceding generated segment" in latent_only_compiled.text
 
 class VideoVAE:
     def encode(self, frames):
@@ -317,7 +325,7 @@ latent = {"samples": mod.segments.comfy.nested_tensor.NestedTensor((
     torch.zeros(1, 24, 12, 4, 4), torch.zeros(1, 32, 2, 100)))}
 previous_images = torch.zeros(30, 64, 64, 3)
 previous_audio = {"waveform": torch.zeros(1, 2, 40000), "sample_rate": 32000}
-locked = mod.segments._lock_context_prefix(latent, previous_images, previous_audio,
+locked = mod.segments._lock_context_prefix(latent, previous_images, previous_audio, None,
     VideoVAE(), AudioVAE(), 22, 64, 64)
 video, audio = locked["samples"].unbind()
 video_mask, audio_mask = locked["noise_mask"].unbind()
@@ -326,12 +334,57 @@ assert torch.all(video_mask[:, :, :7] == 0) and torch.all(video_mask[:, :, 7:] =
 assert torch.all(audio[..., :37] == 1)
 assert torch.all(audio_mask[..., :37] == 0) and torch.all(audio_mask[..., 37:] == 1)
 
+class UnusedVAE:
+    def encode(self, value):
+        raise AssertionError("Direct Latent continuity unexpectedly re-encoded decoded media")
+
+previous_video_latent = torch.arange(20, dtype=torch.float32).reshape(1, 1, 20, 1, 1).repeat(1, 24, 1, 4, 4)
+previous_audio_latent = torch.arange(60, dtype=torch.float32).reshape(1, 1, 1, 60).repeat(1, 32, 2, 1)
+direct_previous = {"samples": mod.segments.comfy.nested_tensor.NestedTensor((
+    previous_video_latent, previous_audio_latent))}
+direct_locked = mod.segments._lock_context_prefix(latent, previous_images, previous_audio, direct_previous,
+    UnusedVAE(), UnusedVAE(), 22, 64, 64)
+direct_video, direct_audio = direct_locked["samples"].unbind()
+assert torch.equal(direct_video[:, :, :7], previous_video_latent[:, :, -7:])
+assert torch.equal(direct_audio[..., :37], previous_audio_latent[..., -37:])
+
 try:
     mod.MiniMaxH3SegmentTrim.execute(torch.zeros(140, 16, 16, 3),
         {"waveform": torch.zeros(1, 2, 1000), "sample_rate": 32000}, 0, 4.0, 141)
     raise AssertionError("Decoded video length mismatch was accepted")
 except ValueError as error:
     assert "140 帧" in str(error) and "141 帧" in str(error)
+
+trim_source = torch.arange(141, dtype=torch.float32).reshape(141, 1, 1, 1).repeat(1, 16, 16, 3)
+trim_audio = {"waveform": torch.arange(188000, dtype=torch.float32).reshape(1, 1, -1).repeat(1, 2, 1),
+    "sample_rate": 32000}
+trimmed_images, trimmed_audio = mod.MiniMaxH3SegmentTrim.execute(
+    trim_source, trim_audio, 39, 102 / 24, 141)[:2]
+assert trimmed_images.shape[0] == 102
+assert trimmed_images[0, 0, 0, 0] == 39 and trimmed_images[-1, 0, 0, 0] == 140
+assert trimmed_audio["waveform"].shape[-1] == 136000
+assert trimmed_audio["waveform"][0, 0, 0] == 52000
+
+short_trim_audio = {"waveform": torch.ones(1, 2, 187999), "sample_rate": 32000}
+short_trimmed = mod.MiniMaxH3SegmentTrim.execute(
+    trim_source, short_trim_audio, 39, 102 / 24, 141)[1]
+assert short_trimmed["waveform"].shape[-1] == 136000
+assert short_trimmed["waveform"][..., -2].eq(1).all() and short_trimmed["waveform"][..., -1].eq(0).all()
+
+long_trim_audio = {"waveform": torch.ones(1, 2, 188100), "sample_rate": 32000}
+long_trimmed = mod.MiniMaxH3SegmentTrim.execute(
+    trim_source, long_trim_audio, 39, 102 / 24, 141)[1]
+assert long_trimmed["waveform"].shape[-1] == 136000
+
+joined_images, joined_audio = mod.MiniMaxH3SegmentJoin.execute(
+    trimmed_images, trimmed_audio, trimmed_images, trimmed_audio)[:2]
+assert joined_images.shape[0] == 204 and joined_audio["waveform"].shape[-1] == 272000
+try:
+    mod.MiniMaxH3SegmentJoin.execute(trimmed_images, trimmed_audio, trimmed_images,
+        {**trimmed_audio, "waveform": trimmed_audio["waveform"][..., :-1]})
+    raise AssertionError("Mismatched audio and video lengths were accepted")
+except ValueError as error:
+    assert "当前段音频长度与画面帧数不一致" in str(error)
 
 old_output = mod.checkpoints.folder_paths.get_output_directory()
 with tempfile.TemporaryDirectory() as temp_output:
@@ -341,10 +394,18 @@ with tempfile.TemporaryDirectory() as temp_output:
         components = mod.checkpoints.Types.VideoComponents(torch.zeros(5, 32, 32, 3),
             Fraction(24), {"waveform": torch.zeros(1, 2, 7000), "sample_rate": 32000})
         video = mod.checkpoints.InputImpl.VideoFromComponents(components)
-        saved = mod.MiniMaxH3SegmentCheckpoint.execute(video, cache_name, f'["{cache_name}"]')[0]
+        cached_latent = {"samples": mod.segments.comfy.nested_tensor.NestedTensor((
+            torch.ones(1, 24, 12, 4, 4), torch.ones(1, 32, 2, 100)))}
+        saved_output = mod.MiniMaxH3SegmentCheckpoint.execute(video, cache_name, f'["{cache_name}"]', cached_latent)
+        saved = saved_output[0]
         assert mod.checkpoints._cache_path(cache_name).is_file()
-        loaded = mod.MiniMaxH3SegmentCheckpointLoad.execute(cache_name, f'["{cache_name}"]')[0]
+        assert mod.checkpoints._latent_path(cache_name).is_file()
+        loaded_output = mod.MiniMaxH3SegmentCheckpointLoad.execute(cache_name, f'["{cache_name}"]')
+        loaded = loaded_output[0]
+        loaded_video_latent, loaded_audio_latent = loaded_output[1]["samples"].unbind()
         assert saved.get_dimensions() == loaded.get_dimensions() == (32, 32)
+        assert torch.equal(loaded_video_latent, torch.ones(1, 24, 12, 4, 4))
+        assert torch.equal(loaded_audio_latent, torch.ones(1, 32, 2, 100))
     finally:
         mod.checkpoints.folder_paths.set_output_directory(old_output)
 
@@ -405,7 +466,20 @@ silent_motion_prompt = mod.segments._compile_generation_segment(
     s.GenerationJobData(silent_motion_timeline, 0.4, "16:9", 0, "simple", 4, 1.0, "match", 0.92, "不输出"), 0)[0].text
 assert "<Audio 1>" not in silent_motion_prompt
 assert "The target video is a 4.46-second continuous single shot." in silent_motion_prompt
-assert "From 4 to 4.46 seconds, the final visible state" in silent_motion_prompt
+assert "Luluka follows the dance" in silent_motion_prompt
+assert "pre-roll" not in silent_motion_prompt
+assert "final visible state" not in silent_motion_prompt
+
+class FakeModel:
+    model = object()
+    patches = {}
+
+    def model_size(self):
+        return 1
+
+expanded = mod.MiniMaxH3MultiSegmentGenerate.execute(FakeModel(), object(), object(), object(), object(), job,
+    "重新生成全部片段", 0)
+assert expanded.expand is not None
 
 camera_details = action_camera_prompt.split("detailed_description:\n", 1)[1]
 assert camera_details.index("A low-angle wide shot frames Luluka") < camera_details.index("Luluka follows the dance")

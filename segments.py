@@ -1,4 +1,4 @@
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import torch
 import comfy.samplers
@@ -8,7 +8,7 @@ import torchvision.transforms.functional as TF
 from PIL import Image, ImageDraw, ImageFont
 from comfy_api.latest import io
 from comfy_extras.nodes_minimax_h3 import (MiniMaxH3ReferenceToVideo as NativeRef2VA,
-    _resize as resize_h3_image)
+    _resize as resize_h3_image, align_frame_count, video_latent_t)
 
 from .schema import (ASPECT_RATIOS, CATEGORY, EMPTY_SECTION_MODES, EMPTY_SECTION_OPTIONS, FPS,
     H3_GENERATION_JOB, H3_TIMELINE, GenerationJobData, MotionReferenceData, TimelineData, TrackListData)
@@ -60,15 +60,42 @@ def _segment_timeline(timeline, start, end):
     return replace(timeline, tracks=TrackListData(tuple(tracks)), duration=end - start)
 
 
-def _context_frame_count(seconds, available_frames, current_frames):
-    wanted = min(max(0, round(seconds * 24)), max(0, int(available_frames)))
-    if wanted < 5:
-        return 0
-    first = (5 - int(current_frames)) % 17
-    while first < 5:
-        first += 17
-    candidates = range(first, int(available_frames) + 1, 17)
-    return min(candidates, key=lambda value: (abs(value - wanted), -value), default=0)
+def _retime_timeline(timeline, duration):
+    if abs(timeline.duration - duration) <= 1e-6:
+        return timeline
+    scale = duration / timeline.duration
+    tracks = tuple(replace(track, clips=tuple(replace(clip,
+        start_time=clip.start_time * scale, end_time=clip.end_time * scale) for clip in track.clips))
+        for track in timeline.tracks.tracks)
+    return replace(timeline, tracks=TrackListData(tracks), duration=duration)
+
+
+@dataclass(frozen=True, slots=True)
+class SegmentFramePlan:
+    requested_frames: int
+    current_frames: int
+    locked_frames: int
+    generation_frames: int
+
+
+_LATENT_CONTEXT_WINDOWS = (5, 22, 39, 56)
+
+
+def _segment_frame_plan(seconds, available_frames, current_frames):
+    requested_frames = max(1, int(current_frames))
+    available_frames = max(0, int(available_frames))
+    wanted = min(max(0, round(seconds * FPS)), available_frames)
+    candidates = [value for value in _LATENT_CONTEXT_WINDOWS if value <= wanted]
+    locked_frames = candidates[-1] if candidates else 0
+    generation_frames = _video_length((requested_frames + locked_frames) / FPS)
+    return SegmentFramePlan(requested_frames, generation_frames - locked_frames, locked_frames,
+        generation_frames)
+
+
+def _video_steps_for_frames(frame_count):
+    if align_frame_count(frame_count) != frame_count:
+        raise ValueError(f"{frame_count} 帧不能表示为完整的 MiniMax H3 视频 Latent 步")
+    return video_latent_t(frame_count)
 
 
 def _encode_context_audio(audio_vae, audio):
@@ -80,29 +107,47 @@ def _encode_context_audio(audio_vae, audio):
     return audio_vae.encode(waveform[:1].movedim(1, -1))
 
 
-def _lock_context_prefix(latent, previous_images, previous_audio, video_vae, audio_vae,
-                         context_frames, width, height):
+def _lock_context_prefix(latent, previous_images, previous_audio, previous_latent, video_vae, audio_vae,
+                         locked_frames, width, height):
     video, audio = (stream.clone() for stream in latent["samples"].unbind())
-    tail = previous_images[-context_frames:, ..., :3]
-    if tail.shape[1] != height or tail.shape[2] != width:
-        tail = resize_h3_image(tail, width, height, "disabled")
-    tail_latent = video_vae.encode(tail).to(device=video.device, dtype=video.dtype)
-    video_steps = min(tail_latent.shape[2], video.shape[2] - 1)
-    video[:, :, :video_steps] = tail_latent[:, :, :video_steps]
+    video_steps = _video_steps_for_frames(locked_frames)
+    if previous_latent is not None:
+        previous_video, previous_audio_latent = previous_latent["samples"].unbind()
+        if previous_video.shape[1] != video.shape[1]:
+            raise ValueError("上一片段视频 Latent 通道数与当前模型不一致")
+        if previous_video.shape[3:] != video.shape[3:]:
+            raise ValueError("上一片段与当前片段分辨率不一致，无法直接传递 Latent")
+        if previous_video.shape[2] < video_steps:
+            raise ValueError("上一片段视频 Latent 短于要求的段间锁定窗口")
+        tail_latent = previous_video[:, :, -video_steps:]
+    else:
+        tail = previous_images[-locked_frames:, ..., :3]
+        if tail.shape[1] != height or tail.shape[2] != width:
+            tail = resize_h3_image(tail, width, height, "disabled")
+        tail_latent = video_vae.encode(tail)
+        previous_audio_latent = None
+        if tail_latent.shape[2] != video_steps:
+            raise ValueError(f"{locked_frames} 帧段间画面编码得到 {tail_latent.shape[2]} 个 Latent 步，预期 {video_steps} 个")
+    if video_steps >= video.shape[2]:
+        raise ValueError("段间锁定窗口必须短于本次生成视频")
+    video[:, :, :video_steps] = tail_latent.to(device=video.device, dtype=video.dtype)
     video_mask = torch.ones_like(video)
     video_mask[:, :, :video_steps] = 0
-    for offset, weight in enumerate((0.55, 0.34, 0.16)):
-        step = video_steps + offset
-        if step >= video.shape[2]:
-            break
-        video[:, :, step] = video[:, :, step] * (1.0 - weight) + video[:, :, step - 1] * weight
 
     audio_mask = torch.ones_like(audio)
-    if previous_audio is not None:
+    audio_steps = max(1, round((locked_frames / FPS) * 40))
+    if previous_audio_latent is not None:
+        if previous_audio_latent.shape[-1] < audio_steps:
+            raise ValueError("上一片段音频 Latent 短于要求的段间锁定窗口")
+        audio_latent = previous_audio_latent[..., -audio_steps:]
+    elif previous_audio is not None:
         sample_rate = int(previous_audio["sample_rate"])
-        audio_samples = max(1, round((context_frames / 24.0) * sample_rate))
+        audio_samples = max(1, round((locked_frames / FPS) * sample_rate))
         tail_audio = {**previous_audio, "waveform": previous_audio["waveform"][..., -audio_samples:]}
         audio_latent = _encode_context_audio(audio_vae, tail_audio)
+    else:
+        audio_latent = None
+    if audio_latent is not None:
         audio_latent = audio_latent.to(device=audio.device, dtype=audio.dtype)
         audio_steps = min(audio_latent.shape[-1], audio.shape[-1] - 1)
         audio[..., :audio_steps] = audio_latent[..., :audio_steps]
@@ -266,10 +311,11 @@ def _reference_visible_audio(reference, duration, sample_rate, channels, device,
     return torch.nn.functional.pad(waveform, (start, max(0, total - start - waveform.shape[-1])))
 
 
-def _align_motion_context(timeline, previous_timeline, references, context_frames, target_frames,
+def _align_motion_context(timeline, previous_timeline, references, frame_plan,
                           previous_images=None, previous_audio=None):
     if not references:
         return references
+    target_frames = frame_plan.generation_frames
     if target_frames > round(15.0 * FPS):
         raise ValueError("参考视频加入段间上下文后超过 15 秒，请缩短片段或段间引导长度")
 
@@ -283,26 +329,26 @@ def _align_motion_context(timeline, previous_timeline, references, context_frame
     aligned = []
     for reference in references:
         visible = _reference_visible_frames(reference, timeline.duration)
-        prefix = None
+        locked = None
         previous_reference = previous.get(reference.owner_id)
-        if context_frames and previous_reference is not None:
+        if frame_plan.locked_frames and previous_images is not None and previous_images.shape[0]:
+            locked = previous_images[-frame_plan.locked_frames:, ..., :3]
+        elif frame_plan.locked_frames and previous_reference is not None:
             previous_visible = _reference_visible_frames(previous_reference, previous_timeline.duration)
-            prefix = previous_visible[-context_frames:]
-        elif context_frames and previous_images is not None and previous_images.shape[0]:
-            prefix = previous_images[-context_frames:, ..., :3]
-        if context_frames:
-            if prefix is None or not prefix.shape[0]:
-                prefix = visible[:1].repeat(context_frames, 1, 1, 1)
-            if prefix.shape[1:3] != visible.shape[1:3]:
-                prefix = resize_h3_image(prefix, visible.shape[2], visible.shape[1], "disabled")
-            prefix = prefix.to(device=visible.device, dtype=visible.dtype)
-            if prefix.shape[0] < context_frames:
-                prefix = torch.cat((prefix[:1].repeat(context_frames - prefix.shape[0], 1, 1, 1), prefix), dim=0)
-            visible = torch.cat((prefix[-context_frames:], visible), dim=0)
-        if visible.shape[0] > target_frames:
-            visible = visible[:target_frames]
-        elif visible.shape[0] < target_frames:
-            visible = torch.cat((visible, visible[-1:].repeat(target_frames - visible.shape[0], 1, 1, 1)), dim=0)
+            locked = previous_visible[-frame_plan.locked_frames:]
+        if frame_plan.locked_frames and locked is None:
+            locked = visible[:1].repeat(frame_plan.locked_frames, 1, 1, 1)
+        if locked is not None and locked.shape[1:3] != visible.shape[1:3]:
+            locked = resize_h3_image(locked, visible.shape[2], visible.shape[1], "disabled")
+        if locked is not None:
+            locked = locked.to(device=visible.device, dtype=visible.dtype)
+            if locked.shape[0] < frame_plan.locked_frames:
+                locked = torch.cat((locked[:1].repeat(frame_plan.locked_frames - locked.shape[0], 1, 1, 1), locked), dim=0)
+            locked = locked[-frame_plan.locked_frames:]
+        if locked is not None:
+            visible = torch.cat((locked, visible), dim=0)
+        if visible.shape[0] != target_frames:
+            raise ValueError(f"参考视频对齐后得到 {visible.shape[0]} 帧，本次模型生成需要 {target_frames} 帧")
 
         audio = reference.audio
         if audio is not None:
@@ -311,24 +357,25 @@ def _align_motion_context(timeline, previous_timeline, references, context_frame
             channels = waveform.shape[1]
             body = _reference_visible_audio(reference, timeline.duration, sample_rate, channels,
                 waveform.device, waveform.dtype)
-            if context_frames:
-                prefix_samples = round((context_frames / FPS) * sample_rate)
+            locked_audio = None
+            if frame_plan.locked_frames:
+                locked_samples = round((frame_plan.locked_frames / FPS) * sample_rate)
                 source_audio = previous_reference.audio if previous_reference is not None else None
                 if source_audio is not None:
                     active_samples = round(previous_reference.motion_duration * source_audio["sample_rate"])
                     source_audio = {**source_audio, "waveform": source_audio["waveform"][..., :active_samples]}
                 if source_audio is None:
                     source_audio = previous_audio
-                prefix_audio = _audio_tail(source_audio, sample_rate, prefix_samples, channels,
+                locked_audio = _audio_tail(source_audio, sample_rate, locked_samples, channels,
                     waveform.device, waveform.dtype)
-                body = torch.cat((prefix_audio, body), dim=-1)
+                body = torch.cat((locked_audio, body), dim=-1)
             target_samples = round((target_frames / FPS) * sample_rate)
-            body = torch.nn.functional.pad(body[..., :target_samples],
-                (0, max(0, target_samples - body.shape[-1])))
+            body = torch.nn.functional.pad(body, (0, max(0, target_samples - body.shape[-1])))[..., :target_samples]
             audio = {**audio, "waveform": body}
 
         aligned.append(replace(reference, frames=visible, audio=audio,
-            aligned_duration=target_frames / FPS, context_duration=context_frames / FPS))
+            aligned_duration=target_frames / FPS, context_duration=frame_plan.locked_frames / FPS,
+            locked_duration=frame_plan.locked_frames / FPS))
     return aligned
 
 
@@ -349,7 +396,15 @@ def _reference_subject_count(timeline):
     return _reference_subject_layout(timeline)[3]
 
 
-def _semantic_references(timeline, video_groups, audio_groups, first_subject_number, context_duration=0.0):
+def _opening_alignment_instruction(locked_duration):
+    if locked_duration <= 1e-6:
+        return ""
+    return (f"The opening {_time(locked_duration)} seconds are hard-locked to the preceding generated segment's final motion, pose, and framing. "
+        f"At {_time(locked_duration)} seconds, the current action continues directly from the locked final frame and runs through the final frame")
+
+
+def _semantic_references(timeline, video_groups, audio_groups, first_subject_number,
+                         prefix_duration=0.0, has_locked_context=False):
     actor_subjects = _reference_subject_layout(timeline)[0]
     labels = {id(actor): actor.card.name or f"Actor {index}"
         for index, actor in enumerate(timeline.characters.actors, 1)}
@@ -374,10 +429,11 @@ def _semantic_references(timeline, video_groups, audio_groups, first_subject_num
     for video_number, (group, _) in enumerate(video_groups, 1):
         bindings = group["bindings"]
         has_camera = any(binding[0] == "camera" for binding in bindings)
-        if context_duration or has_camera:
+        if prefix_duration or has_camera:
             roles = []
-            if context_duration:
-                roles.append("preceding continuity and shot-aligned temporal order")
+            if prefix_duration:
+                roles.append("motion-transition context and current shot-aligned temporal order" if has_locked_context
+                    else "current shot-aligned temporal order")
             if has_camera:
                 roles.append("camera movement and framing progression")
             definitions.append(f"<Video {video_number}> is the reference for [Shot 1]'s {' and '.join(roles)}.")
@@ -392,13 +448,15 @@ def _semantic_references(timeline, video_groups, audio_groups, first_subject_num
                 definitions.append(f"{subject} is the body performance derived from <Video {video_number}> and transferred to {target}.")
                 retentions.append(f"{subject} (appears in [Shot 1]): attribute_transfer - Transfer its motion order, timing, and final pose to {target}.")
                 line = (f"Use {subject} as {target}'s authoritative body performance. Preserve its complete motion order, timing, "
-                    f"weight shifts, and final pose while retaining {owner}'s declared identity and fixed appearance.")
+                    f"weight shifts, and final pose while retaining {owner}'s declared identity and fixed appearance. "
+                    "Transfer only body performance; do not copy the source performer, face, clothing, background, lighting, or audio.")
                 instructions.append((id(clip), _sentence(line)))
                 action_labels.append(subject)
                 subject_number += 1
             elif kind == "camera":
                 instructions.append((id(clip), _sentence(
-                    f"Use <Video {video_number}> as the authoritative camera movement, framing, and temporal-structure reference.")))
+                    f"Use <Video {video_number}> as the authoritative camera movement, framing, and temporal-structure reference. "
+                    "Transfer only camera behavior; do not copy the source performer, clothing, background, lighting, or audio.")))
                 camera_labels.append(f"<Video {video_number}>")
             elif kind == "lighting":
                 subject = f"<Subject {subject_number}>"
@@ -443,22 +501,27 @@ def _semantic_references(timeline, video_groups, audio_groups, first_subject_num
     return instruction_map, "\n".join(definitions), "\n".join(retentions), " ".join(summary_parts), standalone_audios
 
 
-def _compile_generation_segment(generation_job, segment_index, context_frames=0,
+def _compile_generation_segment(generation_job, segment_index, frame_plan=None,
                                 previous_images=None, previous_audio=None):
     ranges = _segment_ranges(generation_job.timeline)
     if segment_index < 0 or segment_index >= len(ranges):
         raise ValueError(f"分段编号超出范围：{segment_index}")
     start, end = ranges[segment_index]
-    
-    timeline = _segment_timeline(generation_job.timeline, start, end)
+    if frame_plan is None:
+        available = round((ranges[segment_index - 1][1] - ranges[segment_index - 1][0]) * FPS) if segment_index else 0
+        frame_plan = _segment_frame_plan(generation_job.continuity_seconds, available, round((end - start) * FPS))
+    timeline = _retime_timeline(_segment_timeline(generation_job.timeline, start, end),
+        frame_plan.current_frames / FPS)
     previous_timeline = (_segment_timeline(generation_job.timeline, *ranges[segment_index - 1])
         if segment_index else None)
     state = _persistent_state(generation_job.timeline, start)
-    context_duration = context_frames / FPS
+    prefix_duration = frame_plan.locked_frames / FPS
+    locked_duration = frame_plan.locked_frames / FPS
     video_groups, audio_groups = _reference_media(timeline)
     media_references = [reference for _, reference in video_groups]
     motion_instructions, motion_definitions, motion_retentions, motion_summary, standalone_audios = _semantic_references(
-        timeline, video_groups, audio_groups, _reference_subject_count(timeline) + 1, context_duration)
+        timeline, video_groups, audio_groups, _reference_subject_count(timeline) + 1, prefix_duration,
+        frame_plan.locked_frames > 0)
     if len(media_references) > 3:
         raise ValueError("单个生成片段最多支持 3 段语义参考视频")
     if sum(reference.audio is not None for reference in media_references) + len(standalone_audios) > 3:
@@ -475,16 +538,16 @@ def _compile_generation_segment(generation_job, segment_index, context_frames=0,
         motion_retentions=motion_retentions,
         motion_summary=motion_summary,
         empty_sections=generation_job.empty_sections,
-        suppress_initial_state=context_frames > 0,
-        generation_duration=timeline.duration + context_duration,
-        timeline_offset=context_duration,
-        opening_instructions=(f"The opening {_time(context_duration)} seconds continue the preceding generated segment without a cut, "
-            "preserving its motion direction, pose, framing, lighting, environment, and synchronized sound. "
-            f"At {_time(context_duration)} seconds, the current action phase begins" if context_duration else ""),
-        continuation=context_frames > 0,
+        suppress_initial_state=frame_plan.locked_frames > 0,
+        generation_duration=frame_plan.generation_frames / FPS,
+        timeline_offset=prefix_duration,
+        opening_instructions=_opening_alignment_instruction(locked_duration),
+        continuation=frame_plan.locked_frames > 0,
     )[0]
-    media_references = _align_motion_context(timeline, previous_timeline, media_references, context_frames,
-        compiled.video_settings.length, previous_images, previous_audio)
+    if compiled.video_settings.length != frame_plan.generation_frames:
+        raise ValueError(f"提示词生成长度为 {compiled.video_settings.length} 帧，分段计划需要 {frame_plan.generation_frames} 帧")
+    media_references = _align_motion_context(timeline, previous_timeline, media_references, frame_plan,
+        previous_images, previous_audio)
     _validate_motion_alignment(media_references, compiled.video_settings.length)
     return compiled, media_references, standalone_audios
 
@@ -534,16 +597,18 @@ class MiniMaxH3SegmentConditioning(io.ComfyNode):
         return io.Schema(node_id="MiniMaxH3SegmentConditioning", display_name="MiniMax H3 分段条件（内部）",
             category=f"{CATEGORY}/内部", inputs=[io.Clip.Input("clip"), io.Vae.Input("video_vae"),
             io.Vae.Input("audio_vae"), H3_GENERATION_JOB.Input("generation_job"), io.Int.Input("segment_index"),
-            io.Image.Input("previous_images", optional=True), io.Audio.Input("previous_audio", optional=True)],
+            io.Image.Input("previous_images", optional=True), io.Audio.Input("previous_audio", optional=True),
+            io.Latent.Input("previous_latent", optional=True)],
             outputs=[io.Conditioning.Output(display_name="positive"), io.Latent.Output(),
                 io.Int.Output(display_name="context_frames")])
 
     @classmethod
-    def execute(cls, clip, video_vae, audio_vae, generation_job, segment_index, previous_images=None, previous_audio=None):
+    def execute(cls, clip, video_vae, audio_vae, generation_job, segment_index, previous_images=None,
+                previous_audio=None, previous_latent=None):
         start, end = _segment_ranges(generation_job.timeline)[segment_index]
-        context_frames = _context_frame_count(generation_job.continuity_seconds,
+        frame_plan = _segment_frame_plan(generation_job.continuity_seconds,
             previous_images.shape[0] if previous_images is not None else 0, round((end - start) * FPS))
-        compiled, motion_references, standalone_audios = _compile_generation_segment(generation_job, segment_index, context_frames,
+        compiled, motion_references, standalone_audios = _compile_generation_segment(generation_job, segment_index, frame_plan,
             previous_images, previous_audio)
         settings = compiled.video_settings
         ref_videos = {}
@@ -562,10 +627,10 @@ class MiniMaxH3SegmentConditioning(io.ComfyNode):
             ref_videos=ref_videos, ref_video_audios=ref_video_audios,
             ref_audios={f"ref_audio_{index}": audio for index, audio in enumerate(standalone_audios)})
         positive, latent = native[0], native[1]
-        if context_frames:
-            latent = _lock_context_prefix(latent, previous_images, previous_audio, video_vae, audio_vae,
-                context_frames, settings.width, settings.height)
-        return io.NodeOutput(positive, latent, context_frames)
+        if frame_plan.locked_frames:
+            latent = _lock_context_prefix(latent, previous_images, previous_audio, previous_latent,
+                video_vae, audio_vae, frame_plan.locked_frames, settings.width, settings.height)
+        return io.NodeOutput(positive, latent, frame_plan.locked_frames)
 
 
 def _draw_picture_label(tensor_image, label_text):
@@ -611,9 +676,9 @@ class MiniMaxH3PromptPreview(io.ComfyNode):
 
         for index, (start, end) in enumerate(ranges):
             available = round((ranges[index - 1][1] - ranges[index - 1][0]) * 24) if index else 0
-            context_frames = _context_frame_count(generation_job.continuity_seconds, available,
+            frame_plan = _segment_frame_plan(generation_job.continuity_seconds, available,
                 round((end - start) * FPS))
-            compiled, motion_references, standalone_audios = _compile_generation_segment(generation_job, index, context_frames)
+            compiled, motion_references, standalone_audios = _compile_generation_segment(generation_job, index, frame_plan)
             rendered = _segment_result(generation_job.timeline, start, end)
             settings = compiled.video_settings
             
@@ -629,21 +694,23 @@ class MiniMaxH3PromptPreview(io.ComfyNode):
             for ref_item in compiled.references:
                 references.append(f"<Picture {ref_item.picture_number}> = [{ref_item.role}] ({ref_item.usage or 'Default'})")
             for offset, reference in enumerate(motion_references):
-                context = reference.context_duration
-                prefix = (f"上下文 {_time(context)} 秒（优先上一段同人物动作参考，否则上一段生成视频尾部）＋"
-                    if context else "")
+                prefix_parts = []
+                if reference.locked_duration:
+                    prefix_parts.append(f"锁定上下文 {_time(reference.locked_duration)} 秒")
+                prefix = ("＋".join(prefix_parts) + "＋") if prefix_parts else ""
                 references.append(f"<Video {1 + offset}> = 当前片段语义参考视频 {offset + 1} [{reference.role}]（{prefix}"
                     f"当前引用 {_time(reference.motion_duration or reference.frames.shape[0] / FPS)} 秒，"
                     f"送入模型 {_time(reference.aligned_duration or reference.frames.shape[0] / FPS)} 秒）")
             paired_audio_count = sum(reference.audio is not None for reference in motion_references)
             for offset, _ in enumerate(standalone_audios, paired_audio_count + 1):
                 references.append(f"<Audio {offset}> = 当前片段独立音频语义参考")
-            if context_frames:
+            if frame_plan.locked_frames:
                 references.insert(0,
-                    f"段间引导 = 硬锁定上一片段末尾 {context_frames} 帧及对应音频（不占用参考视频槽位）")
+                    f"段间引导 = Latent 强锁定上一片段末尾 {frame_plan.locked_frames} 帧及对应音频，"
+                    f"生成后只裁掉这 {frame_plan.locked_frames} 帧（不占用参考视频槽位）")
             
             header = [f"========== 片段 {index + 1}/{len(ranges)} ==========",
-                f"时间轴范围：{_time(start)}–{_time(end)} 秒 | 输出时长：{_time(end - start)} 秒"]
+                f"时间轴范围：{_time(start)}–{_time(end)} 秒 | 动态输出时长：{_time(frame_plan.current_frames / FPS)} 秒"]
             if rendered:
                 header.append(f"生成方式：使用已生成结果（版本 {rendered[1]}），跳过模型采样")
             header.extend(["【媒体绑定清单】：",

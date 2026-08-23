@@ -143,6 +143,7 @@ class MotionReferenceData:
     owner_id: int | None = None
     clip_start: float = 0.0
     clip_end: float = 0.0
+    locked_duration: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
