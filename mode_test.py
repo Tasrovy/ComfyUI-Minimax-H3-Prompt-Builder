@@ -379,9 +379,21 @@ assert long_trimmed["waveform"].shape[-1] == 136000
 joined_images, joined_audio = mod.MiniMaxH3SegmentJoin.execute(
     trimmed_images, trimmed_audio, trimmed_images, trimmed_audio)[:2]
 assert joined_images.shape[0] == 204 and joined_audio["waveform"].shape[-1] == 272000
+rounded_images, rounded_audio = mod.MiniMaxH3SegmentJoin.execute(
+    trimmed_images, trimmed_audio, trimmed_images,
+    {**trimmed_audio, "waveform": trimmed_audio["waveform"][..., :-1]})[:2]
+assert rounded_images.shape[0] == 204 and rounded_audio["waveform"].shape[-1] == 272000
+
+three_second_images = torch.zeros(73, 1, 1, 3)
+five_second_images = torch.zeros(136, 1, 1, 3)
+three_second_audio = {"waveform": torch.zeros(1, 2, 97333), "sample_rate": 32000}
+five_second_audio = {"waveform": torch.zeros(1, 2, 181333), "sample_rate": 32000}
+rounded_images, rounded_audio = mod.MiniMaxH3SegmentJoin.execute(
+    three_second_images, three_second_audio, five_second_images, five_second_audio)[:2]
+assert rounded_images.shape[0] == 209 and rounded_audio["waveform"].shape[-1] == 278667
 try:
     mod.MiniMaxH3SegmentJoin.execute(trimmed_images, trimmed_audio, trimmed_images,
-        {**trimmed_audio, "waveform": trimmed_audio["waveform"][..., :-1]})
+        {**trimmed_audio, "waveform": trimmed_audio["waveform"][..., :-9]})
     raise AssertionError("Mismatched audio and video lengths were accepted")
 except ValueError as error:
     assert "当前段音频长度与画面帧数不一致" in str(error)

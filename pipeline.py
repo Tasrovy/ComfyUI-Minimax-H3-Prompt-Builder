@@ -22,6 +22,7 @@ SECOND_PASS_UPSCALE_METHODS = {
     "最近邻": "nearest-exact",
 }
 SECOND_PASS_CROP_MODES = {"拉伸到目标比例": "disabled", "居中裁切到目标比例": "center"}
+AUDIO_SAMPLE_TOLERANCE = 8
 
 
 class MiniMaxH3SegmentSampler(io.ComfyNode):
@@ -241,14 +242,18 @@ class MiniMaxH3SegmentJoin(io.ComfyNode):
         sample_rate = previous_audio["sample_rate"]
         previous_samples = round((previous_images.shape[0] / FPS) * sample_rate)
         current_samples = round((current_images.shape[0] / FPS) * sample_rate)
-        if previous_audio["waveform"].shape[-1] != previous_samples:
+        previous_waveform = previous_audio["waveform"]
+        current_waveform = current_audio["waveform"]
+        if abs(previous_waveform.shape[-1] - previous_samples) > AUDIO_SAMPLE_TOLERANCE:
             raise ValueError("上一段音频长度与画面帧数不一致，无法拼接")
-        if current_audio["waveform"].shape[-1] != current_samples:
+        if abs(current_waveform.shape[-1] - current_samples) > AUDIO_SAMPLE_TOLERANCE:
             raise ValueError("当前段音频长度与画面帧数不一致，无法拼接")
-            
-        images = torch.cat((previous_images, current_images), dim=0)
 
-        waveform = torch.cat((previous_audio["waveform"], current_audio["waveform"]), dim=-1)
+        images = torch.cat((previous_images, current_images), dim=0)
+        waveform = torch.cat((previous_waveform, current_waveform), dim=-1)
+        sample_count = round((images.shape[0] / FPS) * sample_rate)
+        waveform = torch.nn.functional.pad(waveform[..., :sample_count],
+            (0, max(0, sample_count - waveform.shape[-1])))
         return io.NodeOutput(images, {**current_audio, "waveform": waveform})
 
 
