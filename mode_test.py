@@ -165,6 +165,11 @@ assert "Legacy stormy night" not in environment_prompt and "Legacy tense atmosph
 result_components = mod.checkpoints.Types.VideoComponents(torch.zeros(150, 32, 48, 3), Fraction(30),
     {"waveform": torch.zeros(1, 1, 220500), "sample_rate": 44100})
 result_video = mod.checkpoints.InputImpl.VideoFromComponents(result_components)
+split_motion, split_camera, split_lighting, split_audio = mod.MiniMaxH3MotionReference.execute(
+    result_video, 1.0, 3.0)
+assert split_motion.source.frames.shape[0] == 48
+assert split_motion.source is split_camera.source is split_lighting.source is split_audio.source
+assert split_motion.source.audio["waveform"].shape[-1] == 88200
 result_clip = mod.MiniMaxH3ActionResult.execute(clip, result_video, 2)[0]
 result_track = s.TimelineTrackData("actor", actor, (result_clip,))
 result_timeline = s.TimelineData(group, style, env, s.TrackListData((result_track,)), 5.0)

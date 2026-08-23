@@ -1,5 +1,7 @@
 from dataclasses import replace
 
+import torch
+
 from comfy_api.latest import io
 
 from .schema import (ACTOR_KINDS, CATEGORY, FPS, H3_ACTOR_INSTANCE, H3_ENVIRONMENT_INSTANCE,
