@@ -51,12 +51,13 @@ assert mod.segments._reference_subject_count(referenced_timeline) == 2
 aligned_references, aligned_instructions, aligned_definitions, aligned_retentions, aligned_summary = mod.segments._motion_references(
     aligned_timeline, 1, 2)
 assert len(aligned_references) == 1
-assert "Transfer <Subject 2> to Luluka (S1)" in aligned_instructions
-assert "complete order, timing, and final pose" in aligned_instructions
-assert "format padding" not in aligned_instructions
-assert "<Subject 2> is Luluka (S1)'s body motion derived from <Video 1>." in aligned_definitions
+aligned_instruction = next(iter(aligned_instructions.values()))
+assert "Transfer <Subject 2> to <Subject 1> (Luluka)" in aligned_instruction
+assert "complete order, timing, and final pose" in aligned_instruction
+assert "format padding" not in aligned_instruction
+assert "<Subject 2> is the body motion derived from <Video 1> and transferred to <Subject 1> (Luluka)." in aligned_definitions
 assert "<Subject 2> (appears in [Shot 1]): attribute_transfer" in aligned_retentions
-assert aligned_summary == "The action is guided by <Subject 2>."
+assert aligned_summary == "The action is guided by <Subject 2>. The synchronized sound is referenced from <Audio 1>."
 
 full_motion = s.MotionReferenceData(motion_frames, motion_audio, "完整表演", 2.0, 2.0)
 full_clip = mod.MiniMaxH3Action.execute("body", 0.0, 4.0, "follows the complete performance",
@@ -71,13 +72,15 @@ full_prompt = mod.segments._compile_generation_segment(full_job, 0)[0].text
 assert "stands in the center of the frame" not in full_prompt
 assert "stands naturally" not in full_prompt
 assert "has a calm expression" not in full_prompt
-assert "<Subject 2> is Luluka (S1)'s complete performance derived from <Video 1>." in full_prompt
+assert "<Subject 2> is the complete performance derived from <Video 1> and transferred to <Subject 1> (Luluka)." in full_prompt
 assert "<Subject 2> (appears in [Shot 1]): attribute_transfer" in full_prompt
 assert "<Video 1> provides the camera behavior and temporal structure for [Shot 1]." in full_prompt
 assert "<Video 1> (camera and temporal structure in [Shot 1]): fully_preserved" in full_prompt
 assert "The camera and temporal structure are guided by <Video 1>." in full_prompt
 assert "A low-angle wide shot frames Luluka" not in full_prompt
 assert "The camera orbits clockwise" not in full_prompt
+assert "Motion references:" not in full_prompt
+assert full_prompt.index("<Video 1>'s camera behavior") > full_prompt.index("Luluka follows the complete performance")
 
 action_camera_timeline = s.TimelineData(group, style, env, s.TrackListData((aligned_track, camera_track)), 4.0)
 action_camera_job = s.GenerationJobData(action_camera_timeline, 0.4, "16:9", 0, "simple", 4, 1.0, "match", 0.92,
@@ -120,14 +123,16 @@ omit = mod.MiniMaxH3FinalPrompt.execute(timeline, 0.98, "16:9", "Ref", None, Non
 na = mod.MiniMaxH3FinalPrompt.execute(timeline, 0.98, "16:9", "Ref", None, None, "",
     empty_sections="输出 N/A")[0].text
 
-assert "overall_soundscape" not in omit
-assert "non_diegetic_music" not in omit
-assert "overall_soundscape" in na
-assert "non_diegetic_music" in na
-assert "N/A" in na
+sections = ("subject_definitions:", "summary:", "retention_analysis:", "detailed_description:",
+    "overall_soundscape:", "non_diegetic_music:")
+assert all(section in omit for section in sections)
+assert [omit.index(section) for section in sections] == sorted(omit.index(section) for section in sections)
+assert "Natural environmental ambience" in omit
+assert "overall_soundscape:\nN/A" in na
+assert "non_diegetic_music:\nN/A" in na
 assert "Strict chronological timeline" not in na
 assert "Do not anticipate" not in na
-assert "Main visible action: Luluka (S1) dances." in na
+assert "Main visible action: Luluka dances." in na
 
 audio_clip = s.TimelineClipData("audio", 0.0, 5.0, "Steady rain ambience", "", "", None, "", "on-screen",
     None, "ambience", None, None, 0)
@@ -148,11 +153,13 @@ ordered_prompt = mod.MiniMaxH3FinalPrompt.execute(ordered_timeline, 0.98, "16:9"
     empty_sections="输出 N/A")[0].text
 assert ordered_prompt.index("walks to the window") < ordered_prompt.index("Then, from 2.5 to 5 seconds")
 assert "Do not" not in ordered_prompt
+assert "Luluka (S1)" not in ordered_prompt
 
 assert mod.segments._context_frame_count(0.92, 124, 96) == 28
 assert mod.segments._context_frame_count(2.0, 124, 96) == 45
 assert mod.segments._context_frame_count(0.1, 124, 96) == 0
 assert mod.segments._context_frame_count(2.0, 40, 96) == 28
+assert mod.segments._empty_sections_mode("不输出") == "自动补全"
 
 previous_motion = s.MotionReferenceData(torch.ones(107, 16, 16, 3),
     {"waveform": torch.ones(1, 2, 142667), "sample_rate": 32000}, "仅动作", 4.0, 107 / 24, 4.0)
@@ -182,11 +189,17 @@ try:
 except ValueError as error:
     assert "140 帧" in str(error) and "141 帧" in str(error)
 assert "1.62" not in compiled_segment.text and "5.62" not in compiled_segment.text
-assert "Generate a continuous single shot." in compiled_segment.text
-assert "The target video is a 4-second" not in compiled_segment.text
-assert "<Subject 2> is Luluka (S1)'s motion sequence derived from <Video 1>" in compiled_segment.text
-assert "Transfer <Subject 2> to Luluka (S1): continue the preceding motion" in compiled_segment.text
+assert "The target video is a 5.88-second continuous single shot." in compiled_segment.text
+assert "[video continuation + reference generation + audio reference]" in compiled_segment.text
+assert "<Subject 2> is the shot-aligned motion sequence derived from <Video 1>" in compiled_segment.text
+assert "<Video 1> is the shot-aligned temporal reference, beginning with 1.88 seconds" in compiled_segment.text
+assert "The opening 1.88 seconds continue the preceding generated segment" in compiled_segment.text
+assert "At 1.88 seconds, the current action phase begins" in compiled_segment.text
+assert "After the opening continuity phase, transfer <Subject 2> to <Subject 1> (Luluka)" in compiled_segment.text
 assert "<Subject 2> (appears in [Shot 1]): attribute_transfer" in compiled_segment.text
+assert "Motion references:" not in compiled_segment.text
+details = compiled_segment.text.split("detailed_description:\n", 1)[1]
+assert details.index("The opening 1.88 seconds") < details.index("From 1.88 to 5.88 seconds, Luluka performs the dance")
 
 previous_without_reference = s.TimelineClipData("body", 0.0, 4.0, "walks forward", "", "", lang, "",
     "on-screen", None, "", None)
@@ -195,12 +208,25 @@ fallback_timeline = s.TimelineData(group, style, env, s.TrackListData((fallback_
 fallback_job = s.GenerationJobData(fallback_timeline, 0.4, "16:9", 0, "simple", 4, 1.0, "match", 2.0, "不输出")
 generated_tail = torch.full((96, 16, 16, 3), 3.0)
 generated_audio = {"waveform": torch.full((1, 2, 128000), 3.0), "sample_rate": 32000}
-_, fallback_references = mod.segments._compile_generation_segment(fallback_job, 1, 45,
+fallback_compiled, fallback_references = mod.segments._compile_generation_segment(fallback_job, 1, 45,
     generated_tail, generated_audio)
 fallback_reference = fallback_references[0]
 assert torch.all(fallback_reference.frames[:45] == 3)
 assert torch.all(fallback_reference.frames[45:] == 2)
 assert torch.all(fallback_reference.audio["waveform"][..., :60000] == 3)
+assert "[video continuation + reference generation + audio reference]" in fallback_compiled.text
+assert "The opening 1.88 seconds continue the preceding generated segment" in fallback_compiled.text
+
+current_without_reference = s.TimelineClipData("body", 4.0, 8.0, "walks toward the door", "", "", lang, "",
+    "on-screen", None, "", None)
+latent_only_track = s.TimelineTrackData("actor", actor, (previous_clip, current_without_reference))
+latent_only_job = s.GenerationJobData(
+    s.TimelineData(group, style, env, s.TrackListData((latent_only_track,)), 8.0),
+    0.4, "16:9", 0, "simple", 4, 1.0, "match", 2.0, "不输出")
+latent_only_compiled, latent_only_references = mod.segments._compile_generation_segment(latent_only_job, 1, 45)
+assert not latent_only_references
+assert "[video continuation + reference generation]" in latent_only_compiled.text
+assert "The opening 1.88 seconds continue the preceding generated segment" in latent_only_compiled.text
 
 class VideoVAE:
     def encode(self, frames):
@@ -253,8 +279,63 @@ empty_group = s.CharacterGroupData((empty_actor,))
 empty_style = s.StyleCardData("", "", "", "", None)
 empty_env = s.EnvironmentInstanceData(s.EnvironmentCardData("", "", "", "", "", "", None), "", "", "", "")
 empty_timeline = s.TimelineData(empty_group, empty_style, empty_env, s.TrackListData(()), 5.0)
-empty_fl = mod.MiniMaxH3FinalPrompt.execute(empty_timeline, 0.98, "16:9", "FL", None, None, "",
-    empty_sections="不输出")[0].text
-assert empty_fl == ""
+t2va = mod.MiniMaxH3FinalPrompt.execute(empty_timeline, 0.98, "16:9", "FL", None, None, "",
+    empty_sections="不输出")[0]
+i2va = mod.MiniMaxH3FinalPrompt.execute(empty_timeline, 0.98, "16:9", "FL", image, None, "",
+    empty_sections="不输出")[0]
+l2va = mod.MiniMaxH3FinalPrompt.execute(empty_timeline, 0.98, "16:9", "FL", None, image, "",
+    empty_sections="不输出")[0]
+fl2va = mod.MiniMaxH3FinalPrompt.execute(empty_timeline, 0.98, "16:9", "FL", image, image, "",
+    empty_sections="不输出")[0]
+assert t2va.video_settings.mode == "T2VA"
+assert t2va.text.startswith("integrated_multimodal_description:")
+assert i2va.video_settings.mode == "I2VA"
+assert i2va.text.startswith("For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.\n\n")
+assert l2va.video_settings.mode == "L2VA"
+assert "<Picture 1> (from [Shot 1]) aligns with the 5.17-second mark" in l2va.text
+assert fl2va.video_settings.mode == "FL2VA"
+assert "Picture 1 (from Shot 1) aligns with the 0.00-second mark" in fl2va.text
+assert "Picture 2 (from Shot 1) aligns with the 5.17-second mark" in fl2va.text
+
+second_card = s.CharacterCardData("Yona", "She is another girl.", "Preserve her identity.",
+    u._reference(image, "character identity"), "", "", "", "", "", "global")
+second_actor = s.ActorInstanceData(second_card, "", "", "", "")
+shared_group = s.CharacterGroupData((actor, second_actor))
+shared_timeline = s.TimelineData(shared_group, style, env, s.TrackListData(()), 5.0)
+shared = mod.MiniMaxH3FinalPrompt.execute(shared_timeline, 0.98, "16:9", "Ref", None, None, "")[0]
+assert len(shared.references) == 1
+assert "<Subject 1> is Luluka, whose identity and appearance come from <Picture 1>." in shared.text
+assert "<Subject 2> is Yona, whose identity and appearance come from <Picture 1>." in shared.text
+
+speech = s.TimelineClipData("speech", 0.0, 2.0, "来抱一个。", "", "", lang, "softly",
+    "off-screen voiceover", None, "", None)
+silent_action = s.TimelineClipData("body", 0.0, 2.0, "turns toward Yona", "", "", lang, "",
+    "on-screen", second_actor, "", None)
+speaker_tracks = s.TrackListData((s.TimelineTrackData("actor", actor, (silent_action,)),
+    s.TimelineTrackData("actor", second_actor, (speech,))))
+speaker_timeline = s.TimelineData(shared_group, style, env, speaker_tracks, 5.0)
+speaker_prompt = mod.MiniMaxH3FinalPrompt.execute(speaker_timeline, 0.98, "16:9", "Ref", None, None, "")[0].text
+assert "<Subject 2> (S1) says in an off-screen voiceover" in speaker_prompt
+assert "while Yona's lips remain completely closed" in speaker_prompt
+assert "Luluka (S" not in speaker_prompt
+assert "retention_analysis:\n<Subject 1> (appears in [Shot 1]):" in speaker_prompt
+
+silent_motion = s.MotionReferenceData(motion_frames, None, "仅动作", 2.0, 2.0)
+silent_clip = mod.MiniMaxH3Action.execute("body", 0.0, 4.0, "follows the dance",
+    motion_reference=silent_motion)[0]
+silent_motion_timeline = s.TimelineData(group, style, env,
+    s.TrackListData((s.TimelineTrackData("actor", actor, (silent_clip,)),)), 4.0)
+silent_motion_prompt = mod.segments._compile_generation_segment(
+    s.GenerationJobData(silent_motion_timeline, 0.4, "16:9", 0, "simple", 4, 1.0, "match", 0.92, "不输出"), 0)[0].text
+assert "<Audio 1>" not in silent_motion_prompt
+assert "The target video is a 4.46-second continuous single shot." in silent_motion_prompt
+assert "From 4 to 4.46 seconds, the final visible state" in silent_motion_prompt
+
+camera_details = action_camera_prompt.split("detailed_description:\n", 1)[1]
+assert camera_details.index("A low-angle wide shot frames Luluka") < camera_details.index("Luluka follows the dance")
+styled = mod.MiniMaxH3FinalPrompt.execute(
+    s.TimelineData(group, s.StyleCardData("2D animation", "", "", "", None), env, tracks, 5.0),
+    0.98, "16:9", "Ref", None, None, "")[0].text
+assert "detailed_description:\n2D animation.\n[Shot 1]" in styled
 
 print("PASS")

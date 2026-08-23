@@ -12,8 +12,8 @@ from comfy_extras.nodes_minimax_h3 import (MiniMaxH3ReferenceToVideo as NativeRe
 
 from .schema import (ASPECT_RATIOS, CATEGORY, EMPTY_SECTION_MODES, EMPTY_SECTION_OPTIONS, FPS,
     H3_GENERATION_JOB, H3_TIMELINE, GenerationJobData, TimelineData, TrackListData)
-from .timeline import MiniMaxH3FinalPrompt, _validate_timeline
-from .utils import _match_reference_video, _same_image, _sentence, _text, _time
+from .timeline import MiniMaxH3FinalPrompt, _reference_subject_layout, _validate_timeline
+from .utils import _match_reference_video, _sentence, _text, _time
 
 
 def _segment_ranges(timeline):
@@ -117,7 +117,8 @@ def _lock_context_prefix(latent, previous_images, previous_audio, video_vae, aud
 def _persistent_state(timeline, start):
     if start <= 1e-6:
         return ""
-    labels = {id(actor): f"{actor.card.name} (S{index})" for index, actor in enumerate(timeline.characters.actors, 1)}
+    labels = {id(actor): actor.card.name or f"Actor {index}"
+        for index, actor in enumerate(timeline.characters.actors, 1)}
     states = []
     for track in timeline.tracks.tracks:
         completed = [clip for clip in track.clips if clip.end_time <= start + 1e-6 and clip.result]
@@ -267,29 +268,27 @@ def _validate_motion_alignment(references, target_frames):
 
 
 def _reference_subject_count(timeline):
-    references = [actor.card.reference for actor in timeline.characters.actors]
-    references.extend((timeline.style.reference, timeline.environment.card.reference))
-    unique = []
-    for reference in filter(None, references):
-        if not any(_same_image(reference.image, item.image) for item in unique):
-            unique.append(reference)
-    return len(unique)
+    return _reference_subject_layout(timeline)[3]
 
 
-def _motion_references(timeline, first_video_number, first_subject_number, has_context=False):
+def _motion_references(timeline, first_video_number, first_subject_number, context_duration=0.0):
     role_text = {
         "仅动作": ("body motion", False),
         "动作与镜头": ("body motion", True),
         "完整表演": ("complete performance", True),
         "动作与声音": ("performance", False),
     }
-    labels = {id(actor): f"{actor.card.name} (S{index})" for index, actor in enumerate(timeline.characters.actors, 1)}
+    actor_subjects = _reference_subject_layout(timeline)[0]
+    labels = {id(actor): actor.card.name or f"Actor {index}"
+        for index, actor in enumerate(timeline.characters.actors, 1)}
     references = []
     instructions = []
     definitions = []
     retentions = []
     summary_labels = []
     camera_labels = []
+    continuation_labels = []
+    audio_labels = []
     video_number = first_video_number
     audio_number = 1
     subject_number = first_subject_number
@@ -301,39 +300,56 @@ def _motion_references(timeline, first_video_number, first_subject_number, has_c
             if reference is None or not _text(clip.content):
                 continue
             owner = labels.get(id(track.owner), "the character")
+            target = (f"<Subject {actor_subjects[id(track.owner)]}> ({owner})"
+                if id(track.owner) in actor_subjects else owner)
             responsibility, uses_camera = role_text[reference.role]
-            if has_context:
-                subject_definition = (f"<Subject {subject_number}> is {owner}'s motion sequence derived from <Video {video_number}>, "
-                    f"beginning with continuity and followed by the current {responsibility}.")
-                line = (f"Transfer <Subject {subject_number}> to {owner}: continue the preceding motion, then reproduce the current "
-                    f"{responsibility} in the supplied order. Preserve {owner}'s declared identity, clothing, and scene.")
+            if context_duration:
+                subject_definition = (f"<Subject {subject_number}> is the shot-aligned motion sequence derived from <Video {video_number}> "
+                    f"and transferred to {target}.")
+                video_role = (f"<Video {video_number}> is the shot-aligned temporal reference, beginning with "
+                    f"{_time(context_duration)} seconds of preceding continuity and followed by the current {responsibility}")
+                if uses_camera:
+                    video_role += ", including its camera behavior"
+                definitions.append(video_role + ".")
+                retentions.append(f"<Video {video_number}> (temporal structure in [Shot 1]): fully_preserved - "
+                    "Preserve the supplied continuity-first order without restarting or anticipating the current action.")
+                continuation_labels.append(f"<Video {video_number}>")
+                line = (f"After the opening continuity phase, transfer <Subject {subject_number}> to {target}. Reproduce the current "
+                    f"{responsibility} in its supplied order and timing while preserving {owner}'s declared identity, clothing, and scene.")
             else:
-                subject_definition = f"<Subject {subject_number}> is {owner}'s {responsibility} derived from <Video {video_number}>."
-                line = (f"Transfer <Subject {subject_number}> to {owner}. Preserve its complete order, "
-                    f"timing, and final pose while rendering {owner}'s declared identity, clothing, and scene.")
+                subject_definition = (f"<Subject {subject_number}> is the {responsibility} derived from <Video {video_number}> "
+                    f"and transferred to {target}.")
+                line = (f"Transfer <Subject {subject_number}> to {target}. Preserve its complete order, timing, and final pose "
+                    f"while rendering {owner}'s declared identity, clothing, and scene.")
             definitions.append(subject_definition)
             retentions.append(f"<Subject {subject_number}> (appears in [Shot 1]): attribute_transfer - "
-                f"Transfer its aligned performance and timing to {owner}.")
+                f"Transfer its aligned performance and timing to {target}.")
             summary_labels.append(f"<Subject {subject_number}>")
-            if uses_camera:
+            if uses_camera and not context_duration:
                 definitions.append(f"<Video {video_number}> provides the camera behavior and temporal structure for [Shot 1].")
                 retentions.append(f"<Video {video_number}> (camera and temporal structure in [Shot 1]): fully_preserved - "
                     "Strictly preserve its camera behavior and temporal order.")
+            if uses_camera:
                 line += f" Follow <Video {video_number}>'s camera behavior and temporal structure."
                 camera_labels.append(f"<Video {video_number}>")
             if reference.audio is not None:
-                line += f" Use its synchronized <Audio {audio_number}>."
-                definitions.append(f"<Audio {audio_number}> is the synchronized sound reference paired with <Video {video_number}>.")
-                retentions.append(f"<Audio {audio_number}>: reference - Use its synchronized timing and sound character.")
+                line += f" Reference <Audio {audio_number}>'s synchronized timing and sound character without copying its signal."
+                definitions.append(f"<Audio {audio_number}> is the explicitly enabled synchronized sound reference from <Video {video_number}>.")
+                retentions.append(f"<Audio {audio_number}>: reference - Follow its synchronized timing and sound character without copying the source signal.")
+                audio_labels.append(f"<Audio {audio_number}>")
                 audio_number += 1
-            instructions.append(_sentence(line))
+            instructions.append((id(clip), _sentence(line)))
             references.append(reference)
             video_number += 1
             subject_number += 1
     summary = "" if not summary_labels else f"The action is guided by {' and '.join(summary_labels)}."
+    if continuation_labels:
+        summary += f" The continuity-first temporal structure is guided by {' and '.join(continuation_labels)}."
     if camera_labels:
         summary += f" The camera and temporal structure are guided by {' and '.join(camera_labels)}."
-    return references, " ".join(instructions), "\n".join(definitions), "\n".join(retentions), summary
+    if audio_labels:
+        summary += f" The synchronized sound is referenced from {' and '.join(audio_labels)}."
+    return references, dict(instructions), "\n".join(definitions), "\n".join(retentions), summary
 
 
 def _compile_generation_segment(generation_job, segment_index, context_frames=0,
@@ -347,8 +363,9 @@ def _compile_generation_segment(generation_job, segment_index, context_frames=0,
     previous_timeline = (_segment_timeline(generation_job.timeline, *ranges[segment_index - 1])
         if segment_index else None)
     state = _persistent_state(generation_job.timeline, start)
+    context_duration = context_frames / FPS
     motion_references, motion_instructions, motion_definitions, motion_retentions, motion_summary = _motion_references(
-        timeline, 1, _reference_subject_count(timeline) + 1, context_frames > 0)
+        timeline, 1, _reference_subject_count(timeline) + 1, context_duration)
     full_performance_actors = {id(track.owner) for track in timeline.tracks.tracks if track.owner_kind == "actor"
         for clip in track.clips if clip.motion_reference is not None and clip.motion_reference.role == "完整表演"}
     camera_references = [reference for reference in motion_references if reference.role in ("动作与镜头", "完整表演")]
@@ -369,11 +386,15 @@ def _compile_generation_segment(generation_job, segment_index, context_frames=0,
         motion_retentions=motion_retentions,
         motion_summary=motion_summary,
         empty_sections=generation_job.empty_sections,
-        continuity_keyframe=False,
         suppress_initial_state=context_frames > 0,
         suppress_actor_state_ids=full_performance_actors,
         suppress_camera_tracks=uses_reference_camera,
-        generation_duration=timeline.duration + context_frames / FPS
+        generation_duration=timeline.duration + context_duration,
+        timeline_offset=context_duration,
+        opening_instructions=(f"The opening {_time(context_duration)} seconds continue the preceding generated segment without a cut, "
+            "preserving its motion direction, pose, framing, lighting, environment, and synchronized sound. "
+            f"At {_time(context_duration)} seconds, the current action phase begins" if context_duration else ""),
+        continuation=context_frames > 0,
     )[0]
     motion_references = _align_motion_context(timeline, previous_timeline, motion_references, context_frames,
         compiled.video_settings.length, previous_images, previous_audio)
@@ -384,11 +405,11 @@ def _compile_generation_segment(generation_job, segment_index, context_frames=0,
 def _empty_sections_mode(value):
     if value in EMPTY_SECTION_MODES:
         return value
-    if value in (1, "1"):
-        return "不输出"
+    if value in (1, "1", "不输出"):
+        return "自动补全"
     if value in (2, "2"):
         return "输出 N/A"
-    return "不输出"
+    return "自动补全"
 
 
 class MiniMaxH3GenerationJob(io.ComfyNode):
@@ -404,13 +425,13 @@ class MiniMaxH3GenerationJob(io.ComfyNode):
             io.Int.Input("steps", display_name="采样步数", default=4, min=1, max=10000),
             io.Float.Input("denoise", display_name="降噪强度", default=1.0, min=0.0, max=1.0, step=0.01),
             io.Combo.Input("ref_image_size", display_name="参考媒体尺寸", options=["match", "max"], default="match"),
-            io.Combo.Input("empty_sections", display_name="空节处理", options=EMPTY_SECTION_OPTIONS, default="不输出"),
+            io.Combo.Input("empty_sections", display_name="声音空节处理", options=EMPTY_SECTION_OPTIONS, default="自动补全"),
             io.Float.Input("continuity_seconds", display_name="段间引导长度（秒）", default=0.92, min=0.21, max=2.33, step=0.01)],
             outputs=[H3_GENERATION_JOB.Output(display_name="generation_job")])
 
     @classmethod
     def execute(cls, timeline, megapixels, aspect_ratio, seed, scheduler, steps, denoise, ref_image_size,
-                continuity_seconds, empty_sections="不输出"):
+                continuity_seconds, empty_sections="自动补全"):
         if not isinstance(timeline, TimelineData):
             raise TypeError("生成任务包需要 MiniMax H3 时间轴")
         empty_sections = _empty_sections_mode(empty_sections)

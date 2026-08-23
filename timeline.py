@@ -56,7 +56,33 @@ def _validate_timeline(timeline):
                 raise ValueError(f"Timeline conflict: {owner[0]} {kind} clips overlap")
 
 
-def _render_clip(track, clip, labels, timeline_duration):
+def _speaker_ids(timeline):
+    events = sorted(((clip.start_time, track_index, clip_index, id(track.owner))
+        for track_index, track in enumerate(timeline.tracks.tracks) if track.owner_kind == "actor"
+        for clip_index, clip in enumerate(track.clips) if clip.kind == "speech" and _text(clip.content)),
+        key=lambda item: (item[0], item[1], item[2]))
+    speakers = {}
+    for _, _, _, actor_id in events:
+        if actor_id not in speakers:
+            speakers[actor_id] = f"S{len(speakers) + 1}"
+    return speakers
+
+
+def _reference_subject_layout(timeline):
+    actor_subjects = {}
+    next_number = 1
+    for actor in timeline.characters.actors:
+        if actor.card.reference is not None:
+            actor_subjects[id(actor)] = next_number
+            next_number += 1
+    style_subject = next_number if timeline.style.reference is not None else None
+    next_number += style_subject is not None
+    environment_subject = next_number if timeline.environment.card.reference is not None else None
+    next_number += environment_subject is not None
+    return actor_subjects, style_subject, environment_subject, next_number - 1
+
+
+def _render_clip(track, clip, labels, subject_labels, speaker_ids, timeline_duration, time_offset=0.0):
     content = _text(clip.content)
     quality = clip.quality
     end_state = clip.result
@@ -70,7 +96,10 @@ def _render_clip(track, clip, labels, timeline_duration):
                 voice = f" using {details}" if details else ""
                 delivery = f" {_text(clip.delivery)}" if clip.delivery else ""
                 mode = " says in an off-screen voiceover" if clip.speech_type == "off-screen voiceover" else " says"
-                text = f"{label}{mode}{voice}{delivery}: <d>[{clip.language.language}] {content}</d>"
+                speaker = f"{subject_labels.get(id(track.owner), label)} ({speaker_ids[id(track.owner)]})"
+                text = f"{speaker}{mode}{voice}{delivery}: <d>[{clip.language.language}] {content}</d>"
+                if clip.speech_type == "off-screen voiceover":
+                    text += f" while {label}'s lips remain completely closed"
             else:
                 text = f"{label} {content}"
                 if clip.target is not None:
@@ -94,8 +123,10 @@ def _render_clip(track, clip, labels, timeline_duration):
         parts.append(_sentence(f"Afterward, {end_state}"))
     if not parts:
         return ""
-    covers_shot = clip.start_time <= 1e-6 and clip.end_time >= timeline_duration - 1e-6
-    prefix = "" if covers_shot or not content else f"From {_time(clip.start_time)} to {_time(clip.end_time)} seconds, "
+    start_time = clip.start_time + time_offset
+    end_time = clip.end_time + time_offset
+    covers_shot = start_time <= 1e-6 and end_time >= timeline_duration - 1e-6
+    prefix = "" if covers_shot or not content else f"From {_time(start_time)} to {_time(end_time)} seconds, "
     return prefix + " ".join(parts)
 
 
@@ -113,9 +144,10 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
 
     @classmethod
     def execute(cls, timeline, megapixels, aspect_ratio, prompt_format="Ref", first_frame=None, last_frame=None,
-                additional_instructions="", motion_instructions="", empty_sections="不输出", continuity_keyframe=False,
+                additional_instructions="", motion_instructions=None, empty_sections="自动补全",
                 suppress_initial_state=False, generation_duration=None, motion_definitions="",
-                motion_retentions="", motion_summary="", suppress_actor_state_ids=(), suppress_camera_tracks=False):
+                motion_retentions="", motion_summary="", suppress_actor_state_ids=(), suppress_camera_tracks=False,
+                timeline_offset=0.0, opening_instructions="", continuation=False):
         if not isinstance(timeline, TimelineData):
             raise TypeError("Timeline compiler requires TimelineData")
         _validate_timeline(timeline)
@@ -123,11 +155,21 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
             raise ValueError("Ref mode does not use first_frame or last_frame")
         width, height = _video_size(megapixels, aspect_ratio)
         length = _video_length(generation_duration if generation_duration is not None else timeline.duration)
-        settings = VideoSettingsData("Ref2VA" if prompt_format == "Ref" else "I2VA-continuation", width, height, length,
-                                     length / FPS, first_frame, last_frame)
-        references, definitions, retentions = [], {}, {}
+        actual_duration = length / FPS
+        if prompt_format == "Ref":
+            mode = "Ref2VA"
+        elif first_frame is not None and last_frame is not None:
+            mode = "FL2VA"
+        elif first_frame is not None:
+            mode = "I2VA"
+        elif last_frame is not None:
+            mode = "L2VA"
+        else:
+            mode = "T2VA"
+        settings = VideoSettingsData(mode, width, height, length, actual_duration, first_frame, last_frame)
+        references = []
 
-        def add_reference(reference, definition, marker, retention):
+        def add_picture(reference):
             if reference is None:
                 return None
             existing = next((item for item in references if _same_image(item.image, reference.image)), None)
@@ -136,23 +178,31 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
                 references.append(ReferenceImageData(number, reference.image, reference.role, reference.usage))
             else:
                 number = existing.picture_number
-            definitions.setdefault(number, definition.format(number=number))
-            retentions.setdefault(number, (marker, _text(retention)))
             return number
 
-        actor_labels = tuple(f"{actor.card.name} (S{index})" for index, actor in enumerate(timeline.characters.actors, 1))
+        actor_subjects, style_subject, environment_subject, _ = _reference_subject_layout(timeline)
+        definitions = {}
+        retentions = {}
+        actor_labels = tuple(actor.card.name or f"Actor {index}" for index, actor in enumerate(timeline.characters.actors, 1))
         labels = {id(actor): actor_labels[index] for index, actor in enumerate(timeline.characters.actors)}
+        subject_labels = {actor_id: f"<Subject {number}>" for actor_id, number in actor_subjects.items()}
+        speaker_ids = _speaker_ids(timeline)
         character_lines = []
         for actor in timeline.characters.actors:
             card, label = actor.card, labels[id(actor)]
             description = _card_description(card.description, card.name)
-            number = None
+            subject_number = actor_subjects.get(id(actor))
             if prompt_format == "Ref":
-                number = add_reference(card.reference,
-                    f"<Subject {{number}}> is {card.name}, whose identity and appearance come from <Picture {{number}}>. {card.name} is {_lower_first(description)}",
-                    "fully_preserved", card.preservation or
-                    "Preserve identity and appearance while allowing new pose and framing.")
-            identity = f"{label} is <Subject {number}>" if number else (f"{label} is {_lower_first(description)}" if description else "")
+                picture_number = add_picture(card.reference)
+                if subject_number is not None:
+                    definition = f"<Subject {subject_number}> is {label}, whose identity and appearance come from <Picture {picture_number}>."
+                    if description:
+                        definition += f" {label} is {_lower_first(description)}"
+                    definitions[subject_number] = definition
+                    retentions[subject_number] = ("fully_preserved", card.preservation or
+                        "Preserve identity and appearance while allowing new pose and framing.")
+            identity = (f"{label} is represented by <Subject {subject_number}>" if subject_number is not None else
+                (f"{label} is {_lower_first(description)}" if description else ""))
             if identity:
                 character_lines.append(_sentence(identity))
                 
@@ -167,51 +217,66 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
                 rule = "prioritize this character-specific style over conflicting global style" if card.style_priority == "character" else "the global style takes priority; use this character style only where compatible"
                 character_lines.append(_sentence(f"For {label}, {rule}: {_card_description(card.character_style, card.name)}"))
 
-        style_number = None
-        environment_number = None
         if prompt_format == "Ref":
-            style_number = add_reference(timeline.style.reference,
-                "<Subject {number}> is the visual style derived from <Picture {number}>.", "partially_preserved",
-                (timeline.style.reference.usage or "Use its visual style without preserving its subjects or composition.")
-                if timeline.style.reference else "")
-            environment_number = add_reference(timeline.environment.card.reference,
-                f"<Subject {{number}}> is the {timeline.environment.card.name} environment derived from <Picture {{number}}>.",
-                "partially_preserved", timeline.environment.card.preservation or
-                "Preserve the recognizable environment while allowing new framing and subject placement.")
+            if style_subject is not None:
+                picture_number = add_picture(timeline.style.reference)
+                definitions[style_subject] = f"<Subject {style_subject}> is the visual style derived from <Picture {picture_number}>."
+                retentions[style_subject] = ("partially_preserved", timeline.style.reference.usage or
+                    "Use its visual style without preserving its subjects or composition.")
+            if environment_subject is not None:
+                picture_number = add_picture(timeline.environment.card.reference)
+                definitions[environment_subject] = (f"<Subject {environment_subject}> is the "
+                    f"{timeline.environment.card.name} environment derived from <Picture {picture_number}>.")
+                retentions[environment_subject] = ("partially_preserved", timeline.environment.card.preservation or
+                    "Preserve the recognizable environment while allowing new framing and subject placement.")
         if prompt_format == "Ref" and not references:
             raise ValueError("Ref mode requires at least one character, style, or environment reference image")
 
-        style_parts = [timeline.style.style, timeline.style.rendering, timeline.style.color_palette, timeline.style.texture]
-        if style_number:
-            style_parts.append(_sentence(f"Use <Subject {style_number}> as the global visual reference. {timeline.style.reference.usage}"))
+        style_parts = list(filter(_text, map(_sentence,
+            (timeline.style.style, timeline.style.rendering, timeline.style.color_palette, timeline.style.texture))))
+        if style_subject is not None:
+            style_parts.append(_sentence(f"Use <Subject {style_subject}> as the global visual reference. {timeline.style.reference.usage}"))
         card, environment = timeline.environment.card, timeline.environment
         environment_parts = [_resolved(card.location, environment.location_override),
             _resolved(card.default_time_weather, environment.time_weather_override),
             _resolved(card.default_background, environment.background_override),
             _resolved(card.default_atmosphere, environment.atmosphere_override)]
-        if environment_number:
-            environment_parts.insert(0, _sentence(f"Use <Subject {environment_number}> as the environment reference. {card.reference.usage}"))
+        if environment_subject is not None:
+            environment_parts.insert(0, _sentence(
+                f"Use <Subject {environment_subject}> as the environment reference. {card.reference.usage}"))
 
-        continuous_events, timed_events, soundscape, music = [], [], [], []
+        opening_events, timed_events, soundscape, music = [], [], [], []
+        motion_instructions = motion_instructions or {}
         for track_index, track in enumerate(timeline.tracks.tracks):
             if suppress_camera_tracks and track.owner_kind == "camera":
                 continue
             for clip_index, clip in enumerate(track.clips):
                 if clip.kind == "audio" and _text(clip.content):
                     covers_shot = clip.start_time <= 1e-6 and clip.end_time >= timeline.duration - 1e-6
-                    timed = (_sentence(clip.content) if covers_shot else
-                        f"From {_time(clip.start_time)} to {_time(clip.end_time)} seconds, {_sentence(clip.content)}")
-                    (music if clip.audio_type == "music" else soundscape).append(timed)
-                    continue
-                rendered = _render_clip(track, clip, labels, timeline.duration)
-                event = (clip.start_time, clip.end_time, track_index, clip_index, track, rendered)
-                if track.owner_kind != "actor" and clip.start_time <= 1e-6 and clip.end_time >= timeline.duration - 1e-6:
-                    continuous_events.append(event)
+                    audio_text = " ".join(filter(_text, (_sentence(clip.content), clip.quality)))
+                    if clip.audio_type == "music":
+                        music.append(audio_text if covers_shot else
+                            f"From {_time(clip.start_time + timeline_offset)} to {_time(clip.end_time + timeline_offset)} seconds, {audio_text}")
+                        continue
+                    if covers_shot:
+                        soundscape.append(audio_text)
+                        continue
+                rendered = _render_clip(track, clip, labels, subject_labels, speaker_ids,
+                    actual_duration, timeline_offset)
+                motion_text = motion_instructions.get(id(clip), "")
+                if motion_text:
+                    rendered = " ".join(filter(_text, (rendered, motion_text)))
+                event = (clip.start_time + timeline_offset, clip.end_time + timeline_offset,
+                    track_index, clip_index, track, rendered)
+                if (timeline_offset <= 1e-6 and track.owner_kind != "actor" and
+                        clip.start_time <= 1e-6 and clip.end_time >= timeline.duration - 1e-6):
+                    opening_events.append(event)
                 else:
                     timed_events.append(event)
-        continuous_events.sort(key=lambda item: (item[2], item[3]))
-        owner_priority = {"actor": 0, "environment": 1, "camera": 2, "lighting": 3}
-        timed_events.sort(key=lambda item: (item[0], owner_priority.get(item[4].owner_kind, 4), item[2], item[3]))
+        opening_priority = {"camera": 0, "environment": 1, "lighting": 2, "audio": 3}
+        opening_events.sort(key=lambda item: (opening_priority.get(item[4].owner_kind, 4), item[2], item[3]))
+        owner_priority = {"camera": 0, "environment": 1, "lighting": 2, "actor": 3, "audio": 4}
+        timed_events.sort(key=lambda item: (item[0], owner_priority.get(item[4].owner_kind, 5), item[2], item[3]))
         timeline_lines = []
         actor_end_times = {}
         for start_time, end_time, _, _, track, rendered in timed_events:
@@ -223,35 +288,39 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
             if track.owner_kind == "actor":
                 actor_end_times[id(track.owner)] = max(end_time, actor_end_times.get(id(track.owner), end_time))
             timeline_lines.append(rendered)
-        continuity_number = len(references) + 1 if continuity_keyframe else None
-        continuity_parts = []
-        if continuity_keyframe:
-            continuity_parts.extend([_sentence(
-                f"How the reference pictures align with the target video - <Picture {continuity_number}> aligns with "
-                "the 0.00-second mark of the target video as the exact opening frame."),
-                _sentence(f"At 0.00 seconds the frame is exactly <Picture {continuity_number}> without reinterpretation.")])
-        if empty_sections == "输出 N/A":
-            detailed_parts = [*continuity_parts, "[Shot 1]", *style_parts, *environment_parts, *character_lines,
-                *timeline_lines]
-            if continuous_events:
-                detailed_parts.extend(item[5] for item in continuous_events)
-            if additional_instructions:
-                detailed_parts.append(_sentence(additional_instructions))
-            if motion_instructions:
-                detailed_parts.extend(["Motion references:", _sentence(motion_instructions)])
-            detailed = " ".join(filter(_text, detailed_parts))
+        frame_anchors = []
+        if mode == "I2VA":
+            frame_anchors.append("The shot begins from <Picture 1>, preserving its subjects, composition, lighting, and spatial relationships.")
+        elif mode == "FL2VA":
+            frame_anchors.extend(("The shot begins from Picture 1, preserving its opening composition and visible state.",
+                "The action and camera path progressively converge to Picture 2 as the exact final composition."))
+        elif mode == "L2VA":
+            frame_anchors.append("The action and camera path progressively converge to <Picture 1> as the exact final composition.")
+        body_parts = [*frame_anchors, *(item[5] for item in opening_events), *environment_parts, *character_lines]
+        if additional_instructions:
+            body_parts.append(_sentence(additional_instructions))
+        if opening_instructions:
+            body_parts.append(_sentence(opening_instructions))
+        body_parts.extend(timeline_lines)
+        described_end = timeline_offset + timeline.duration
+        last_timed_end = max((item[1] for item in timed_events if _text(item[5])), default=described_end)
+        if last_timed_end < described_end - 1e-6:
+            body_parts.append(f"From {_time(last_timed_end)} to {_time(described_end)} seconds, the established subject states "
+                "continue naturally without an unintended reset or a new action.")
+        if actual_duration > described_end + 1e-6:
+            body_parts.append(f"From {_time(described_end)} to {_time(actual_duration)} seconds, the final visible state, "
+                "framing, lighting, environment, and synchronized sound remain stable without introducing a new action.")
+        shot_body = " ".join(filter(_text, body_parts))
+        if prompt_format == "Ref":
+            style_text = " ".join(style_parts) or "The target video maintains a coherent visual style across the entire shot."
+            detailed = f"{style_text}\n[Shot 1] {shot_body}".strip()
         else:
-            body_parts = [*continuity_parts, *style_parts, *environment_parts, *character_lines]
-            if timeline_lines:
-                body_parts.extend(timeline_lines)
-            if continuous_events:
-                body_parts.extend(item[5] for item in continuous_events)
-            if additional_instructions:
-                body_parts.append(_sentence(additional_instructions))
-            if motion_instructions:
-                body_parts.extend(["Motion references:", _sentence(motion_instructions)])
-            body = " ".join(filter(_text, body_parts))
-            detailed = " ".join(filter(_text, ["[Shot 1]", body])) if body else ""
+            detailed = " ".join(filter(_text, ("[Shot 1]", *style_parts, shot_body)))
+
+        missing_soundscape = ("N/A" if empty_sections == "输出 N/A" else
+            "Natural environmental ambience and physically synchronized movement sounds remain spatially coherent throughout the shot.")
+        soundscape_text = " ".join(soundscape) or missing_soundscape
+        music_text = " ".join(music) or "N/A"
 
         if prompt_format == "Ref":
             numbers = sorted(definitions)
@@ -263,21 +332,16 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
                 definitions_text += "\n" + motion_definitions
             if motion_retentions:
                 retentions_text += "\n" + motion_retentions
-            if continuity_keyframe:
-                definitions_text += (f"\n<Picture {continuity_number}> is the exact opening frame of this segment at 0.00 seconds, "
-                    f"extracted from the last frame of the previous segment without reinterpretation. "
-                    f"<Video 1> is the previous segment's tail and provides motion continuity.")
-                retentions_text += (f"\n<Picture {continuity_number}> (at 0.00s): fully_preserved - exact opening frame; "
-                    f"the first frame of this segment must match it. "
-                    f"<Video 1>: partially_preserved - motion continuity reference; continue the preceding movement; do not restart it.")
-            summary_tag = "[keyframe completion + reference generation]" if continuity_keyframe else "[reference generation]"
+            task_types = (["video continuation"] if continuation else []) + ["reference generation"]
+            if "<Audio " in motion_definitions:
+                task_types.append("audio reference")
+            summary_tag = "[" + " + ".join(task_types) + "]"
             primary = next(((track, clip) for track in timeline.tracks.tracks if track.owner_kind == "actor"
                 for clip in track.clips if clip.kind == "body" and _text(clip.content)), None)
             if primary is None:
                 primary = next(((track, clip) for track in timeline.tracks.tracks if track.owner_kind == "actor"
                     for clip in track.clips if _text(clip.content)), None)
-            summary = (f"{summary_tag} Generate a continuous single shot." if generation_duration is not None else
-                f"{summary_tag} The target video is a {_time(timeline.duration)}-second continuous single shot.")
+            summary = f"{summary_tag} The target video is a {_time(actual_duration)}-second continuous single shot."
             if primary is not None:
                 track, clip = primary
                 summary += f" Main visible action: {labels[id(track.owner)]} {_lower_first(_text(clip.content))}."
@@ -286,31 +350,25 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
                 summary += " " + motion_summary
             result = ["subject_definitions:\n" + definitions_text,
                 "summary:\n" + summary,
-                "retention_analysis:\n" + retentions_text]
-            if empty_sections == "输出 N/A":
-                result.extend(["detailed_description:\n" + detailed,
-                    "overall_soundscape:\n" + (" ".join(soundscape) or "N/A"),
-                    "non_diegetic_music:\n" + (" ".join(music) or "N/A")])
-            else:
-                if detailed:
-                    result.append("detailed_description:\n" + detailed)
-                if soundscape:
-                    result.append("overall_soundscape:\n" + " ".join(soundscape))
-                if music:
-                    result.append("non_diegetic_music:\n" + " ".join(music))
+                "retention_analysis:\n" + retentions_text,
+                "detailed_description:\n" + detailed,
+                "overall_soundscape:\n" + soundscape_text,
+                "non_diegetic_music:\n" + music_text]
         else:
-            result = []
-            if empty_sections == "输出 N/A":
-                result.extend(["integrated_multimodal_description: " + detailed,
-                    "overall_soundscape: " + (" ".join(soundscape) or "N/A"),
-                    "non_diegetic_music: " + (" ".join(music) or "N/A")])
-            else:
-                if detailed:
-                    result.append("integrated_multimodal_description: " + detailed)
-                if soundscape:
-                    result.append("overall_soundscape: " + " ".join(soundscape))
-                if music:
-                    result.append("non_diegetic_music: " + " ".join(music))
+            instruction = ""
+            if mode == "I2VA":
+                instruction = "For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced."
+            elif mode == "FL2VA":
+                instruction = ("How the reference pictures align with the target video — Picture 1 (from Shot 1) aligns with "
+                    f"the 0.00-second mark of the target video; Picture 2 (from Shot 1) aligns with the {actual_duration:.2f}-second mark of the target video.")
+            elif mode == "L2VA":
+                instruction = ("How the reference pictures align with the target video — <Picture 1> (from [Shot 1]) aligns with "
+                    f"the {actual_duration:.2f}-second mark of the target video.")
+            result = ["integrated_multimodal_description: " + detailed,
+                "overall_soundscape: " + soundscape_text,
+                "non_diegetic_music: " + music_text]
+            if instruction:
+                result.insert(0, instruction)
         return io.NodeOutput(CompletePromptData(_bind_actor_tokens("\n\n".join(result), actor_labels), tuple(references), settings))
 
 

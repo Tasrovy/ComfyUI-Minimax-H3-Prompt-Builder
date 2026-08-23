@@ -8,8 +8,8 @@ FPS = 24
 ASPECT_RATIOS = {"16:9": (16, 9), "9:16": (9, 16), "1:1": (1, 1), "4:3": (4, 3), "3:4": (3, 4), "3:2": (3, 2), "2:3": (2, 3), "21:9": (21, 9)}
 ACTOR_KINDS = ("body", "expression", "gaze", "speech")
 SYSTEM_KINDS = ("camera", "lighting", "audio")
-EMPTY_SECTION_MODES = ("不输出", "输出 N/A")
-EMPTY_SECTION_OPTIONS = list(EMPTY_SECTION_MODES) + [1, 2]
+EMPTY_SECTION_MODES = ("自动补全", "输出 N/A")
+EMPTY_SECTION_OPTIONS = list(EMPTY_SECTION_MODES) + ["不输出", 1, 2]
 
 H3_CHARACTER_CARD = io.Custom("MINIMAX_H3_CHARACTER_CARD")
 H3_ACTOR_INSTANCE = io.Custom("MINIMAX_H3_ACTOR_INSTANCE")
