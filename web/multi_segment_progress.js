@@ -7,6 +7,13 @@ const STAGE_LABELS = {
     noise: "准备噪声",
     guider: "准备引导器",
     scheduler: "准备采样计划",
+    separate: "拆分一采音视频 Latent",
+    source_decode: "解码一采画面",
+    source_components: "读取已有片段",
+    resize: "放大一采画面",
+    encode: "重新编码放大画面",
+    concat: "合并音视频 Latent",
+    lock: "锁定上一段二采 Latent",
     sampling: "模型采样",
     video_decode: "解码画面",
     audio_decode: "解码声音",
@@ -25,6 +32,13 @@ const STAGE_PROGRESS = {
     noise: 0.05,
     guider: 0.07,
     scheduler: 0.09,
+    separate: 0.03,
+    source_decode: 0.04,
+    source_components: 0.04,
+    resize: 0.05,
+    encode: 0.07,
+    concat: 0.08,
+    lock: 0.09,
     sampling: 0.1,
     video_decode: 0.88,
     audio_decode: 0.92,
@@ -41,7 +55,7 @@ const STAGE_PROGRESS = {
 const STAGE_ORDER = Object.keys(STAGE_LABELS);
 
 function parseStage(nodeId) {
-    const match = String(nodeId).match(/segment_(\d+)_of_(\d+)_(conditioning|noise|guider|scheduler|sampling|video_decode|audio_decode|trim|result_prepare|segment_video|checkpoint|cache_load|components|join|final_video)$/);
+    const match = String(nodeId).match(/segment_(\d+)_of_(\d+)_(conditioning|separate|source_decode|source_components|resize|encode|concat|lock|noise|guider|scheduler|sampling|video_decode|audio_decode|trim|result_prepare|segment_video|checkpoint|cache_load|components|join|final_video)$/);
     return match ? { segment: Number(match[1]), total: Number(match[2]), stage: match[3] } : null;
 }
 
@@ -191,7 +205,7 @@ function progressText(node, detail) {
 app.registerExtension({
     name: "MiniMaxH3.MultiSegmentProgress",
     async beforeRegisterNodeDef(nodeType, nodeData, app) {
-        if (nodeData.name !== "MiniMaxH3MultiSegmentGenerate") {
+        if (!["MiniMaxH3MultiSegmentGenerate", "MiniMaxH3MultiSegmentSecondPass"].includes(nodeData.name)) {
             return;
         }
         const onNodeCreated = nodeType.prototype.onNodeCreated;
@@ -207,7 +221,7 @@ app.registerExtension({
             this.segmentProgressWidget.inputEl.placeholder = "执行后显示每一步的进度和耗时";
             this.segmentProgressWidget.serializeValue = async () => "";
             this.segmentProgressWidget.value = "等待执行";
-            this.addWidget("button", "停止生成并保留已完成片段", null, () => {
+            this.addWidget("button", "停止并保留已完成片段", null, () => {
                 void api.interrupt();
             });
             resetTiming(this);
@@ -218,7 +232,8 @@ app.registerExtension({
 
 api.addEventListener("execution_start", () => {
     for (const node of app.graph?._nodes ?? []) {
-        if (node.type !== "MiniMaxH3MultiSegmentGenerate" || !node.segmentProgressWidget) {
+        if (!["MiniMaxH3MultiSegmentGenerate", "MiniMaxH3MultiSegmentSecondPass"].includes(node.type)
+            || !node.segmentProgressWidget) {
             continue;
         }
         resetTiming(node);
@@ -228,7 +243,8 @@ api.addEventListener("execution_start", () => {
 
 api.addEventListener("progress_state", ({ detail }) => {
     for (const node of app.graph?._nodes ?? []) {
-        if (node.type !== "MiniMaxH3MultiSegmentGenerate" || !node.segmentProgressWidget) {
+        if (!["MiniMaxH3MultiSegmentGenerate", "MiniMaxH3MultiSegmentSecondPass"].includes(node.type)
+            || !node.segmentProgressWidget) {
             continue;
         }
         const text = progressText(node, detail);

@@ -28,6 +28,8 @@ H3_TRACK_LIST = io.Custom("MINIMAX_H3_TRACK_LIST")
 H3_TIMELINE = io.Custom("MINIMAX_H3_TIMELINE")
 H3_PROMPT = io.Custom("MINIMAX_H3_PROMPT")
 H3_GENERATION_JOB = io.Custom("MINIMAX_H3_GENERATION_JOB")
+H3_SECOND_PASS_ENTRY = io.Custom("MINIMAX_H3_SECOND_PASS_ENTRY")
+H3_SECOND_PASS_BATCH = io.Custom("MINIMAX_H3_SECOND_PASS_BATCH")
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +222,23 @@ class GenerationJobData:
     empty_sections: str
 
 
+@dataclass(frozen=True, slots=True)
+class SecondPassEntryData:
+    segment_index: int
+    conditioning: object | None
+    latent: object | None
+    video: object
+    context_frames: int
+    generation_frames: int
+    visible_duration: float
+    cache_file: str
+
+
+@dataclass(frozen=True, slots=True)
+class SecondPassBatchData:
+    entries: tuple[SecondPassEntryData, ...]
+
+
 for custom_type, data_type in ((H3_CHARACTER_CARD, CharacterCardData), (H3_ACTOR_INSTANCE, ActorInstanceData),
                                (H3_CHARACTER_GROUP, CharacterGroupData), (H3_LANGUAGE, LanguageData),
                                (H3_STYLE_CARD, StyleCardData), (H3_ENVIRONMENT_CARD, EnvironmentCardData),
@@ -230,5 +249,7 @@ for custom_type, data_type in ((H3_CHARACTER_CARD, CharacterCardData), (H3_ACTOR
                                (H3_TIMELINE_CLIP, TimelineClipData),
                                (H3_TIMELINE_TRACK, TimelineTrackData), (H3_TRACK_LIST, TrackListData),
                                (H3_TIMELINE, TimelineData), (H3_PROMPT, CompletePromptData),
-                               (H3_GENERATION_JOB, GenerationJobData)):
+                               (H3_GENERATION_JOB, GenerationJobData),
+                               (H3_SECOND_PASS_ENTRY, SecondPassEntryData),
+                               (H3_SECOND_PASS_BATCH, SecondPassBatchData)):
     custom_type.Type = data_type

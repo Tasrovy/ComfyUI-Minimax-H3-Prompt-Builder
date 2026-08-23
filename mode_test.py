@@ -492,6 +492,14 @@ class FakeModel:
 expanded = mod.MiniMaxH3MultiSegmentGenerate.execute(FakeModel(), object(), object(), object(), object(), job,
     "重新生成全部片段", 0)
 assert expanded.expand is not None
+assert len(expanded.result) == 2
+entry = mod.MiniMaxH3SecondPassEntryPack.execute(object(), 0, 0, 5, 5 / 24, "segment_001_" + "0" * 24 + ".mp4",
+    conditioning=object(), latent={"samples": object()})[0]
+batch = mod.MiniMaxH3SecondPassBatchAppend.execute(entry)[0]
+assert batch.entries == (entry,)
+second_pass = mod.MiniMaxH3MultiSegmentSecondPass.execute(FakeModel(), object(), object(), object(), batch,
+    cache_mode="重新生成全部片段")
+assert second_pass.expand is not None
 
 camera_details = action_camera_prompt.split("detailed_description:\n", 1)[1]
 assert camera_details.index("A low-angle wide shot frames Luluka") < camera_details.index("Luluka follows the dance")

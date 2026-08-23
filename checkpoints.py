@@ -16,14 +16,16 @@ from .utils import _video_size
 
 
 CACHE_SUBFOLDER = "video/MiniMax H3 Segments"
-_CACHE_NAME = re.compile(r"segment_\d{3}_[0-9a-f]{24}\.mp4")
+SECOND_PASS_CACHE_SUBFOLDER = "video/MiniMax H3 Second Pass"
+_CACHE_NAME = re.compile(r"(?:segment|second_segment)_\d{3}_[0-9a-f]{24}\.mp4")
 
 
 def _cache_path(filename):
     if not _CACHE_NAME.fullmatch(filename):
         raise ValueError("无效的 MiniMax H3 分段缓存文件名")
     root = Path(folder_paths.get_output_directory()).resolve()
-    folder = (root / CACHE_SUBFOLDER).resolve()
+    subfolder = SECOND_PASS_CACHE_SUBFOLDER if filename.startswith("second_segment_") else CACHE_SUBFOLDER
+    folder = (root / subfolder).resolve()
     if folder != root and root not in folder.parents:
         raise ValueError("MiniMax H3 分段缓存目录超出输出目录")
     return folder / filename
@@ -59,7 +61,9 @@ def _load_latent(path):
 
 
 def _saved_results(filenames):
-    return [ui.SavedResult(name, CACHE_SUBFOLDER, io.FolderType.output) for name in filenames]
+    return [ui.SavedResult(name,
+        SECOND_PASS_CACHE_SUBFOLDER if name.startswith("second_segment_") else CACHE_SUBFOLDER,
+        io.FolderType.output) for name in filenames]
 
 
 def _tensor_digest(tensor, memo):
@@ -137,6 +141,33 @@ def segment_cache_files(generation_job, model, sampler, cache_version):
         }
         previous = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
         files.append(f"segment_{index + 1:03d}_{previous[:24]}.mp4")
+    return tuple(files)
+
+
+def second_pass_cache_files(batch, model, sampler, settings, cache_version):
+    model_signature = {
+        "class": f"{type(model.model).__module__}.{type(model.model).__qualname__}",
+        "size": model.model_size(),
+        "patch_keys": sorted(map(str, model.patches)),
+        "sampler": f"{type(sampler).__module__}.{type(sampler).__qualname__}",
+        "cache_version": int(cache_version),
+    }
+    previous = ""
+    files = []
+    for entry in batch.entries:
+        payload = {
+            "pipeline": "multi-segment-second-pass-v1",
+            "segment": entry.segment_index,
+            "source": entry.cache_file,
+            "context_frames": entry.context_frames,
+            "generation_frames": entry.generation_frames,
+            "visible_duration": entry.visible_duration,
+            "settings": settings,
+            "model": model_signature,
+            "previous": previous,
+        }
+        previous = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        files.append(f"second_segment_{entry.segment_index + 1:03d}_{previous[:24]}.mp4")
     return tuple(files)
 
 
