@@ -33,54 +33,100 @@ track = s.TimelineTrackData("actor", actor, (clip,))
 tracks = s.TrackListData((track,))
 timeline = s.TimelineData(group, style, env, tracks, 5.0)
 
+safe_card = mod.MiniMaxH3Character.execute("Luluka", "A short girl with long blue hair.", "", "global", image)[0]
+assert not any((safe_card.default_position, safe_card.default_pose, safe_card.default_emotion,
+    safe_card.default_appearance))
+assert safe_card.preservation == "Preserve identity and fixed appearance throughout the video."
+safe_environment = mod.MiniMaxH3Environment.execute("bridge", "A steel pedestrian bridge.",
+    "Fixed railings line both sides.", image)[0]
+assert not safe_environment.default_time_weather and not safe_environment.default_atmosphere
+assert safe_environment.location == "A steel pedestrian bridge."
+
 motion_frames = torch.arange(48, dtype=torch.float32).reshape(48, 1, 1, 1).expand(-1, 16, 16, 3)
 motion_audio = {"waveform": torch.zeros(1, 2, 64000), "sample_rate": 32000}
-motion = s.MotionReferenceData(motion_frames, motion_audio, "仅动作", 2.0, 2.0)
+source = s.ReferenceVideoData(motion_frames, motion_audio, 2.0)
+motion = s.ActorPerformanceReferenceData(source)
 aligned_clip = mod.MiniMaxH3Action.execute("body", 0.0, 4.0, "follows the dance", motion_reference=motion)[0]
-assert aligned_clip.motion_reference.frames.shape[0] == 107
-assert torch.equal(aligned_clip.motion_reference.frames[0], motion_frames[0])
-assert torch.equal(aligned_clip.motion_reference.frames[-1], motion_frames[-1])
-assert torch.all(aligned_clip.motion_reference.frames[96:] == motion_frames[-1])
-assert aligned_clip.motion_reference.motion_duration == 4.0
-assert aligned_clip.motion_reference.audio["waveform"].shape[-1] == round((107 / 24) * 32000)
+assert aligned_clip.motion_reference is motion
 aligned_track = s.TimelineTrackData("actor", actor, (aligned_clip,))
 aligned_timeline = s.TimelineData(group, style, env, s.TrackListData((aligned_track,)), 4.0)
 style_reference = s.StyleCardData("", "", "", "", u._reference(torch.ones_like(image), "visual style"))
 referenced_timeline = s.TimelineData(group, style_reference, env, s.TrackListData((aligned_track,)), 4.0)
 assert mod.segments._reference_subject_count(referenced_timeline) == 2
-aligned_references, aligned_instructions, aligned_definitions, aligned_retentions, aligned_summary = mod.segments._motion_references(
-    aligned_timeline, 1, 2)
-assert len(aligned_references) == 1
+aligned_video_groups, aligned_audio_groups = mod.segments._reference_media(aligned_timeline)
+aligned_instructions, aligned_definitions, aligned_retentions, aligned_summary, aligned_audios = mod.segments._semantic_references(
+    aligned_timeline, aligned_video_groups, aligned_audio_groups, 2)
+assert len(aligned_video_groups) == 1 and not aligned_audios
+aligned_reference = aligned_video_groups[0][1]
+assert aligned_reference.frames.shape[0] == 107
+assert torch.equal(aligned_reference.frames[0], motion_frames[0])
+assert torch.equal(aligned_reference.frames[-1], motion_frames[-1])
+assert torch.all(aligned_reference.frames[96:] == motion_frames[-1])
+assert aligned_reference.motion_duration == 4.0 and aligned_reference.audio is None
 aligned_instruction = next(iter(aligned_instructions.values()))
-assert "Transfer <Subject 2> to <Subject 1> (Luluka)" in aligned_instruction
-assert "complete order, timing, and final pose" in aligned_instruction
+assert "authoritative body performance" in aligned_instruction
+assert "complete motion order" in aligned_instruction
 assert "format padding" not in aligned_instruction
-assert "<Subject 2> is the body motion derived from <Video 1> and transferred to <Subject 1> (Luluka)." in aligned_definitions
+assert "<Subject 2> is the body performance derived from <Video 1> and transferred to <Subject 1> (Luluka)." in aligned_definitions
 assert "<Subject 2> (appears in [Shot 1]): attribute_transfer" in aligned_retentions
-assert aligned_summary == "The action is guided by <Subject 2>. The synchronized sound is referenced from <Audio 1>."
+assert aligned_summary == "Body performance is transferred from <Subject 2>."
 
-full_motion = s.MotionReferenceData(motion_frames, motion_audio, "完整表演", 2.0, 2.0)
 full_clip = mod.MiniMaxH3Action.execute("body", 0.0, 4.0, "follows the complete performance",
-    motion_reference=full_motion)[0]
+    motion_reference=motion)[0]
 full_track = s.TimelineTrackData("actor", actor, (full_clip,))
 camera_clip = mod.MiniMaxH3Camera.execute(0.0, 4.0, "A low-angle wide shot frames Luluka.",
     "The camera orbits clockwise.", "Deep focus keeps the stage sharp.")[0]
 camera_track = s.TimelineTrackData("camera", None, (camera_clip,))
-full_timeline = s.TimelineData(group, style, env, s.TrackListData((full_track, camera_track)), 4.0)
+referenced_camera_clip = mod.MiniMaxH3Camera.execute(0.0, 4.0, "Conflicting camera text.",
+    "Conflicting camera movement.", "Conflicting focus.", camera_reference=s.CameraReferenceData(source))[0]
+referenced_camera_track = s.TimelineTrackData("camera", None, (referenced_camera_clip,))
+referenced_lighting_clip = mod.MiniMaxH3LightingAction.execute(0.0, 4.0, "Conflicting lighting text.",
+    lighting_reference=s.LightingReferenceData(source))[0]
+referenced_lighting_track = s.TimelineTrackData("lighting", None, (referenced_lighting_clip,))
+referenced_audio_clip = mod.MiniMaxH3AudioAction.execute("music", 0.0, 4.0, "A rhythmic score.",
+    audio_reference=s.AudioReferenceData(source))[0]
+referenced_audio_track = s.TimelineTrackData("audio", None, (referenced_audio_clip,))
+full_timeline = s.TimelineData(group, style, env, s.TrackListData((full_track, referenced_camera_track,
+    referenced_lighting_track, referenced_audio_track)), 4.0)
 full_job = s.GenerationJobData(full_timeline, 0.4, "16:9", 0, "simple", 4, 1.0, "match", 0.92, "不输出")
-full_prompt = mod.segments._compile_generation_segment(full_job, 0)[0].text
+full_compiled, full_references, full_standalone_audios = mod.segments._compile_generation_segment(full_job, 0)
+full_prompt = full_compiled.text
+assert len(full_references) == 1 and not full_standalone_audios
+assert full_references[0].role == "actor + camera + lighting"
+assert full_references[0].audio is not None
 assert "stands in the center of the frame" not in full_prompt
 assert "stands naturally" not in full_prompt
 assert "has a calm expression" not in full_prompt
-assert "<Subject 2> is the complete performance derived from <Video 1> and transferred to <Subject 1> (Luluka)." in full_prompt
+assert "<Subject 2> is the body performance derived from <Video 1> and transferred to <Subject 1> (Luluka)." in full_prompt
 assert "<Subject 2> (appears in [Shot 1]): attribute_transfer" in full_prompt
-assert "<Video 1> provides the camera behavior and temporal structure for [Shot 1]." in full_prompt
-assert "<Video 1> (camera and temporal structure in [Shot 1]): fully_preserved" in full_prompt
-assert "The camera and temporal structure are guided by <Video 1>." in full_prompt
+assert "<Subject 3> is the lighting behavior derived from <Video 1>" in full_prompt
+assert "<Video 1> is the reference for [Shot 1]'s camera movement and framing progression." in full_prompt
+assert "<Video 1> (temporal structure in [Shot 1]): fully_preserved" in full_prompt
+assert "Camera movement and temporal structure follow <Video 1>." in full_prompt
+assert "<Audio 1> is the music sound reference from the soundtrack associated with <Video 1>." in full_prompt
 assert "A low-angle wide shot frames Luluka" not in full_prompt
-assert "The camera orbits clockwise" not in full_prompt
+assert "Conflicting camera" not in full_prompt and "Conflicting lighting" not in full_prompt
 assert "Motion references:" not in full_prompt
-assert full_prompt.index("<Video 1>'s camera behavior") > full_prompt.index("Luluka follows the complete performance")
+assert "authoritative camera movement" in full_prompt and "authoritative lighting behavior" in full_prompt
+
+reference_only_clip = mod.MiniMaxH3Action.execute("body", 0.0, 4.0, "", motion_reference=motion)[0]
+reference_only_timeline = mod.MiniMaxH3Timeline.execute(group, style, env,
+    s.TrackListData((s.TimelineTrackData("actor", actor, (reference_only_clip,)),)), 4.0)[0]
+assert len(reference_only_timeline.tracks.tracks[0].clips) == 1
+reference_only_prompt = mod.segments._compile_generation_segment(
+    s.GenerationJobData(reference_only_timeline, 0.4, "16:9", 0, "simple", 4, 1.0, "match", 0.92, "不输出"), 0)[0].text
+assert "authoritative body performance" in reference_only_prompt
+
+standalone_audio_clip = mod.MiniMaxH3AudioAction.execute("music", 0.0, 4.0, "Follow the supplied rhythm.",
+    audio_reference=s.AudioReferenceData(source))[0]
+standalone_audio_timeline = s.TimelineData(group, style, env,
+    s.TrackListData((s.TimelineTrackData("audio", None, (standalone_audio_clip,)),)), 4.0)
+standalone_compiled, standalone_videos, standalone_audios = mod.segments._compile_generation_segment(
+    s.GenerationJobData(standalone_audio_timeline, 0.4, "16:9", 0, "simple", 4, 1.0, "match", 0.92, "不输出"), 0)
+assert not standalone_videos and len(standalone_audios) == 1
+assert "<Audio 1> is the music sound reference" in standalone_compiled.text
+assert "<Video 1>" not in standalone_compiled.text
+assert "[reference generation + audio reference]" in standalone_compiled.text
 
 action_camera_timeline = s.TimelineData(group, style, env, s.TrackListData((aligned_track, camera_track)), 4.0)
 action_camera_job = s.GenerationJobData(action_camera_timeline, 0.4, "16:9", 0, "simple", 4, 1.0, "match", 0.92,
@@ -96,9 +142,25 @@ overridden_timeline = s.TimelineData(overridden_group, style, env, s.TrackListDa
 overridden_job = s.GenerationJobData(overridden_timeline, 0.4, "16:9", 0, "simple", 4, 1.0, "match", 0.92,
     "不输出")
 overridden_prompt = mod.segments._compile_generation_segment(overridden_job, 0)[0].text
-assert "starts beside the window" in overridden_prompt
+assert "starts beside the window" not in overridden_prompt
 assert "stands naturally" not in overridden_prompt
 assert "has a calm expression" not in overridden_prompt
+
+idle_timeline = s.TimelineData(overridden_group, style, env, s.TrackListData(()), 4.0)
+idle_prompt = mod.MiniMaxH3FinalPrompt.execute(idle_timeline, 0.4, "16:9", "Ref", None, None, "")[0].text
+assert "starts beside the window" in idle_prompt
+
+stateful_environment = s.EnvironmentInstanceData(
+    s.EnvironmentCardData("bridge", "A steel pedestrian bridge.", "Legacy stormy night.",
+        "Fixed railings line both sides.", "Legacy tense atmosphere.", "", None),
+    "", "A clear morning.", "", "Quiet and open.")
+environment_prompt = mod.MiniMaxH3FinalPrompt.execute(
+    s.TimelineData(group, style, stateful_environment, s.TrackListData(()), 4.0),
+    0.4, "16:9", "Ref", None, None, "")[0].text
+assert "A steel pedestrian bridge" in environment_prompt
+assert "Fixed railings line both sides" in environment_prompt
+assert "A clear morning" in environment_prompt and "Quiet and open" in environment_prompt
+assert "Legacy stormy night" not in environment_prompt and "Legacy tense atmosphere" not in environment_prompt
 
 result_components = mod.checkpoints.Types.VideoComponents(torch.zeros(150, 32, 48, 3), Fraction(30),
     {"waveform": torch.zeros(1, 1, 220500), "sample_rate": 44100})
@@ -161,18 +223,24 @@ assert mod.segments._context_frame_count(0.1, 124, 96) == 0
 assert mod.segments._context_frame_count(2.0, 40, 96) == 28
 assert mod.segments._empty_sections_mode("不输出") == "自动补全"
 
-previous_motion = s.MotionReferenceData(torch.ones(107, 16, 16, 3),
-    {"waveform": torch.ones(1, 2, 142667), "sample_rate": 32000}, "仅动作", 4.0, 107 / 24, 4.0)
-current_motion = s.MotionReferenceData(torch.full((107, 16, 16, 3), 2.0),
-    {"waveform": torch.full((1, 2, 142667), 2.0), "sample_rate": 32000}, "仅动作", 4.0, 107 / 24, 4.0)
-previous_clip = s.TimelineClipData("body", 0.0, 4.0, "walks forward", "", "", lang, "", "on-screen",
-    None, "", previous_motion)
-current_clip = s.TimelineClipData("body", 4.0, 8.0, "performs the dance", "", "", lang, "", "on-screen",
-    None, "", current_motion)
+previous_source = s.ReferenceVideoData(torch.ones(107, 16, 16, 3),
+    {"waveform": torch.ones(1, 2, 142667), "sample_rate": 32000}, 4.0)
+current_source = s.ReferenceVideoData(torch.full((107, 16, 16, 3), 2.0),
+    {"waveform": torch.full((1, 2, 142667), 2.0), "sample_rate": 32000}, 4.0)
+previous_clip = mod.MiniMaxH3Action.execute("body", 0.0, 4.0, "walks forward",
+    motion_reference=s.ActorPerformanceReferenceData(previous_source))[0]
+current_clip = mod.MiniMaxH3Action.execute("body", 4.0, 8.0, "performs the dance",
+    motion_reference=s.ActorPerformanceReferenceData(current_source))[0]
 segmented_track = s.TimelineTrackData("actor", actor, (previous_clip, current_clip))
-segmented_timeline = s.TimelineData(group, style, env, s.TrackListData((segmented_track,)), 8.0)
+previous_audio_clip = mod.MiniMaxH3AudioAction.execute("music", 0.0, 4.0, "Previous rhythmic score.",
+    audio_reference=s.AudioReferenceData(previous_source))[0]
+current_audio_clip = mod.MiniMaxH3AudioAction.execute("music", 4.0, 8.0, "Current rhythmic score.",
+    audio_reference=s.AudioReferenceData(current_source))[0]
+segmented_audio_track = s.TimelineTrackData("audio", None, (previous_audio_clip, current_audio_clip))
+segmented_timeline = s.TimelineData(group, style, env, s.TrackListData((segmented_track, segmented_audio_track)), 8.0)
 job = s.GenerationJobData(segmented_timeline, 0.4, "16:9", 0, "simple", 4, 1.0, "match", 2.0, "不输出")
-compiled_segment, segment_references = mod.segments._compile_generation_segment(job, 1, 45)
+compiled_segment, segment_references, segment_audios = mod.segments._compile_generation_segment(job, 1, 45)
+assert not segment_audios
 segment_reference = segment_references[0]
 assert compiled_segment.video_settings.length == 141
 assert segment_reference.frames.shape[0] == 141
@@ -184,18 +252,18 @@ assert torch.all(segment_reference.audio["waveform"][..., :60000] == 1)
 assert torch.all(segment_reference.audio["waveform"][..., 60000:] == 2)
 try:
     mod.segments._validate_motion_alignment((s.MotionReferenceData(
-        segment_reference.frames[:-1], None, "仅动作", 4.0, 140 / 24),), 141)
+        segment_reference.frames[:-1], None, "actor", 4.0, 140 / 24),), 141)
     raise AssertionError("Motion reference length mismatch was accepted")
 except ValueError as error:
     assert "140 帧" in str(error) and "141 帧" in str(error)
 assert "1.62" not in compiled_segment.text and "5.62" not in compiled_segment.text
 assert "The target video is a 5.88-second continuous single shot." in compiled_segment.text
 assert "[video continuation + reference generation + audio reference]" in compiled_segment.text
-assert "<Subject 2> is the shot-aligned motion sequence derived from <Video 1>" in compiled_segment.text
-assert "<Video 1> is the shot-aligned temporal reference, beginning with 1.88 seconds" in compiled_segment.text
+assert "<Subject 2> is the body performance derived from <Video 1>" in compiled_segment.text
+assert "<Video 1> is the reference for [Shot 1]'s preceding continuity and shot-aligned temporal order" in compiled_segment.text
 assert "The opening 1.88 seconds continue the preceding generated segment" in compiled_segment.text
 assert "At 1.88 seconds, the current action phase begins" in compiled_segment.text
-assert "After the opening continuity phase, transfer <Subject 2> to <Subject 1> (Luluka)" in compiled_segment.text
+assert "Use <Subject 2> as <Subject 1> (Luluka)'s authoritative body performance" in compiled_segment.text
 assert "<Subject 2> (appears in [Shot 1]): attribute_transfer" in compiled_segment.text
 assert "Motion references:" not in compiled_segment.text
 details = compiled_segment.text.split("detailed_description:\n", 1)[1]
@@ -204,12 +272,13 @@ assert details.index("The opening 1.88 seconds") < details.index("From 1.88 to 5
 previous_without_reference = s.TimelineClipData("body", 0.0, 4.0, "walks forward", "", "", lang, "",
     "on-screen", None, "", None)
 fallback_track = s.TimelineTrackData("actor", actor, (previous_without_reference, current_clip))
-fallback_timeline = s.TimelineData(group, style, env, s.TrackListData((fallback_track,)), 8.0)
+fallback_timeline = s.TimelineData(group, style, env, s.TrackListData((fallback_track, segmented_audio_track)), 8.0)
 fallback_job = s.GenerationJobData(fallback_timeline, 0.4, "16:9", 0, "simple", 4, 1.0, "match", 2.0, "不输出")
 generated_tail = torch.full((96, 16, 16, 3), 3.0)
 generated_audio = {"waveform": torch.full((1, 2, 128000), 3.0), "sample_rate": 32000}
-fallback_compiled, fallback_references = mod.segments._compile_generation_segment(fallback_job, 1, 45,
+fallback_compiled, fallback_references, fallback_audios = mod.segments._compile_generation_segment(fallback_job, 1, 45,
     generated_tail, generated_audio)
+assert not fallback_audios
 fallback_reference = fallback_references[0]
 assert torch.all(fallback_reference.frames[:45] == 3)
 assert torch.all(fallback_reference.frames[45:] == 2)
@@ -223,8 +292,9 @@ latent_only_track = s.TimelineTrackData("actor", actor, (previous_clip, current_
 latent_only_job = s.GenerationJobData(
     s.TimelineData(group, style, env, s.TrackListData((latent_only_track,)), 8.0),
     0.4, "16:9", 0, "simple", 4, 1.0, "match", 2.0, "不输出")
-latent_only_compiled, latent_only_references = mod.segments._compile_generation_segment(latent_only_job, 1, 45)
+latent_only_compiled, latent_only_references, latent_only_audios = mod.segments._compile_generation_segment(latent_only_job, 1, 45)
 assert not latent_only_references
+assert not latent_only_audios
 assert "[video continuation + reference generation]" in latent_only_compiled.text
 assert "The opening 1.88 seconds continue the preceding generated segment" in latent_only_compiled.text
 
@@ -320,7 +390,8 @@ assert "while Yona's lips remain completely closed" in speaker_prompt
 assert "Luluka (S" not in speaker_prompt
 assert "retention_analysis:\n<Subject 1> (appears in [Shot 1]):" in speaker_prompt
 
-silent_motion = s.MotionReferenceData(motion_frames, None, "仅动作", 2.0, 2.0)
+silent_source = s.ReferenceVideoData(motion_frames, None, 2.0)
+silent_motion = s.ActorPerformanceReferenceData(silent_source)
 silent_clip = mod.MiniMaxH3Action.execute("body", 0.0, 4.0, "follows the dance",
     motion_reference=silent_motion)[0]
 silent_motion_timeline = s.TimelineData(group, style, env,

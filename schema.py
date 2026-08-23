@@ -19,6 +19,9 @@ H3_STYLE_CARD = io.Custom("MINIMAX_H3_STYLE_CARD")
 H3_ENVIRONMENT_CARD = io.Custom("MINIMAX_H3_ENVIRONMENT_CARD")
 H3_ENVIRONMENT_INSTANCE = io.Custom("MINIMAX_H3_ENVIRONMENT_INSTANCE")
 H3_MOTION_REFERENCE = io.Custom("MINIMAX_H3_MOTION_REFERENCE")
+H3_CAMERA_REFERENCE = io.Custom("MINIMAX_H3_CAMERA_REFERENCE")
+H3_LIGHTING_REFERENCE = io.Custom("MINIMAX_H3_LIGHTING_REFERENCE")
+H3_AUDIO_REFERENCE = io.Custom("MINIMAX_H3_AUDIO_REFERENCE")
 H3_TIMELINE_CLIP = io.Custom("MINIMAX_H3_TIMELINE_CLIP")
 H3_TIMELINE_TRACK = io.Custom("MINIMAX_H3_TIMELINE_TRACK")
 H3_TRACK_LIST = io.Custom("MINIMAX_H3_TRACK_LIST")
@@ -101,6 +104,33 @@ class EnvironmentInstanceData:
 
 
 @dataclass(frozen=True, slots=True, eq=False)
+class ReferenceVideoData:
+    frames: object
+    audio: object | None
+    source_duration: float
+
+
+@dataclass(frozen=True, slots=True)
+class ActorPerformanceReferenceData:
+    source: ReferenceVideoData
+
+
+@dataclass(frozen=True, slots=True)
+class CameraReferenceData:
+    source: ReferenceVideoData
+
+
+@dataclass(frozen=True, slots=True)
+class LightingReferenceData:
+    source: ReferenceVideoData
+
+
+@dataclass(frozen=True, slots=True)
+class AudioReferenceData:
+    source: ReferenceVideoData
+
+
+@dataclass(frozen=True, slots=True, eq=False)
 class MotionReferenceData:
     frames: object
     audio: object | None
@@ -109,6 +139,10 @@ class MotionReferenceData:
     aligned_duration: float = 0.0
     motion_duration: float = 0.0
     context_duration: float = 0.0
+    source: ReferenceVideoData | None = None
+    owner_id: int | None = None
+    clip_start: float = 0.0
+    clip_end: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,9 +158,12 @@ class TimelineClipData:
     speech_type: str = "on-screen"
     target: ActorInstanceData | None = None
     audio_type: str = ""
-    motion_reference: MotionReferenceData | None = None
+    motion_reference: ActorPerformanceReferenceData | None = None
     rendered_video: object | None = None
     rendered_video_version: int = 0
+    camera_reference: CameraReferenceData | None = None
+    lighting_reference: LightingReferenceData | None = None
+    audio_reference: AudioReferenceData | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,7 +222,10 @@ class GenerationJobData:
 for custom_type, data_type in ((H3_CHARACTER_CARD, CharacterCardData), (H3_ACTOR_INSTANCE, ActorInstanceData),
                                (H3_CHARACTER_GROUP, CharacterGroupData), (H3_LANGUAGE, LanguageData),
                                (H3_STYLE_CARD, StyleCardData), (H3_ENVIRONMENT_CARD, EnvironmentCardData),
-                               (H3_ENVIRONMENT_INSTANCE, EnvironmentInstanceData), (H3_MOTION_REFERENCE, MotionReferenceData),
+                               (H3_ENVIRONMENT_INSTANCE, EnvironmentInstanceData),
+                               (H3_MOTION_REFERENCE, ActorPerformanceReferenceData),
+                               (H3_CAMERA_REFERENCE, CameraReferenceData), (H3_LIGHTING_REFERENCE, LightingReferenceData),
+                               (H3_AUDIO_REFERENCE, AudioReferenceData),
                                (H3_TIMELINE_CLIP, TimelineClipData),
                                (H3_TIMELINE_TRACK, TimelineTrackData), (H3_TRACK_LIST, TrackListData),
                                (H3_TIMELINE, TimelineData), (H3_PROMPT, CompletePromptData),

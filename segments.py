@@ -11,9 +11,9 @@ from comfy_extras.nodes_minimax_h3 import (MiniMaxH3ReferenceToVideo as NativeRe
     _resize as resize_h3_image)
 
 from .schema import (ASPECT_RATIOS, CATEGORY, EMPTY_SECTION_MODES, EMPTY_SECTION_OPTIONS, FPS,
-    H3_GENERATION_JOB, H3_TIMELINE, GenerationJobData, TimelineData, TrackListData)
+    H3_GENERATION_JOB, H3_TIMELINE, GenerationJobData, MotionReferenceData, TimelineData, TrackListData)
 from .timeline import MiniMaxH3FinalPrompt, _reference_subject_layout, _validate_timeline
-from .utils import _match_reference_video, _sentence, _text, _time
+from .utils import _match_reference_video, _sentence, _text, _time, _video_length
 
 
 def _segment_ranges(timeline):
@@ -130,9 +130,83 @@ def _persistent_state(timeline, start):
     return " ".join(states)
 
 
-def _motion_reference_bindings(timeline):
-    return [(id(track.owner), clip) for track in timeline.tracks.tracks if track.owner_kind == "actor"
-        for clip in track.clips if clip.motion_reference is not None and _text(clip.content)]
+def _reference_bindings(timeline):
+    bindings = []
+    for track in timeline.tracks.tracks:
+        for clip in track.clips:
+            if track.owner_kind == "actor" and clip.motion_reference is not None:
+                bindings.append(("actor", track, clip, clip.motion_reference.source))
+            elif track.owner_kind == "camera" and clip.camera_reference is not None:
+                bindings.append(("camera", track, clip, clip.camera_reference.source))
+            elif track.owner_kind == "lighting" and clip.lighting_reference is not None:
+                bindings.append(("lighting", track, clip, clip.lighting_reference.source))
+            elif track.owner_kind == "audio" and clip.audio_reference is not None:
+                bindings.append(("audio", track, clip, clip.audio_reference.source))
+    return bindings
+
+
+def _reference_groups(timeline):
+    groups = []
+    by_key = {}
+    for binding in _reference_bindings(timeline):
+        kind, _, clip, source = binding
+        key = (id(source), round(clip.start_time, 6), round(clip.end_time, 6))
+        group = by_key.get(key)
+        if group is None:
+            group = {"source": source, "start": clip.start_time, "end": clip.end_time, "bindings": []}
+            by_key[key] = group
+            groups.append(group)
+        if kind == "audio" and any(existing[0] == "audio" for existing in group["bindings"]):
+            raise ValueError("同一参考视频在同一时间范围内只能绑定一个音频参考片段")
+        group["bindings"].append(binding)
+    return groups
+
+
+def _fit_reference_group(group):
+    source = group["source"]
+    duration = group["end"] - group["start"]
+    motion_frames = max(5, round(duration * FPS))
+    aligned_frames = _video_length(duration)
+    if aligned_frames > round(15.0 * FPS):
+        raise ValueError("单个参考视频轨道片段不能超过 15 秒，请拆分片段")
+    positions = torch.linspace(0, source.frames.shape[0] - 1, motion_frames,
+        device=source.frames.device).round().long()
+    frames = source.frames.index_select(0, positions)
+    if aligned_frames > motion_frames:
+        frames = torch.cat((frames, frames[-1:].repeat(aligned_frames - motion_frames, 1, 1, 1)), dim=0)
+
+    has_audio = any(binding[0] == "audio" for binding in group["bindings"])
+    audio = source.audio if has_audio else None
+    if audio is not None:
+        motion_samples = max(1, round(duration * audio["sample_rate"]))
+        aligned_samples = round((aligned_frames / FPS) * audio["sample_rate"])
+        waveform = audio["waveform"]
+        shape = waveform.shape
+        waveform = torch.nn.functional.interpolate(waveform.reshape(-1, 1, shape[-1]),
+            size=motion_samples, mode="linear", align_corners=False).reshape(*shape[:-1], motion_samples)
+        waveform = torch.nn.functional.pad(waveform, (0, max(0, aligned_samples - motion_samples)))
+        audio = {**audio, "waveform": waveform[..., :aligned_samples]}
+
+    roles = tuple(dict.fromkeys(binding[0] for binding in group["bindings"] if binding[0] != "audio"))
+    owners = {id(binding[1].owner) for binding in group["bindings"] if binding[0] == "actor"}
+    return MotionReferenceData(frames, audio, " + ".join(roles), source.source_duration,
+        aligned_frames / FPS, duration, source=source, owner_id=next(iter(owners)) if len(owners) == 1 else None,
+        clip_start=group["start"], clip_end=group["end"])
+
+
+def _reference_media(timeline):
+    video_groups = []
+    audio_groups = []
+    for group in _reference_groups(timeline):
+        has_visual = any(binding[0] != "audio" for binding in group["bindings"])
+        if has_visual:
+            video_groups.append((group, _fit_reference_group(group)))
+        else:
+            source = group["source"]
+            if source.audio is None:
+                raise ValueError("音频参考所连接的参考视频不包含音频")
+            audio_groups.append(group)
+    return video_groups, audio_groups
 
 
 def _reference_active_frames(reference):
@@ -140,13 +214,13 @@ def _reference_active_frames(reference):
     return reference.frames[:max(1, min(reference.frames.shape[0], count))]
 
 
-def _reference_visible_frames(clip, duration):
-    active = _reference_active_frames(clip.motion_reference)
+def _reference_visible_frames(reference, duration):
+    active = _reference_active_frames(reference)
     frame_count = max(1, round(duration * FPS))
-    start = min(frame_count, max(0, round(clip.start_time * FPS)))
+    start = min(frame_count, max(0, round(reference.clip_start * FPS)))
     active = active[:max(0, frame_count - start)]
     if not active.shape[0]:
-        return clip.motion_reference.frames[:1].repeat(frame_count, 1, 1, 1)
+        return reference.frames[:1].repeat(frame_count, 1, 1, 1)
     rows = []
     if start:
         rows.append(active[:1].repeat(start, 1, 1, 1))
@@ -178,17 +252,16 @@ def _audio_tail(audio, sample_rate, samples, channels, device, dtype):
     return torch.nn.functional.pad(waveform, (samples - waveform.shape[-1], 0))
 
 
-def _reference_visible_audio(clip, duration, sample_rate, channels, device, dtype):
-    reference = clip.motion_reference
+def _reference_visible_audio(reference, duration, sample_rate, channels, device, dtype):
     waveform = reference.audio["waveform"][:1].to(device=device, dtype=dtype)
     source_rate = int(reference.audio["sample_rate"])
     if source_rate != sample_rate:
         waveform = torchaudio.functional.resample(waveform, source_rate, sample_rate)
     waveform = _audio_channels(waveform, channels)
-    active_samples = max(1, round((reference.motion_duration or clip.end_time - clip.start_time) * sample_rate))
+    active_samples = max(1, round(reference.motion_duration * sample_rate))
     waveform = waveform[..., :active_samples]
     total = max(1, round(duration * sample_rate))
-    start = min(total, max(0, round(clip.start_time * sample_rate)))
+    start = min(total, max(0, round(reference.clip_start * sample_rate)))
     waveform = waveform[..., :max(0, total - start)]
     return torch.nn.functional.pad(waveform, (start, max(0, total - start - waveform.shape[-1])))
 
@@ -198,20 +271,22 @@ def _align_motion_context(timeline, previous_timeline, references, context_frame
     if not references:
         return references
     if target_frames > round(15.0 * FPS):
-        raise ValueError("动作参考视频加入段间上下文后超过 15 秒，请缩短片段或段间引导长度")
+        raise ValueError("参考视频加入段间上下文后超过 15 秒，请缩短片段或段间引导长度")
 
     previous = {}
-    for owner, clip in _motion_reference_bindings(previous_timeline) if previous_timeline is not None else ():
-        if owner not in previous or clip.end_time >= previous[owner].end_time:
-            previous[owner] = clip
+    if previous_timeline is not None:
+        for _, reference in _reference_media(previous_timeline)[0]:
+            if reference.owner_id is not None and (reference.owner_id not in previous or
+                    reference.clip_end >= previous[reference.owner_id].clip_end):
+                previous[reference.owner_id] = reference
 
     aligned = []
-    for (owner, clip), reference in zip(_motion_reference_bindings(timeline), references):
-        visible = _reference_visible_frames(clip, timeline.duration)
+    for reference in references:
+        visible = _reference_visible_frames(reference, timeline.duration)
         prefix = None
-        previous_clip = previous.get(owner)
-        if context_frames and previous_clip is not None:
-            previous_visible = _reference_visible_frames(previous_clip, previous_timeline.duration)
+        previous_reference = previous.get(reference.owner_id)
+        if context_frames and previous_reference is not None:
+            previous_visible = _reference_visible_frames(previous_reference, previous_timeline.duration)
             prefix = previous_visible[-context_frames:]
         elif context_frames and previous_images is not None and previous_images.shape[0]:
             prefix = previous_images[-context_frames:, ..., :3]
@@ -234,11 +309,14 @@ def _align_motion_context(timeline, previous_timeline, references, context_frame
             sample_rate = int(audio["sample_rate"])
             waveform = audio["waveform"]
             channels = waveform.shape[1]
-            body = _reference_visible_audio(clip, timeline.duration, sample_rate, channels,
+            body = _reference_visible_audio(reference, timeline.duration, sample_rate, channels,
                 waveform.device, waveform.dtype)
             if context_frames:
                 prefix_samples = round((context_frames / FPS) * sample_rate)
-                source_audio = previous_clip.motion_reference.audio if previous_clip is not None else None
+                source_audio = previous_reference.audio if previous_reference is not None else None
+                if source_audio is not None:
+                    active_samples = round(previous_reference.motion_duration * source_audio["sample_rate"])
+                    source_audio = {**source_audio, "waveform": source_audio["waveform"][..., :active_samples]}
                 if source_audio is None:
                     source_audio = previous_audio
                 prefix_audio = _audio_tail(source_audio, sample_rate, prefix_samples, channels,
@@ -271,85 +349,98 @@ def _reference_subject_count(timeline):
     return _reference_subject_layout(timeline)[3]
 
 
-def _motion_references(timeline, first_video_number, first_subject_number, context_duration=0.0):
-    role_text = {
-        "仅动作": ("body motion", False),
-        "动作与镜头": ("body motion", True),
-        "完整表演": ("complete performance", True),
-        "动作与声音": ("performance", False),
-    }
+def _semantic_references(timeline, video_groups, audio_groups, first_subject_number, context_duration=0.0):
     actor_subjects = _reference_subject_layout(timeline)[0]
     labels = {id(actor): actor.card.name or f"Actor {index}"
         for index, actor in enumerate(timeline.characters.actors, 1)}
-    references = []
     instructions = []
     definitions = []
     retentions = []
-    summary_labels = []
+    action_labels = []
     camera_labels = []
-    continuation_labels = []
+    lighting_labels = []
     audio_labels = []
-    video_number = first_video_number
-    audio_number = 1
     subject_number = first_subject_number
-    for track in timeline.tracks.tracks:
-        if track.owner_kind != "actor":
-            continue
-        for clip in track.clips:
-            reference = clip.motion_reference
-            if reference is None or not _text(clip.content):
-                continue
-            owner = labels.get(id(track.owner), "the character")
-            target = (f"<Subject {actor_subjects[id(track.owner)]}> ({owner})"
-                if id(track.owner) in actor_subjects else owner)
-            responsibility, uses_camera = role_text[reference.role]
+    audio_number = 1
+    audio_numbers = {}
+    for video_number, (group, reference) in enumerate(video_groups, 1):
+        if reference.audio is not None:
+            audio_numbers[id(group)] = audio_number
+            audio_number += 1
+    for group in audio_groups:
+        audio_numbers[id(group)] = audio_number
+        audio_number += 1
+
+    for video_number, (group, _) in enumerate(video_groups, 1):
+        bindings = group["bindings"]
+        has_camera = any(binding[0] == "camera" for binding in bindings)
+        if context_duration or has_camera:
+            roles = []
             if context_duration:
-                subject_definition = (f"<Subject {subject_number}> is the shot-aligned motion sequence derived from <Video {video_number}> "
-                    f"and transferred to {target}.")
-                video_role = (f"<Video {video_number}> is the shot-aligned temporal reference, beginning with "
-                    f"{_time(context_duration)} seconds of preceding continuity and followed by the current {responsibility}")
-                if uses_camera:
-                    video_role += ", including its camera behavior"
-                definitions.append(video_role + ".")
-                retentions.append(f"<Video {video_number}> (temporal structure in [Shot 1]): fully_preserved - "
-                    "Preserve the supplied continuity-first order without restarting or anticipating the current action.")
-                continuation_labels.append(f"<Video {video_number}>")
-                line = (f"After the opening continuity phase, transfer <Subject {subject_number}> to {target}. Reproduce the current "
-                    f"{responsibility} in its supplied order and timing while preserving {owner}'s declared identity, clothing, and scene.")
-            else:
-                subject_definition = (f"<Subject {subject_number}> is the {responsibility} derived from <Video {video_number}> "
-                    f"and transferred to {target}.")
-                line = (f"Transfer <Subject {subject_number}> to {target}. Preserve its complete order, timing, and final pose "
-                    f"while rendering {owner}'s declared identity, clothing, and scene.")
-            definitions.append(subject_definition)
-            retentions.append(f"<Subject {subject_number}> (appears in [Shot 1]): attribute_transfer - "
-                f"Transfer its aligned performance and timing to {target}.")
-            summary_labels.append(f"<Subject {subject_number}>")
-            if uses_camera and not context_duration:
-                definitions.append(f"<Video {video_number}> provides the camera behavior and temporal structure for [Shot 1].")
-                retentions.append(f"<Video {video_number}> (camera and temporal structure in [Shot 1]): fully_preserved - "
-                    "Strictly preserve its camera behavior and temporal order.")
-            if uses_camera:
-                line += f" Follow <Video {video_number}>'s camera behavior and temporal structure."
+                roles.append("preceding continuity and shot-aligned temporal order")
+            if has_camera:
+                roles.append("camera movement and framing progression")
+            definitions.append(f"<Video {video_number}> is the reference for [Shot 1]'s {' and '.join(roles)}.")
+            retentions.append(f"<Video {video_number}> (temporal structure in [Shot 1]): fully_preserved - "
+                f"Preserve its {' and '.join(roles)} without importing source identities, clothing, or environment.")
+        for kind, track, clip, _ in bindings:
+            if kind == "actor":
+                owner = labels.get(id(track.owner), "the character")
+                target = (f"<Subject {actor_subjects[id(track.owner)]}> ({owner})"
+                    if id(track.owner) in actor_subjects else owner)
+                subject = f"<Subject {subject_number}>"
+                definitions.append(f"{subject} is the body performance derived from <Video {video_number}> and transferred to {target}.")
+                retentions.append(f"{subject} (appears in [Shot 1]): attribute_transfer - Transfer its motion order, timing, and final pose to {target}.")
+                line = (f"Use {subject} as {target}'s authoritative body performance. Preserve its complete motion order, timing, "
+                    f"weight shifts, and final pose while retaining {owner}'s declared identity and fixed appearance.")
+                instructions.append((id(clip), _sentence(line)))
+                action_labels.append(subject)
+                subject_number += 1
+            elif kind == "camera":
+                instructions.append((id(clip), _sentence(
+                    f"Use <Video {video_number}> as the authoritative camera movement, framing, and temporal-structure reference.")))
                 camera_labels.append(f"<Video {video_number}>")
-            if reference.audio is not None:
-                line += f" Reference <Audio {audio_number}>'s synchronized timing and sound character without copying its signal."
-                definitions.append(f"<Audio {audio_number}> is the explicitly enabled synchronized sound reference from <Video {video_number}>.")
-                retentions.append(f"<Audio {audio_number}>: reference - Follow its synchronized timing and sound character without copying the source signal.")
-                audio_labels.append(f"<Audio {audio_number}>")
-                audio_number += 1
-            instructions.append((id(clip), _sentence(line)))
-            references.append(reference)
-            video_number += 1
-            subject_number += 1
-    summary = "" if not summary_labels else f"The action is guided by {' and '.join(summary_labels)}."
-    if continuation_labels:
-        summary += f" The continuity-first temporal structure is guided by {' and '.join(continuation_labels)}."
+            elif kind == "lighting":
+                subject = f"<Subject {subject_number}>"
+                definitions.append(f"{subject} is the lighting behavior derived from <Video {video_number}> and transferred to [Shot 1].")
+                retentions.append(f"{subject} (appears in [Shot 1]): attribute_transfer - Transfer its light direction, color, intensity, and change rhythm without importing the source scene.")
+                instructions.append((id(clip), _sentence(
+                    f"Use {subject} as [Shot 1]'s authoritative lighting behavior while preserving the declared subjects and environment.")))
+                lighting_labels.append(subject)
+                subject_number += 1
+            elif kind == "audio":
+                number = audio_numbers[id(group)]
+                label = f"<Audio {number}>"
+                definitions.append(f"{label} is the {clip.audio_type} sound reference from the soundtrack associated with <Video {video_number}>.")
+                retentions.append(f"{label}: reference - Follow its timing and sound character without copying the source signal.")
+                instructions.append((id(clip), _sentence(f"Use {label} as the {clip.audio_type} timing and sound-character reference.")))
+                audio_labels.append(label)
+
+    standalone_audios = []
+    for group in audio_groups:
+        binding = group["bindings"][0]
+        _, _, clip, source = binding
+        number = audio_numbers[id(group)]
+        label = f"<Audio {number}>"
+        definitions.append(f"{label} is the {clip.audio_type} sound reference from the supplied reference video soundtrack.")
+        retentions.append(f"{label}: reference - Follow its timing and sound character without copying the source signal.")
+        instructions.append((id(clip), _sentence(f"Use {label} as the {clip.audio_type} timing and sound-character reference.")))
+        audio_labels.append(label)
+        standalone_audios.append(source.audio)
+
+    instruction_map = {}
+    for clip_id, instruction in instructions:
+        instruction_map[clip_id] = " ".join(filter(_text, (instruction_map.get(clip_id, ""), instruction)))
+    summary_parts = []
+    if action_labels:
+        summary_parts.append(f"Body performance is transferred from {' and '.join(action_labels)}.")
     if camera_labels:
-        summary += f" The camera and temporal structure are guided by {' and '.join(camera_labels)}."
+        summary_parts.append(f"Camera movement and temporal structure follow {' and '.join(dict.fromkeys(camera_labels))}.")
+    if lighting_labels:
+        summary_parts.append(f"Lighting behavior is transferred from {' and '.join(lighting_labels)}.")
     if audio_labels:
-        summary += f" The synchronized sound is referenced from {' and '.join(audio_labels)}."
-    return references, dict(instructions), "\n".join(definitions), "\n".join(retentions), summary
+        summary_parts.append(f"Sound is referenced from {' and '.join(dict.fromkeys(audio_labels))}.")
+    return instruction_map, "\n".join(definitions), "\n".join(retentions), " ".join(summary_parts), standalone_audios
 
 
 def _compile_generation_segment(generation_job, segment_index, context_frames=0,
@@ -364,16 +455,14 @@ def _compile_generation_segment(generation_job, segment_index, context_frames=0,
         if segment_index else None)
     state = _persistent_state(generation_job.timeline, start)
     context_duration = context_frames / FPS
-    motion_references, motion_instructions, motion_definitions, motion_retentions, motion_summary = _motion_references(
-        timeline, 1, _reference_subject_count(timeline) + 1, context_duration)
-    full_performance_actors = {id(track.owner) for track in timeline.tracks.tracks if track.owner_kind == "actor"
-        for clip in track.clips if clip.motion_reference is not None and clip.motion_reference.role == "完整表演"}
-    camera_references = [reference for reference in motion_references if reference.role in ("动作与镜头", "完整表演")]
-    if len(camera_references) > 1:
-        raise ValueError("同一生成片段只能有一个包含镜头的动作参考视频")
-    uses_reference_camera = bool(camera_references)
-    if len(motion_references) > 3:
-        raise ValueError("单个生成片段最多支持 3 段动作参考视频")
+    video_groups, audio_groups = _reference_media(timeline)
+    media_references = [reference for _, reference in video_groups]
+    motion_instructions, motion_definitions, motion_retentions, motion_summary, standalone_audios = _semantic_references(
+        timeline, video_groups, audio_groups, _reference_subject_count(timeline) + 1, context_duration)
+    if len(media_references) > 3:
+        raise ValueError("单个生成片段最多支持 3 段语义参考视频")
+    if sum(reference.audio is not None for reference in media_references) + len(standalone_audios) > 3:
+        raise ValueError("单个生成片段最多支持 3 段参考音频")
         
     compiled = MiniMaxH3FinalPrompt.execute(
         timeline, 
@@ -387,8 +476,6 @@ def _compile_generation_segment(generation_job, segment_index, context_frames=0,
         motion_summary=motion_summary,
         empty_sections=generation_job.empty_sections,
         suppress_initial_state=context_frames > 0,
-        suppress_actor_state_ids=full_performance_actors,
-        suppress_camera_tracks=uses_reference_camera,
         generation_duration=timeline.duration + context_duration,
         timeline_offset=context_duration,
         opening_instructions=(f"The opening {_time(context_duration)} seconds continue the preceding generated segment without a cut, "
@@ -396,10 +483,10 @@ def _compile_generation_segment(generation_job, segment_index, context_frames=0,
             f"At {_time(context_duration)} seconds, the current action phase begins" if context_duration else ""),
         continuation=context_frames > 0,
     )[0]
-    motion_references = _align_motion_context(timeline, previous_timeline, motion_references, context_frames,
+    media_references = _align_motion_context(timeline, previous_timeline, media_references, context_frames,
         compiled.video_settings.length, previous_images, previous_audio)
-    _validate_motion_alignment(motion_references, compiled.video_settings.length)
-    return compiled, motion_references
+    _validate_motion_alignment(media_references, compiled.video_settings.length)
+    return compiled, media_references, standalone_audios
 
 
 def _empty_sections_mode(value):
@@ -456,7 +543,7 @@ class MiniMaxH3SegmentConditioning(io.ComfyNode):
         start, end = _segment_ranges(generation_job.timeline)[segment_index]
         context_frames = _context_frame_count(generation_job.continuity_seconds,
             previous_images.shape[0] if previous_images is not None else 0, round((end - start) * FPS))
-        compiled, motion_references = _compile_generation_segment(generation_job, segment_index, context_frames,
+        compiled, motion_references, standalone_audios = _compile_generation_segment(generation_job, segment_index, context_frames,
             previous_images, previous_audio)
         settings = compiled.video_settings
         ref_videos = {}
@@ -472,7 +559,8 @@ class MiniMaxH3SegmentConditioning(io.ComfyNode):
             width=settings.width, height=settings.height, length=settings.length,
             ref_image_size=generation_job.ref_image_size,
             ref_images=ref_images,
-            ref_videos=ref_videos, ref_video_audios=ref_video_audios)
+            ref_videos=ref_videos, ref_video_audios=ref_video_audios,
+            ref_audios={f"ref_audio_{index}": audio for index, audio in enumerate(standalone_audios)})
         positive, latent = native[0], native[1]
         if context_frames:
             latent = _lock_context_prefix(latent, previous_images, previous_audio, video_vae, audio_vae,
@@ -525,7 +613,7 @@ class MiniMaxH3PromptPreview(io.ComfyNode):
             available = round((ranges[index - 1][1] - ranges[index - 1][0]) * 24) if index else 0
             context_frames = _context_frame_count(generation_job.continuity_seconds, available,
                 round((end - start) * FPS))
-            compiled, motion_references = _compile_generation_segment(generation_job, index, context_frames)
+            compiled, motion_references, standalone_audios = _compile_generation_segment(generation_job, index, context_frames)
             rendered = _segment_result(generation_job.timeline, start, end)
             settings = compiled.video_settings
             
@@ -544,9 +632,12 @@ class MiniMaxH3PromptPreview(io.ComfyNode):
                 context = reference.context_duration
                 prefix = (f"上下文 {_time(context)} 秒（优先上一段同人物动作参考，否则上一段生成视频尾部）＋"
                     if context else "")
-                references.append(f"<Video {1 + offset}> = 当前片段动作参考视频 {offset + 1}（{prefix}"
-                    f"当前片段动作 {_time(reference.motion_duration or reference.frames.shape[0] / FPS)} 秒，"
+                references.append(f"<Video {1 + offset}> = 当前片段语义参考视频 {offset + 1} [{reference.role}]（{prefix}"
+                    f"当前引用 {_time(reference.motion_duration or reference.frames.shape[0] / FPS)} 秒，"
                     f"送入模型 {_time(reference.aligned_duration or reference.frames.shape[0] / FPS)} 秒）")
+            paired_audio_count = sum(reference.audio is not None for reference in motion_references)
+            for offset, _ in enumerate(standalone_audios, paired_audio_count + 1):
+                references.append(f"<Audio {offset}> = 当前片段独立音频语义参考")
             if context_frames:
                 references.insert(0,
                     f"段间引导 = 硬锁定上一片段末尾 {context_frames} 帧及对应音频（不占用参考视频槽位）")

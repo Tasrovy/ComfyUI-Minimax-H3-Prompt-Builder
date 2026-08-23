@@ -34,7 +34,8 @@ def _reference(image, role, usage=""):
 
 
 def _clip_has_content(clip):
-    return bool(_text(clip.content))
+    return bool(_text(clip.content) or clip.motion_reference is not None or clip.camera_reference is not None
+        or clip.lighting_reference is not None or clip.audio_reference is not None or clip.rendered_video is not None)
 
 
 def _same_image(left, right):

@@ -86,6 +86,11 @@ def _render_clip(track, clip, labels, subject_labels, speaker_ids, timeline_dura
     content = _text(clip.content)
     quality = clip.quality
     end_state = clip.result
+    if ((track.owner_kind == "camera" and clip.camera_reference is not None) or
+            (track.owner_kind == "lighting" and clip.lighting_reference is not None)):
+        content = ""
+        quality = ""
+        end_state = ""
     parts = []
     if track.owner_kind == "actor":
         label = labels[id(track.owner)]
@@ -187,6 +192,9 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
         labels = {id(actor): actor_labels[index] for index, actor in enumerate(timeline.characters.actors)}
         subject_labels = {actor_id: f"<Subject {number}>" for actor_id, number in actor_subjects.items()}
         speaker_ids = _speaker_ids(timeline)
+        active_actor_ids = {id(track.owner) for track in timeline.tracks.tracks
+            if track.owner_kind == "actor" and any(_clip_has_content(clip) for clip in track.clips)}
+        suppressed_actor_ids = active_actor_ids | set(suppress_actor_state_ids)
         character_lines = []
         for actor in timeline.characters.actors:
             card, label = actor.card, labels[id(actor)]
@@ -206,11 +214,10 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
             if identity:
                 character_lines.append(_sentence(identity))
                 
-            if not suppress_initial_state:
-                use_defaults = id(actor) not in suppress_actor_state_ids
-                character_lines.extend(filter(_text, (_actor_state(label, card.default_position if use_defaults else "", actor.position_override),
-                    _actor_state(label, card.default_pose if use_defaults else "", actor.pose_override),
-                    _actor_state(label, card.default_emotion if use_defaults else "", actor.emotion_override),
+            if not suppress_initial_state and id(actor) not in suppressed_actor_ids:
+                character_lines.extend(filter(_text, (_actor_state(label, card.default_position, actor.position_override),
+                    _actor_state(label, card.default_pose, actor.pose_override),
+                    _actor_state(label, card.default_emotion, actor.emotion_override),
                     _actor_state(label, card.default_appearance, actor.appearance_override))))
                     
             if card.character_style:
@@ -238,9 +245,9 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
             style_parts.append(_sentence(f"Use <Subject {style_subject}> as the global visual reference. {timeline.style.reference.usage}"))
         card, environment = timeline.environment.card, timeline.environment
         environment_parts = [_resolved(card.location, environment.location_override),
-            _resolved(card.default_time_weather, environment.time_weather_override),
+            _sentence(environment.time_weather_override),
             _resolved(card.default_background, environment.background_override),
-            _resolved(card.default_atmosphere, environment.atmosphere_override)]
+            _sentence(environment.atmosphere_override)]
         if environment_subject is not None:
             environment_parts.insert(0, _sentence(
                 f"Use <Subject {environment_subject}> as the environment reference. {card.reference.usage}"))
@@ -251,9 +258,11 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
             if suppress_camera_tracks and track.owner_kind == "camera":
                 continue
             for clip_index, clip in enumerate(track.clips):
-                if clip.kind == "audio" and _text(clip.content):
-                    covers_shot = clip.start_time <= 1e-6 and clip.end_time >= timeline.duration - 1e-6
-                    audio_text = " ".join(filter(_text, (_sentence(clip.content), clip.quality)))
+                motion_text = motion_instructions.get(id(clip), "")
+                if clip.kind == "audio" and (_text(clip.content) or motion_text):
+                    covers_shot = (timeline_offset <= 1e-6 and clip.start_time <= 1e-6 and
+                        clip.end_time >= timeline.duration - 1e-6)
+                    audio_text = " ".join(filter(_text, (_sentence(clip.content), clip.quality, motion_text)))
                     if clip.audio_type == "music":
                         music.append(audio_text if covers_shot else
                             f"From {_time(clip.start_time + timeline_offset)} to {_time(clip.end_time + timeline_offset)} seconds, {audio_text}")
@@ -263,7 +272,6 @@ class MiniMaxH3FinalPrompt(io.ComfyNode):
                         continue
                 rendered = _render_clip(track, clip, labels, subject_labels, speaker_ids,
                     actual_duration, timeline_offset)
-                motion_text = motion_instructions.get(id(clip), "")
                 if motion_text:
                     rendered = " ".join(filter(_text, (rendered, motion_text)))
                 event = (clip.start_time + timeline_offset, clip.end_time + timeline_offset,

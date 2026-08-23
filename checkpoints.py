@@ -77,7 +77,7 @@ def segment_cache_files(generation_job, model, sampler, cache_version):
         available = round((ranges[index - 1][1] - ranges[index - 1][0]) * 24) if index else 0
         context_frames = _context_frame_count(generation_job.continuity_seconds, available,
             round((end - start) * 24))
-        compiled, motion_references = _compile_generation_segment(generation_job, index, context_frames)
+        compiled, motion_references, standalone_audios = _compile_generation_segment(generation_job, index, context_frames)
         payload = {
             "pipeline": "raw-aligned-av-context-v2",
             "index": index,
@@ -100,6 +100,7 @@ def segment_cache_files(generation_job, model, sampler, cache_version):
                 "frames": _tensor_digest(reference.frames, memo),
                 "audio": _audio_digest(reference.audio, memo),
             } for reference in motion_references],
+            "reference_audio": [_audio_digest(audio, memo) for audio in standalone_audios],
         }
         previous = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
         files.append(f"segment_{index + 1:03d}_{previous[:24]}.mp4")

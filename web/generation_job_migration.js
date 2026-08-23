@@ -71,9 +71,68 @@ function migrateGeneratedVideoSave(info) {
     }
 }
 
+function migrateCharacterCard(info) {
+    const values = info?.widgets_values;
+    if (!Array.isArray(values) || values.length <= 4) {
+        return;
+    }
+    const stylePriority = values.find((value) => value === "character" || value === "global") ?? "global";
+    info.widgets_values = [values[0] ?? "the young woman", values[1] ?? "", stylePriority, values[8] ?? ""];
+    if (Array.isArray(info.inputs)) {
+        info.inputs = info.inputs.filter((input) => ![
+            "preservation", "default_position", "default_pose", "default_emotion", "default_appearance",
+        ].includes(input.name));
+    }
+}
+
+function migrateEnvironmentCard(info) {
+    const values = info?.widgets_values;
+    if (!Array.isArray(values) || values.length <= 3) {
+        return;
+    }
+    info.widgets_values = [values[0] ?? "the environment", values[1] ?? "", values[3] ?? ""];
+    if (Array.isArray(info.inputs)) {
+        info.inputs = info.inputs.filter((input) => ![
+            "default_time_weather", "default_atmosphere", "preservation", "reference_usage",
+        ].includes(input.name));
+    }
+}
+
+function migrateReferenceSplit(info) {
+    const values = info?.widgets_values;
+    if (!Array.isArray(values) || values.length <= 2) {
+        return;
+    }
+    const numeric = values.filter((value) => typeof value === "number" && Number.isFinite(value));
+    info.widgets_values = [numeric.at(-2) ?? 0, numeric.at(-1) ?? 0];
+    if (Array.isArray(info.inputs)) {
+        info.inputs = info.inputs.filter((input) => !["role", "include_audio"].includes(input.name));
+    }
+}
+
 app.registerExtension({
     name: "MiniMaxH3.GenerationJobMigration",
     async beforeRegisterNodeDef(nodeType, nodeData) {
+        if (nodeData.name === "MiniMaxH3MotionReference") {
+            const configure = nodeType.prototype.configure;
+            nodeType.prototype.configure = function (info) {
+                migrateReferenceSplit(info);
+                return configure?.apply(this, arguments);
+            };
+            return;
+        }
+        if (nodeData.name === "MiniMaxH3Character" || nodeData.name === "MiniMaxH3Environment") {
+            const configure = nodeType.prototype.configure;
+            nodeType.prototype.configure = function (info) {
+                if (nodeData.name === "MiniMaxH3Character") {
+                    migrateCharacterCard(info);
+                } else {
+                    migrateEnvironmentCard(info);
+                }
+                return configure?.apply(this, arguments);
+            };
+            return;
+        }
         if (nodeData.name === "SaveVideo") {
             const configure = nodeType.prototype.configure;
             nodeType.prototype.configure = function (info) {
