@@ -124,6 +124,8 @@ MODEL / 视频 VAE / 音频 VAE / SAMPLER -> 二次采样放大 -> VIDEO
 
 多段二采与一采使用相同的执行体验：每完成一段就保存未裁剪 MP4 和对应 Latent，节点内累计显示已完成片段预览、当前步骤与耗时；中断后再次运行可复用已经完成的二采缓存。时间轴中直接接入的已有结果只做尺寸处理并参与最终拼接，不会被模型重新生成。
 
+需要改接其他升分辨率或重采样流程时，将 `second_pass_batch` 连接到 **MiniMax H3 二采任务解析（Second Pass Batch Parser）**。节点按片段输出一采 `LATENT`、`CONDITIONING`、未裁剪 `VIDEO`、片段编号、锁定帧数、生成帧数、可见时长和缓存文件名列表；下游节点会按相同顺序逐项执行。直接导入的已有结果没有可复用的 Latent 和 Conditioning，因此不会进入这些采样列表。
+
 ## 参考视频语义拆分
 
 **MiniMax H3 参考视频语义拆分（Reference Split）** 对一份原生 `VIDEO` 完成一次截取，并输出四种类型化引用：

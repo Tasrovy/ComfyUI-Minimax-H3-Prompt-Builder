@@ -181,6 +181,42 @@ class MiniMaxH3SecondPassBatchAppend(io.ComfyNode):
         return io.NodeOutput(SecondPassBatchData((*entries, entry)))
 
 
+class MiniMaxH3SecondPassBatchParser(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(node_id="MiniMaxH3SecondPassBatchParser",
+            display_name="MiniMax H3 二采任务解析（Second Pass Batch Parser）", category=CATEGORY,
+            description="将多段生成节点的二采任务包拆成逐片段列表，供外部放大、重编码或采样节点使用。",
+            inputs=[H3_SECOND_PASS_BATCH.Input("second_pass_batch")],
+            outputs=[io.Latent.Output(display_name="first_pass_latent", is_output_list=True),
+                io.Conditioning.Output(display_name="conditioning", is_output_list=True),
+                io.Video.Output(display_name="source_video", is_output_list=True),
+                io.Int.Output(display_name="segment_index", is_output_list=True),
+                io.Int.Output(display_name="context_frames", is_output_list=True),
+                io.Int.Output(display_name="generation_frames", is_output_list=True),
+                io.Float.Output(display_name="visible_duration", is_output_list=True),
+                io.String.Output(display_name="cache_file", is_output_list=True)])
+
+    @classmethod
+    def execute(cls, second_pass_batch):
+        if not isinstance(second_pass_batch, SecondPassBatchData):
+            raise TypeError("二采任务解析需要 MiniMax H3 二采任务包")
+        entries = tuple(entry for entry in second_pass_batch.entries
+            if entry.latent is not None and entry.conditioning is not None)
+        if not entries:
+            raise ValueError("二采任务包中没有可采样片段；直接导入的已有结果不包含 Latent 和 Conditioning")
+        return io.NodeOutput(
+            [entry.latent for entry in entries],
+            [entry.conditioning for entry in entries],
+            [entry.video for entry in entries],
+            [entry.segment_index + 1 for entry in entries],
+            [entry.context_frames for entry in entries],
+            [entry.generation_frames for entry in entries],
+            [entry.visible_duration for entry in entries],
+            [entry.cache_file for entry in entries],
+        )
+
+
 class MiniMaxH3SecondPassLock(io.ComfyNode):
     @classmethod
     def define_schema(cls):

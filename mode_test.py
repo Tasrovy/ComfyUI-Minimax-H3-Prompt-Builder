@@ -497,6 +497,12 @@ entry = mod.MiniMaxH3SecondPassEntryPack.execute(object(), 0, 0, 5, 5 / 24, "seg
     conditioning=object(), latent={"samples": object()})[0]
 batch = mod.MiniMaxH3SecondPassBatchAppend.execute(entry)[0]
 assert batch.entries == (entry,)
+parsed_batch = mod.MiniMaxH3SecondPassBatchParser.execute(batch)
+assert parsed_batch[0] == [entry.latent]
+assert parsed_batch[1] == [entry.conditioning]
+assert parsed_batch[2] == [entry.video]
+assert parsed_batch[3] == [1]
+assert parsed_batch[4:] == ([0], [5], [5 / 24], [entry.cache_file])
 second_pass = mod.MiniMaxH3MultiSegmentSecondPass.execute(FakeModel(), object(), object(), object(), batch,
     cache_mode="重新生成全部片段")
 assert second_pass.expand is not None
