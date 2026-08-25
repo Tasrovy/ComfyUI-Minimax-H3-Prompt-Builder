@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import pathlib
 import sys
 import tempfile
@@ -18,6 +19,46 @@ spec.loader.exec_module(mod)
 
 s = mod.schema
 u = mod.utils
+
+library = mod.resource_library.normalize_library({
+    "format": "minimax-h3-resource-library", "version": 1, "library_id": "test-library", "name": "测试资源库",
+    "characters": [{"id": "character_luluka", "display_name": "Luluka", "tags": ["蓝发"],
+        "reference_image": {"type": "input", "subfolder": "minimax_h3/resources", "filename": "luluka.png"},
+        "card": {"name": "Luluka", "description": "A short girl with long blue hair.", "style_priority": "global"},
+        "instance_defaults": {"pose_override": "stands naturally"}}],
+    "environments": [{"id": "environment_bridge", "display_name": "雨夜人行桥",
+        "card": {"name": "bridge", "location": "A steel pedestrian bridge.", "default_background": "City lights beyond the railing."}}],
+    "styles": [{"id": "style_anime", "display_name": "日系手绘", "card": {"style": "Japanese anime illustration."}}],
+    "extension_cards": [{"kind": "org.example.prop", "id": "prop_letter", "display_name": "信件",
+        "data": {"description": "A sealed letter."}, "extensions": {"org.example.test": {"enabled": True}}}],
+})
+assert library["characters"][0]["card"]["description"] == "A short girl with long blue hair."
+assert library["characters"][0]["instance_defaults"]["pose_override"] == "stands naturally"
+assert library["environments"][0]["card"]["location"] == "A steel pedestrian bridge."
+assert library["styles"][0]["card"]["style"] == "Japanese anime illustration."
+assert library["extension_cards"][0]["data"]["description"] == "A sealed letter."
+try:
+    mod.resource_library.normalize_library({"characters": [{"display_name": "bad", "card": {"name": "bad"},
+        "reference_image": {"type": "input", "subfolder": "../outside", "filename": "bad.png"}}]})
+    raise AssertionError("unsafe resource image path was accepted")
+except ValueError:
+    pass
+
+original_library_path = mod.resource_library._library_path
+with tempfile.TemporaryDirectory() as resource_temp:
+    mod.resource_library._library_path = lambda: str(pathlib.Path(resource_temp) / "library.json")
+    saved_library = mod.resource_library.save_library(library, 0)
+    character_path = pathlib.Path(resource_temp) / "cards" / "character" / "character_luluka.json"
+    extension_path = pathlib.Path(resource_temp) / "cards" / "org.example.prop" / "prop_letter.json"
+    assert character_path.exists()
+    assert extension_path.exists()
+    assert json.loads(character_path.read_text(encoding="utf-8"))["format"] == "minimax-h3-resource-card"
+    assert json.loads((pathlib.Path(resource_temp) / "library.json").read_text(encoding="utf-8"))["format"] == "minimax-h3-resource-index"
+    reloaded_library = mod.resource_library.load_library()
+    assert reloaded_library["revision"] == saved_library["revision"]
+    assert reloaded_library["characters"][0]["id"] == "character_luluka"
+    assert reloaded_library["extension_cards"][0]["kind"] == "org.example.prop"
+mod.resource_library._library_path = original_library_path
 
 image = torch.zeros(1, 64, 64, 3)
 lang = s.LanguageData("Chinese", "Mandarin Chinese", "standard Mandarin accent", "natural pronunciation")

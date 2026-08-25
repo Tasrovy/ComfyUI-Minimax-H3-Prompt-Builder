@@ -14,6 +14,7 @@ from .pipeline import (MiniMaxH3MultiSegmentGenerate, MiniMaxH3MultiSegmentSecon
     MiniMaxH3SegmentResultPrepare, MiniMaxH3SegmentSampler, MiniMaxH3SegmentTrim)
 from .segments import (MiniMaxH3GenerationJob, MiniMaxH3PromptPreview, MiniMaxH3SegmentConditioning)
 from .timeline import (MiniMaxH3FinalPrompt, MiniMaxH3PromptParser, MiniMaxH3Ref2VAAdapter, MiniMaxH3Timeline)
+from . import resource_library
 
 
 WEB_DIRECTORY = "./web"
