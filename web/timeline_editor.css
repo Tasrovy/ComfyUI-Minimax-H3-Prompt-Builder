@@ -70,6 +70,10 @@
 .h3te-form-section { padding:10px 0 16px; }.h3te-form-section.secondary { border-top:1px solid var(--line); margin-top:8px; }
 .h3te-form-title { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:13px; }.h3te-form-title>div { display:flex; flex-direction:column; min-width:0; }.h3te-form-title strong { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }.h3te-form-title button { padding:5px 8px; font-size:11px; }
 .h3te-form-actions { display:flex!important; flex-direction:row!important; gap:5px; flex-shrink:0; }
+.h3te-card-picker { margin:0 0 14px; padding:10px; border:1px solid #3a4460; border-radius:9px; background:#171d2a; }
+.h3te-card-picker .h3te-field { margin:0 0 8px; }
+.h3te-card-picker button { width:100%; color:#d1ccff; }
+.h3te-card-picker>small { display:block; margin-top:7px; color:var(--muted); font-size:10px; line-height:1.5; }
 .h3te-field { display:flex; flex-direction:column; gap:5px; margin:11px 0; }.h3te-field>span { color:#aab4c7; font-size:11px; }.h3te-field textarea { resize:vertical; min-height:65px; }.h3te-field :disabled { opacity:.5; cursor:not-allowed; }
 .h3te-empty { margin:14px 0; padding:16px; border:1px dashed #364156; border-radius:9px; color:var(--muted); line-height:1.7; }.h3te-stage-empty { margin:30px; }
 .h3te-footer { display:flex; justify-content:space-between; align-items:center; padding:0 15px; border-top:1px solid var(--line); background:#10151e; color:var(--muted); font-size:11px; }

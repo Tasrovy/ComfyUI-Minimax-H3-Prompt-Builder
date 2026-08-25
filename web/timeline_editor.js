@@ -549,6 +549,7 @@ class H3TimelineEditor {
             if (!response.ok || !body.success) throw new Error(body.error || "读取资源库失败");
             this.library = body.library;
             this.renderLibrary();
+            if (this.selection) this.renderInspector();
         } catch (error) {
             this.library = { error: String(error?.message || error) };
             this.renderLibrary();
@@ -783,6 +784,61 @@ class H3TimelineEditor {
         resource.reference_image = this.imageReferenceFromCard(card);
         this.resourceModal = { kind: "characters", editing: false, resource };
         this.renderResourceModal();
+    }
+
+    characterCardPicker(card) {
+        const resources = Array.isArray(this.library?.characters) ? this.library.characters : [];
+        const currentId = card.properties?.minimax_h3_resource?.resource_kind === "characters" ? card.properties.minimax_h3_resource.resource_id : "";
+        return `<div class="h3te-card-picker">
+            <label class="h3te-field"><span>选择已有人物卡</span><select data-character-card-select="${card.id}" ${resources.length ? "" : "disabled"}>
+                <option value="">${resources.length ? "请选择资源库人物卡" : "人物卡资源库为空"}</option>
+                ${resources.map((resource) => `<option value="${escapeAttribute(resource.id)}" ${resource.id === currentId ? "selected" : ""}>${escapeHtml(resource.display_name)}</option>`).join("")}
+            </select></label>
+            <button data-apply-character-card="${card.id}" ${resources.length ? "" : "disabled"}>应用到当前人物卡</button>
+            <small>只替换固定外观、人物风格和参考图；人物实例状态与动作轨道保持不变。</small>
+        </div>`;
+    }
+
+    applyCharacterCard(cardId) {
+        const card = app.graph.getNodeById(Number(cardId));
+        const select = $(`[data-character-card-select="${cardId}"]`, this.root);
+        const resource = this.findLibraryResource("characters", select?.value);
+        if (!card || nodeType(card) !== TYPES.character || !resource) {
+            this.setStatus("请先选择一张已有人物卡");
+            return;
+        }
+        const created = [];
+        this.pendingCreatedNodes = created;
+        app.graph.beforeChange?.();
+        try {
+            if (resource.reference_image) {
+                this.addReferenceImage(resource, card, [card.pos[0] - 300, card.pos[1]]);
+            } else {
+                const input = slotIndex(card, "reference_image");
+                if (input >= 0 && card.inputs[input].link != null) card.disconnectInput(input);
+            }
+            for (const name of ["name", "description", "style_priority", "character_style"]) setWidgetValue(card, name, resource.card[name]);
+            card.properties ||= {};
+            card.properties.minimax_h3_resource = {
+                library_id: this.library.library_id,
+                resource_id: resource.id,
+                resource_kind: "characters",
+                resource_revision: resource.revision,
+            };
+            this.layoutProjectNodes(false);
+            app.graph.afterChange?.();
+            this.markWorkflowChanged();
+            this.data = collectTimeline(this.currentTimeline());
+            this.renderLibrary();
+            this.renderInspector();
+            this.setStatus(`已将人物卡切换为“${resource.display_name}”，人物实例和动作保持不变`);
+        } catch (error) {
+            for (const node of created.reverse()) app.graph.remove(node);
+            app.graph.afterChange?.();
+            this.setStatus(`应用人物卡失败：${error?.message || error}`);
+        } finally {
+            this.pendingCreatedNodes = null;
+        }
     }
 
     renderResourceModal() {
@@ -1314,8 +1370,10 @@ class H3TimelineEditor {
         const cardTitles = { [TYPES.character]: "人物卡", [TYPES.environment]: "环境卡", [TYPES.visual]: "风格卡" };
         const title = secondary ? cardTitles[nodeType(node)] || node.title || nodeType(node) : this.selection.title || node.title || nodeType(node);
         const saveActor = !secondary && nodeType(node) === TYPES.actor ? `<button data-save-actor-card="${node.id}">保存为人物卡</button>` : "";
+        const characterPicker = nodeType(node) === TYPES.character ? this.characterCardPicker(node) : "";
         return `<section class="h3te-form-section ${secondary ? "secondary" : ""}">
             <div class="h3te-form-title"><div><small>${escapeHtml(nodeType(node))} · #${node.id}</small><strong>${escapeHtml(title)}</strong></div><div class="h3te-form-actions">${saveActor}<button data-locate="${node.id}">定位节点</button></div></div>
+            ${characterPicker}
             ${fields.map(([name, label, hint]) => this.fieldHtml(node, name, label, hint)).join("") || `<div class="h3te-empty">此节点没有可在编辑器中修改的文字属性。</div>`}
         </section>`;
     }
@@ -1500,6 +1558,8 @@ class H3TimelineEditor {
         if (attachReference) return this.attachReferenceVideo(attachReference.dataset.attachReference);
         const saveActorCard = event.target.closest("[data-save-actor-card]");
         if (saveActorCard) return this.saveActorAsResource(app.graph.getNodeById(Number(saveActorCard.dataset.saveActorCard)));
+        const applyCharacterCard = event.target.closest("[data-apply-character-card]");
+        if (applyCharacterCard) return this.applyCharacterCard(applyCharacterCard.dataset.applyCharacterCard);
 
         const resourceButton = event.target.closest("[data-resource]");
         if (resourceButton) {
