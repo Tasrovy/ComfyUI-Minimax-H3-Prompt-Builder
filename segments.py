@@ -16,23 +16,47 @@ from .timeline import MiniMaxH3FinalPrompt, _reference_subject_layout, _validate
 from .utils import _match_reference_video, _sentence, _text, _time, _video_length
 
 
+def _segment_drivers(timeline):
+    actions = [clip for track in timeline.tracks.tracks if track.owner_kind == "actor" for clip in track.clips]
+    body_actions = [clip for clip in actions if clip.kind == "body"]
+    return body_actions or actions
+
+
 def _segment_ranges(timeline):
-    drivers = [clip for track in timeline.tracks.tracks if track.owner_kind == "actor" for clip in track.clips]
-    if not drivers:
-        drivers = [clip for track in timeline.tracks.tracks if track.owner_kind == "environment" for clip in track.clips]
-    if len(drivers) < 2:
-        return ((0.0, timeline.duration),)
-    groups = []
-    for clip in sorted(drivers, key=lambda item: (item.start_time, item.end_time)):
-        if not groups or clip.start_time >= groups[-1][1] - 1e-6:
-            groups.append([clip.start_time, clip.end_time])
-        else:
-            groups[-1][1] = max(groups[-1][1], clip.end_time)
-    boundaries = [group[1] for group in groups[:-1]]
-    boundaries = [value for index, value in enumerate(boundaries)
-                  if value > (boundaries[index - 1] if index else 0.0) + 1e-6 and value < timeline.duration - 1e-6]
-    points = [0.0, *boundaries, timeline.duration]
+    drivers = _segment_drivers(timeline)
+    boundaries = {0.0, timeline.duration}
+    for clip in drivers:
+        if 1e-6 < clip.start_time < timeline.duration - 1e-6:
+            boundaries.add(clip.start_time)
+        if 1e-6 < clip.end_time < timeline.duration - 1e-6:
+            boundaries.add(clip.end_time)
+    points = sorted(boundaries)
     return tuple((points[index], points[index + 1]) for index in range(len(points) - 1))
+
+
+def _segment_visible_frames(start, end):
+    return max(1, round(end * FPS) - round(start * FPS))
+
+
+def _segment_continuity_seconds(generation_job, segment_index, ranges=None):
+    return generation_job.continuity_seconds if _segment_context_mode(
+        generation_job.timeline, segment_index, ranges) != "off" else 0.0
+
+
+def _segment_context_mode(timeline, segment_index, ranges=None):
+    if segment_index <= 0:
+        return "off"
+    ranges = ranges or _segment_ranges(timeline)
+    start = ranges[segment_index][0]
+    starting = [clip for clip in _segment_drivers(timeline)
+                if abs(clip.start_time - start) <= 1e-6]
+    if not starting:
+        return "full"
+    choices = {"audio" if clip.audio_only_context else
+        ("full" if clip.use_previous_context else "off") for clip in starting}
+    if len(choices) > 1:
+        raise ValueError(f"{start:g} 秒开始的动作片段的段间引导模式不一致")
+    return choices.pop()
 
 
 def _segment_result(timeline, start, end):
@@ -77,6 +101,10 @@ class SegmentFramePlan:
     locked_frames: int
     generation_frames: int
 
+    @property
+    def trailing_frames(self):
+        return self.generation_frames - self.locked_frames - self.current_frames
+
 
 _LATENT_CONTEXT_WINDOWS = (5, 22, 39, 56)
 
@@ -87,9 +115,9 @@ def _segment_frame_plan(seconds, available_frames, current_frames):
     wanted = min(max(0, round(seconds * FPS)), available_frames)
     candidates = [value for value in _LATENT_CONTEXT_WINDOWS if value <= wanted]
     locked_frames = candidates[-1] if candidates else 0
-    generation_frames = _video_length((requested_frames + locked_frames) / FPS)
-    return SegmentFramePlan(requested_frames, generation_frames - locked_frames, locked_frames,
-        generation_frames)
+    current_frames = _video_length(requested_frames / FPS)
+    generation_frames = _video_length((current_frames + locked_frames) / FPS)
+    return SegmentFramePlan(requested_frames, current_frames, locked_frames, generation_frames)
 
 
 def _video_steps_for_frames(frame_count):
@@ -108,43 +136,49 @@ def _encode_context_audio(audio_vae, audio):
 
 
 def _lock_context_prefix(latent, previous_images, previous_audio, previous_latent, video_vae, audio_vae,
-                         locked_frames, width, height):
+                         locked_frames, width, height, lock_video=True):
     video, audio = (stream.clone() for stream in latent["samples"].unbind())
     video_steps = _video_steps_for_frames(locked_frames)
+    previous_video = None
+    previous_audio_latent = None
     if previous_latent is not None:
         previous_video, previous_audio_latent = previous_latent["samples"].unbind()
-        if previous_video.shape[1] != video.shape[1]:
-            raise ValueError("上一片段视频 Latent 通道数与当前模型不一致")
-        if previous_video.shape[3:] != video.shape[3:]:
-            raise ValueError("上一片段与当前片段分辨率不一致，无法直接传递 Latent")
-        if previous_video.shape[2] < video_steps:
-            raise ValueError("上一片段视频 Latent 短于要求的段间锁定窗口")
-        tail_latent = previous_video[:, :, -video_steps:]
-    else:
-        tail = previous_images[-locked_frames:, ..., :3]
-        if tail.shape[1] != height or tail.shape[2] != width:
-            tail = resize_h3_image(tail, width, height, "disabled")
-        tail_latent = video_vae.encode(tail)
-        previous_audio_latent = None
-        if tail_latent.shape[2] != video_steps:
-            raise ValueError(f"{locked_frames} 帧段间画面编码得到 {tail_latent.shape[2]} 个 Latent 步，预期 {video_steps} 个")
+    if lock_video:
+        if previous_images is not None and previous_images.shape[0]:
+            tail = previous_images[-locked_frames:, ..., :3]
+            if tail.shape[1] != height or tail.shape[2] != width:
+                tail = resize_h3_image(tail, width, height, "disabled")
+            tail_latent = video_vae.encode(tail)
+            if tail_latent.shape[2] != video_steps:
+                raise ValueError(f"{locked_frames} 帧段间画面编码得到 {tail_latent.shape[2]} 个 Latent 步，预期 {video_steps} 个")
+        elif previous_video is not None:
+            if previous_video.shape[1] != video.shape[1]:
+                raise ValueError("上一片段视频 Latent 通道数与当前模型不一致")
+            if previous_video.shape[3:] != video.shape[3:]:
+                raise ValueError("上一片段与当前片段分辨率不一致，无法直接传递 Latent")
+            if previous_video.shape[2] < video_steps:
+                raise ValueError("上一片段视频 Latent 短于要求的段间锁定窗口")
+            tail_latent = previous_video[:, :, -video_steps:]
+        else:
+            raise ValueError("段间画面锁定缺少上一片段画面或 Latent")
     if video_steps >= video.shape[2]:
         raise ValueError("段间锁定窗口必须短于本次生成视频")
-    video[:, :, :video_steps] = tail_latent.to(device=video.device, dtype=video.dtype)
     video_mask = torch.ones_like(video)
-    video_mask[:, :, :video_steps] = 0
+    if lock_video:
+        video[:, :, :video_steps] = tail_latent.to(device=video.device, dtype=video.dtype)
+        video_mask[:, :, :video_steps] = 0
 
     audio_mask = torch.ones_like(audio)
     audio_steps = max(1, round((locked_frames / FPS) * 40))
-    if previous_audio_latent is not None:
-        if previous_audio_latent.shape[-1] < audio_steps:
-            raise ValueError("上一片段音频 Latent 短于要求的段间锁定窗口")
-        audio_latent = previous_audio_latent[..., -audio_steps:]
-    elif previous_audio is not None:
+    if previous_audio is not None:
         sample_rate = int(previous_audio["sample_rate"])
         audio_samples = max(1, round((locked_frames / FPS) * sample_rate))
         tail_audio = {**previous_audio, "waveform": previous_audio["waveform"][..., -audio_samples:]}
         audio_latent = _encode_context_audio(audio_vae, tail_audio)
+    elif previous_audio_latent is not None:
+        if previous_audio_latent.shape[-1] < audio_steps:
+            raise ValueError("上一片段音频 Latent 短于要求的段间锁定窗口")
+        audio_latent = previous_audio_latent[..., -audio_steps:]
     else:
         audio_latent = None
     if audio_latent is not None:
@@ -162,16 +196,20 @@ def _lock_context_prefix(latent, previous_images, previous_audio, previous_laten
 def _persistent_state(timeline, start):
     if start <= 1e-6:
         return ""
-    labels = {id(actor): actor.card.name or f"Actor {index}"
-        for index, actor in enumerate(timeline.characters.actors, 1)}
+    chinese = timeline.prompt_language == "中文"
+    labels = {id(actor): f"{{{actor.actor_id}}}" for actor in timeline.characters.actors}
     states = []
     for track in timeline.tracks.tracks:
+        if track.owner_kind == "audio":
+            continue
         completed = [clip for clip in track.clips if clip.end_time <= start + 1e-6 and clip.result]
         if not completed:
             continue
         clip = max(completed, key=lambda item: item.end_time)
-        owner = labels.get(id(track.owner), "The environment" if track.owner_kind == "environment" else "The scene")
-        states.append(_sentence(f"At the beginning of this segment, {owner} remains in this established state: {clip.result}"))
+        owner = labels.get(id(track.owner), ({"environment": "环境", "camera": "镜头", "lighting": "灯光"}.get(track.owner_kind, "场景") if chinese else
+            {"environment": "The environment", "camera": "The camera", "lighting": "The lighting"}.get(track.owner_kind, "The scene")))
+        states.append(_sentence((f"本片段开始时，{owner}保持此前建立的状态：{clip.result}" if chinese else
+            f"At the beginning of this segment, {owner} remains in this established state: {clip.result}")))
     return " ".join(states)
 
 
@@ -185,6 +223,8 @@ def _reference_bindings(timeline):
                 bindings.append(("camera", track, clip, clip.camera_reference.source))
             elif track.owner_kind == "lighting" and clip.lighting_reference is not None:
                 bindings.append(("lighting", track, clip, clip.lighting_reference.source))
+            elif track.owner_kind == "environment" and clip.environment_reference is not None:
+                bindings.append(("environment", track, clip, clip.environment_reference.source))
             elif track.owner_kind == "audio" and clip.audio_reference is not None:
                 bindings.append(("audio", track, clip, clip.audio_reference.source))
     return bindings
@@ -277,6 +317,12 @@ def _reference_visible_frames(reference, duration):
     return torch.cat(rows, dim=0)
 
 
+def _tail_align_frames(frames, frame_count):
+    if frames.shape[0] >= frame_count:
+        return frames[-frame_count:]
+    return torch.cat((frames[:1].repeat(frame_count - frames.shape[0], 1, 1, 1), frames), dim=0)
+
+
 def _audio_channels(waveform, channels):
     if waveform.shape[1] == channels:
         return waveform
@@ -312,7 +358,7 @@ def _reference_visible_audio(reference, duration, sample_rate, channels, device,
 
 
 def _align_motion_context(timeline, previous_timeline, references, frame_plan,
-                          previous_images=None, previous_audio=None):
+                          previous_images=None, previous_audio=None, context_mode="full"):
     if not references:
         return references
     target_frames = frame_plan.generation_frames
@@ -328,12 +374,13 @@ def _align_motion_context(timeline, previous_timeline, references, frame_plan,
 
     aligned = []
     for reference in references:
-        visible = _reference_visible_frames(reference, timeline.duration)
+        visible = (_reference_visible_frames(reference, timeline.duration) if frame_plan.locked_frames
+            else _tail_align_frames(reference.frames, target_frames))
         locked = None
         previous_reference = previous.get(reference.owner_id)
-        if frame_plan.locked_frames and previous_images is not None and previous_images.shape[0]:
+        if context_mode == "full" and frame_plan.locked_frames and previous_images is not None and previous_images.shape[0]:
             locked = previous_images[-frame_plan.locked_frames:, ..., :3]
-        elif frame_plan.locked_frames and previous_reference is not None:
+        elif context_mode == "full" and frame_plan.locked_frames and previous_reference is not None:
             previous_visible = _reference_visible_frames(previous_reference, previous_timeline.duration)
             locked = previous_visible[-frame_plan.locked_frames:]
         if frame_plan.locked_frames and locked is None:
@@ -347,6 +394,8 @@ def _align_motion_context(timeline, previous_timeline, references, frame_plan,
             locked = locked[-frame_plan.locked_frames:]
         if locked is not None:
             visible = torch.cat((locked, visible), dim=0)
+        if visible.shape[0] < target_frames:
+            visible = torch.cat((visible, visible[-1:].repeat(target_frames - visible.shape[0], 1, 1, 1)), dim=0)
         if visible.shape[0] != target_frames:
             raise ValueError(f"参考视频对齐后得到 {visible.shape[0]} 帧，本次模型生成需要 {target_frames} 帧")
 
@@ -355,8 +404,13 @@ def _align_motion_context(timeline, previous_timeline, references, frame_plan,
             sample_rate = int(audio["sample_rate"])
             waveform = audio["waveform"]
             channels = waveform.shape[1]
-            body = _reference_visible_audio(reference, timeline.duration, sample_rate, channels,
-                waveform.device, waveform.dtype)
+            if frame_plan.locked_frames:
+                body = _reference_visible_audio(reference, timeline.duration, sample_rate, channels,
+                    waveform.device, waveform.dtype)
+            else:
+                target_samples = round((target_frames / FPS) * sample_rate)
+                body = waveform[..., -target_samples:]
+                body = torch.nn.functional.pad(body, (target_samples - body.shape[-1], 0))
             locked_audio = None
             if frame_plan.locked_frames:
                 locked_samples = round((frame_plan.locked_frames / FPS) * sample_rate)
@@ -375,7 +429,7 @@ def _align_motion_context(timeline, previous_timeline, references, frame_plan,
 
         aligned.append(replace(reference, frames=visible, audio=audio,
             aligned_duration=target_frames / FPS, context_duration=frame_plan.locked_frames / FPS,
-            locked_duration=frame_plan.locked_frames / FPS))
+            locked_duration=frame_plan.locked_frames / FPS if context_mode == "full" else 0.0))
     return aligned
 
 
@@ -396,24 +450,34 @@ def _reference_subject_count(timeline):
     return _reference_subject_layout(timeline)[3]
 
 
-def _opening_alignment_instruction(locked_duration):
+def _opening_alignment_instruction(locked_duration, chinese=False, context_mode="full"):
     if locked_duration <= 1e-6:
         return ""
+    if context_mode == "audio":
+        return ((f"开头{_time(locked_duration)}秒的音频硬锁定为上一生成片段末尾的声音，画面不继承上一段。"
+            f"在{_time(locked_duration)}秒处，当前片段音频从锁定声音连续衔接。") if chinese else
+            (f"The opening {_time(locked_duration)} seconds of audio are hard-locked to the preceding generated segment's ending sound; "
+            f"the visuals do not inherit the preceding segment. At {_time(locked_duration)} seconds, the current audio continues seamlessly from the locked sound."))
+    if chinese:
+        return (f"开头{_time(locked_duration)}秒硬锁定为上一生成片段末尾的动作、姿态与取景。"
+            f"在{_time(locked_duration)}秒处，当前动作从锁定的最后一帧直接延续，并一直进行到本片段最后一帧。")
     return (f"The opening {_time(locked_duration)} seconds are hard-locked to the preceding generated segment's final motion, pose, and framing. "
         f"At {_time(locked_duration)} seconds, the current action continues directly from the locked final frame and runs through the final frame")
 
 
 def _semantic_references(timeline, video_groups, audio_groups, first_subject_number,
-                         prefix_duration=0.0, has_locked_context=False):
+                         prefix_duration=0.0, has_locked_context=False, chinese=False):
     actor_subjects = _reference_subject_layout(timeline)[0]
-    labels = {id(actor): actor.card.name or f"Actor {index}"
-        for index, actor in enumerate(timeline.characters.actors, 1)}
+    labels = {id(actor): f"{{{actor.actor_id}}}" for actor in timeline.characters.actors}
     instructions = []
     definitions = []
     retentions = []
     action_labels = []
     camera_labels = []
     lighting_labels = []
+    environment_labels = []
+    expression_labels = []
+    gaze_labels = []
     audio_labels = []
     subject_number = first_subject_number
     audio_number = 1
@@ -429,49 +493,123 @@ def _semantic_references(timeline, video_groups, audio_groups, first_subject_num
     for video_number, (group, _) in enumerate(video_groups, 1):
         bindings = group["bindings"]
         has_camera = any(binding[0] == "camera" for binding in bindings)
+        has_environment = any(binding[0] == "environment" for binding in bindings)
+        scene_locked = has_environment
         if prefix_duration or has_camera:
             roles = []
             if prefix_duration:
-                roles.append("motion-transition context and current shot-aligned temporal order" if has_locked_context
-                    else "current shot-aligned temporal order")
+                roles.append(("动作过渡上下文与当前镜头对齐的时间顺序" if has_locked_context else "当前镜头对齐的时间顺序") if chinese else
+                    ("motion-transition context and current shot-aligned temporal order" if has_locked_context
+                        else "current shot-aligned temporal order"))
             if has_camera:
-                roles.append("camera movement and framing progression")
-            definitions.append(f"<Video {video_number}> is the reference for [Shot 1]'s {' and '.join(roles)}.")
-            retentions.append(f"<Video {video_number}> (temporal structure in [Shot 1]): fully_preserved - "
-                f"Preserve its {' and '.join(roles)} without importing source identities, clothing, or environment.")
+                roles.append("镜头运动与取景变化" if chinese else "camera movement and framing progression")
+            if has_environment:
+                roles.append("环境外观与空间布局" if chinese else "environment appearance and spatial layout")
+            role_text = "以及".join(roles) if chinese else " and ".join(roles)
+            definitions.append((f"<Video {video_number}>是[Shot 1]的{role_text}参考。" if chinese else
+                f"<Video {video_number}> is the reference for [Shot 1]'s {role_text}."))
+            if chinese:
+                retention = (f"<Video {video_number}>（[Shot 1]的时间结构）：fully_preserved - 保留其{role_text}，"
+                    + ("只替换已声明的源人物身份与服装。" if scene_locked else "但不导入源视频中的人物身份、服装或环境。"))
+            else:
+                retention = (f"<Video {video_number}> (temporal structure in [Shot 1]): fully_preserved - Preserve its {role_text} "
+                    + ("and replace only the declared source performer." if scene_locked else
+                        "without importing source identities, clothing, or environment."))
+            retentions.append(retention)
         for kind, track, clip, _ in bindings:
             if kind == "actor":
-                owner = labels.get(id(track.owner), "the character")
+                owner = labels.get(id(track.owner), "该人物" if chinese else "the character")
                 target = (f"<Subject {actor_subjects[id(track.owner)]}> ({owner})"
                     if id(track.owner) in actor_subjects else owner)
                 subject = f"<Subject {subject_number}>"
-                definitions.append(f"{subject} is the body performance derived from <Video {video_number}> and transferred to {target}.")
-                retentions.append(f"{subject} (appears in [Shot 1]): attribute_transfer - Transfer its motion order, timing, and final pose to {target}.")
-                line = (f"Use {subject} as {target}'s authoritative body performance. Preserve its complete motion order, timing, "
-                    f"weight shifts, and final pose while retaining {owner}'s declared identity and fixed appearance. "
-                    "Transfer only body performance; do not copy the source performer, face, clothing, background, lighting, or audio.")
+                person_id = _text(clip.motion_reference.person_id)
+                person_description = _text(clip.motion_reference.person_description)
+                performance_name = {"body": ("肢体表演" if chinese else "body performance"),
+                    "expression": ("面部表演" if chinese else "facial performance"),
+                    "gaze": ("视线表演" if chinese else "gaze performance")}.get(clip.kind,
+                        "表演" if chinese else "performance")
+                if person_description:
+                    source_person = ((f"源人物{person_id}（{person_description}）" if person_id else person_description) if chinese else
+                        (f"source performer {person_id} ({person_description})" if person_id else person_description))
+                    definitions.append((f"{subject}是从<Video {video_number}>中的{source_person}提取并迁移给{target}的{performance_name}。" if chinese else
+                        f"{subject} is the {performance_name} of {source_person} derived from <Video {video_number}> and transferred to {target}."))
+                else:
+                    definitions.append((f"{subject}是从<Video {video_number}>提取并迁移给{target}的{performance_name}。" if chinese else
+                        f"{subject} is the {performance_name} derived from <Video {video_number}> and transferred to {target}."))
+                if clip.kind == "expression":
+                    retention = (f"保留面部表情顺序、变化时机与最终表情，迁移给{target}。" if chinese else
+                        f"Transfer its expression order, timing, and final expression to {target}.")
+                    instruction = ((f"使用{subject}作为{target}的权威面部表演参考。完整保留表情变化顺序、时机与最终表情，"
+                        f"同时保留{owner}已声明的身份与固定外观。" + ("只替换源人物。" if scene_locked else "不复制源视频中的人物身份、服装、背景或灯光。"))
+                        if chinese else (f"Use {subject} as {target}'s authoritative facial performance reference. Preserve its expression order, timing, "
+                        f"and final expression while retaining {owner}'s declared identity and fixed appearance. " +
+                        ("Replace only the source performer." if scene_locked else "Do not copy source identity, clothing, background, or lighting.")))
+                    expression_labels.append(subject)
+                elif clip.kind == "gaze":
+                    retention = (f"保留视线方向、转移时机与最终视线，迁移给{target}。" if chinese else
+                        f"Transfer its gaze direction, timing, and final gaze to {target}.")
+                    instruction = ((f"使用{subject}作为{target}的权威视线表演参考。完整保留视线方向与时机，同时保留{owner}的身份。" if chinese else
+                        f"Use {subject} as {target}'s authoritative gaze-performance reference. Preserve its gaze direction and timing while retaining {owner}'s identity.") )
+                    gaze_labels.append(subject)
+                else:
+                    retention = (f"将动作顺序、时序与最终姿态迁移给{target}。" if chinese else
+                        f"Transfer its motion order, timing, and final pose to {target}.")
+                    instruction = ((f"使用{subject}作为{target}的权威肢体表演参考。完整保留其动作顺序、时序、重心转移与最终姿态，"
+                        f"同时保留{owner}已声明的身份与固定外观。" + ("只替换源人物。" if scene_locked else "只迁移肢体表演，不复制源视频中的人物、面部、服装、背景、灯光或音频。"))
+                        if chinese else (f"Use {subject} as {target}'s authoritative body-performance reference. Preserve its complete motion order, timing, weight shifts, "
+                        f"and final pose while retaining {owner}'s declared identity and fixed appearance. " +
+                        ("Replace only the source performer." if scene_locked else "Transfer only body performance; do not copy source performer, face, clothing, background, lighting, or audio.")))
+                retentions.append((f"{subject}（出现在[Shot 1]）：attribute_transfer - {retention}" if chinese else
+                    f"{subject} (appears in [Shot 1]): attribute_transfer - {retention}"))
+                line = instruction
+                if person_description:
+                    line += ((f" 在<Video {video_number}>中只跟随{source_person}的表演，不要混用其他可见人物的动作。") if chinese else
+                        (f" In <Video {video_number}>, follow only {source_person}'s performance and do not mix motion from other visible performers."))
                 instructions.append((id(clip), _sentence(line)))
-                action_labels.append(subject)
+                if clip.kind == "body": action_labels.append(subject)
                 subject_number += 1
             elif kind == "camera":
-                instructions.append((id(clip), _sentence(
-                    f"Use <Video {video_number}> as the authoritative camera movement, framing, and temporal-structure reference. "
-                    "Transfer only camera behavior; do not copy the source performer, clothing, background, lighting, or audio.")))
+                line = ((f"使用<Video {video_number}>作为权威的镜头运动、取景与时间结构参考。"
+                    + ("只替换源人物，保留源视频的环境与空间布局。" if scene_locked else "只迁移镜头行为，不复制源视频中的表演者、服装、背景、灯光或音频。")) if chinese else
+                    (f"Use <Video {video_number}> as the authoritative camera movement, framing, and temporal-structure reference. "
+                    + ("Replace only the source performer while preserving the source environment and spatial layout." if scene_locked else
+                        "Transfer only camera behavior; do not copy the source performer, clothing, background, lighting, or audio.")))
+                instructions.append((id(clip), _sentence(line)))
                 camera_labels.append(f"<Video {video_number}>")
             elif kind == "lighting":
                 subject = f"<Subject {subject_number}>"
-                definitions.append(f"{subject} is the lighting behavior derived from <Video {video_number}> and transferred to [Shot 1].")
-                retentions.append(f"{subject} (appears in [Shot 1]): attribute_transfer - Transfer its light direction, color, intensity, and change rhythm without importing the source scene.")
-                instructions.append((id(clip), _sentence(
-                    f"Use {subject} as [Shot 1]'s authoritative lighting behavior while preserving the declared subjects and environment.")))
+                definitions.append((f"{subject}是从<Video {video_number}>提取并迁移到[Shot 1]的灯光行为。" if chinese else
+                    f"{subject} is the lighting behavior derived from <Video {video_number}> and transferred to [Shot 1]."))
+                retentions.append(((f"{subject}（出现在[Shot 1]）：fully_preserved - 保留源视频的光线方向、颜色、强度与变化节奏，并与源环境保持一致。"
+                    if chinese else f"{subject} (appears in [Shot 1]): fully_preserved - Preserve the source light direction, color, intensity, and change rhythm with the source environment.") if scene_locked else
+                    (f"{subject}（出现在[Shot 1]）：attribute_transfer - 迁移其光线方向、颜色、强度与变化节奏，但不导入源场景。" if chinese else
+                    f"{subject} (appears in [Shot 1]): attribute_transfer - Transfer its light direction, color, intensity, and change rhythm without importing the source scene.")))
+                line = (f"使用{subject}作为[Shot 1]的权威灯光行为参考，同时保留源视频环境并只替换源人物。" if chinese and scene_locked else
+                    f"Use {subject} as [Shot 1]'s authoritative lighting behavior while preserving the source environment and replacing only the source performer." if scene_locked else
+                    (f"使用{subject}作为[Shot 1]的权威灯光行为参考，同时保留已声明的主体与环境。" if chinese else
+                        f"Use {subject} as [Shot 1]'s authoritative lighting behavior while preserving the declared subjects and environment."))
+                instructions.append((id(clip), _sentence(line)))
                 lighting_labels.append(subject)
+                subject_number += 1
+            elif kind == "environment":
+                subject = f"<Subject {subject_number}>"
+                definitions.append((f"{subject}是从<Video {video_number}>提取的源视频环境与空间布局。" if chinese else
+                    f"{subject} is the source video's environment and spatial layout derived from <Video {video_number}>."))
+                retentions.append((f"{subject}（出现在[Shot 1]）：fully_preserved - 保留源视频环境、空间布局与背景关系，只替换源人物。" if chinese else
+                    f"{subject} (appears in [Shot 1]): fully_preserved - Preserve the source environment, spatial layout, and background relationship while replacing only the source performer."))
+                instructions.append((id(clip), _sentence((f"使用{subject}作为[Shot 1]的权威环境与空间布局参考，保留源视频背景，只替换源人物。" if chinese else
+                    f"Use {subject} as [Shot 1]'s authoritative environment and spatial-layout reference. Preserve the source background and replace only the source performer."))))
+                environment_labels.append(subject)
                 subject_number += 1
             elif kind == "audio":
                 number = audio_numbers[id(group)]
                 label = f"<Audio {number}>"
-                definitions.append(f"{label} is the {clip.audio_type} sound reference from the soundtrack associated with <Video {video_number}>.")
-                retentions.append(f"{label}: reference - Follow its timing and sound character without copying the source signal.")
-                instructions.append((id(clip), _sentence(f"Use {label} as the {clip.audio_type} timing and sound-character reference.")))
+                definitions.append((f"{label}是与<Video {video_number}>关联音轨中的{clip.audio_type}声音参考。" if chinese else
+                    f"{label} is the {clip.audio_type} sound reference from the soundtrack associated with <Video {video_number}>."))
+                retentions.append((f"{label}：reference - 遵循其时序与声音特征，但不复制源信号。" if chinese else
+                    f"{label}: reference - Follow its timing and sound character without copying the source signal."))
+                instructions.append((id(clip), _sentence((f"使用{label}作为{clip.audio_type}的时序与声音特征参考。" if chinese else
+                    f"Use {label} as the {clip.audio_type} timing and sound-character reference."))))
                 audio_labels.append(label)
 
     standalone_audios = []
@@ -480,9 +618,12 @@ def _semantic_references(timeline, video_groups, audio_groups, first_subject_num
         _, _, clip, source = binding
         number = audio_numbers[id(group)]
         label = f"<Audio {number}>"
-        definitions.append(f"{label} is the {clip.audio_type} sound reference from the supplied reference video soundtrack.")
-        retentions.append(f"{label}: reference - Follow its timing and sound character without copying the source signal.")
-        instructions.append((id(clip), _sentence(f"Use {label} as the {clip.audio_type} timing and sound-character reference.")))
+        definitions.append((f"{label}是所提供参考视频音轨中的{clip.audio_type}声音参考。" if chinese else
+            f"{label} is the {clip.audio_type} sound reference from the supplied reference video soundtrack."))
+        retentions.append((f"{label}：reference - 遵循其时序与声音特征，但不复制源信号。" if chinese else
+            f"{label}: reference - Follow its timing and sound character without copying the source signal."))
+        instructions.append((id(clip), _sentence((f"使用{label}作为{clip.audio_type}的时序与声音特征参考。" if chinese else
+            f"Use {label} as the {clip.audio_type} timing and sound-character reference."))))
         audio_labels.append(label)
         standalone_audios.append(source.audio)
 
@@ -491,13 +632,27 @@ def _semantic_references(timeline, video_groups, audio_groups, first_subject_num
         instruction_map[clip_id] = " ".join(filter(_text, (instruction_map.get(clip_id, ""), instruction)))
     summary_parts = []
     if action_labels:
-        summary_parts.append(f"Body performance is transferred from {' and '.join(action_labels)}.")
+        summary_parts.append((f"肢体表演迁移自{'、'.join(action_labels)}。" if chinese else
+            f"Body performance is transferred from {' and '.join(action_labels)}."))
+    if expression_labels:
+        summary_parts.append((f"面部表演迁移自{'、'.join(expression_labels)}。" if chinese else
+            f"Facial performance is transferred from {' and '.join(expression_labels)}."))
+    if gaze_labels:
+        summary_parts.append((f"视线表演迁移自{'、'.join(gaze_labels)}。" if chinese else
+            f"Gaze performance is transferred from {' and '.join(gaze_labels)}."))
+    if environment_labels:
+        summary_parts.append((f"环境与空间布局保留自{'、'.join(environment_labels)}。" if chinese else
+            f"Environment and spatial layout are preserved from {' and '.join(environment_labels)}."))
     if camera_labels:
-        summary_parts.append(f"Camera movement and temporal structure follow {' and '.join(dict.fromkeys(camera_labels))}.")
+        labels_text = "、".join(dict.fromkeys(camera_labels)) if chinese else " and ".join(dict.fromkeys(camera_labels))
+        summary_parts.append((f"镜头运动与时间结构遵循{labels_text}。" if chinese else
+            f"Camera movement and temporal structure follow {labels_text}."))
     if lighting_labels:
-        summary_parts.append(f"Lighting behavior is transferred from {' and '.join(lighting_labels)}.")
+        summary_parts.append((f"灯光行为迁移自{'、'.join(lighting_labels)}。" if chinese else
+            f"Lighting behavior is transferred from {' and '.join(lighting_labels)}."))
     if audio_labels:
-        summary_parts.append(f"Sound is referenced from {' and '.join(dict.fromkeys(audio_labels))}.")
+        labels_text = "、".join(dict.fromkeys(audio_labels)) if chinese else " and ".join(dict.fromkeys(audio_labels))
+        summary_parts.append((f"声音参考自{labels_text}。" if chinese else f"Sound is referenced from {labels_text}."))
     return instruction_map, "\n".join(definitions), "\n".join(retentions), " ".join(summary_parts), standalone_audios
 
 
@@ -507,21 +662,24 @@ def _compile_generation_segment(generation_job, segment_index, frame_plan=None,
     if segment_index < 0 or segment_index >= len(ranges):
         raise ValueError(f"分段编号超出范围：{segment_index}")
     start, end = ranges[segment_index]
+    context_mode = _segment_context_mode(generation_job.timeline, segment_index, ranges)
     if frame_plan is None:
         available = round((ranges[segment_index - 1][1] - ranges[segment_index - 1][0]) * FPS) if segment_index else 0
-        frame_plan = _segment_frame_plan(generation_job.continuity_seconds, available, round((end - start) * FPS))
+        frame_plan = _segment_frame_plan(_segment_continuity_seconds(generation_job, segment_index, ranges),
+            available, round((end - start) * FPS))
     timeline = _retime_timeline(_segment_timeline(generation_job.timeline, start, end),
         frame_plan.current_frames / FPS)
     previous_timeline = (_segment_timeline(generation_job.timeline, *ranges[segment_index - 1])
         if segment_index else None)
-    state = _persistent_state(generation_job.timeline, start)
+    state = (_persistent_state(generation_job.timeline, start)
+        if context_mode == "full" and frame_plan.locked_frames > 0 else "")
     prefix_duration = frame_plan.locked_frames / FPS
     locked_duration = frame_plan.locked_frames / FPS
     video_groups, audio_groups = _reference_media(timeline)
     media_references = [reference for _, reference in video_groups]
     motion_instructions, motion_definitions, motion_retentions, motion_summary, standalone_audios = _semantic_references(
         timeline, video_groups, audio_groups, _reference_subject_count(timeline) + 1, prefix_duration,
-        frame_plan.locked_frames > 0)
+        context_mode == "full" and frame_plan.locked_frames > 0, timeline.prompt_language == "中文")
     if len(media_references) > 3:
         raise ValueError("单个生成片段最多支持 3 段语义参考视频")
     if sum(reference.audio is not None for reference in media_references) + len(standalone_audios) > 3:
@@ -538,16 +696,16 @@ def _compile_generation_segment(generation_job, segment_index, frame_plan=None,
         motion_retentions=motion_retentions,
         motion_summary=motion_summary,
         empty_sections=generation_job.empty_sections,
-        suppress_initial_state=frame_plan.locked_frames > 0,
+        suppress_initial_state=context_mode == "full" and frame_plan.locked_frames > 0,
         generation_duration=frame_plan.generation_frames / FPS,
         timeline_offset=prefix_duration,
-        opening_instructions=_opening_alignment_instruction(locked_duration),
-        continuation=frame_plan.locked_frames > 0,
+        opening_instructions=_opening_alignment_instruction(locked_duration, timeline.prompt_language == "中文", context_mode),
+        continuation=context_mode == "full" and frame_plan.locked_frames > 0,
     )[0]
     if compiled.video_settings.length != frame_plan.generation_frames:
         raise ValueError(f"提示词生成长度为 {compiled.video_settings.length} 帧，分段计划需要 {frame_plan.generation_frames} 帧")
     media_references = _align_motion_context(timeline, previous_timeline, media_references, frame_plan,
-        previous_images, previous_audio)
+        previous_images, previous_audio, context_mode)
     _validate_motion_alignment(media_references, compiled.video_settings.length)
     return compiled, media_references, standalone_audios
 
@@ -606,8 +764,8 @@ class MiniMaxH3SegmentConditioning(io.ComfyNode):
     def execute(cls, clip, video_vae, audio_vae, generation_job, segment_index, previous_images=None,
                 previous_audio=None, previous_latent=None):
         start, end = _segment_ranges(generation_job.timeline)[segment_index]
-        frame_plan = _segment_frame_plan(generation_job.continuity_seconds,
-            previous_images.shape[0] if previous_images is not None else 0, round((end - start) * FPS))
+        frame_plan = _segment_frame_plan(_segment_continuity_seconds(generation_job, segment_index),
+            previous_images.shape[0] if previous_images is not None else 0, _segment_visible_frames(start, end))
         compiled, motion_references, standalone_audios = _compile_generation_segment(generation_job, segment_index, frame_plan,
             previous_images, previous_audio)
         settings = compiled.video_settings
@@ -629,7 +787,8 @@ class MiniMaxH3SegmentConditioning(io.ComfyNode):
         positive, latent = native[0], native[1]
         if frame_plan.locked_frames:
             latent = _lock_context_prefix(latent, previous_images, previous_audio, previous_latent,
-                video_vae, audio_vae, frame_plan.locked_frames, settings.width, settings.height)
+                video_vae, audio_vae, frame_plan.locked_frames, settings.width, settings.height,
+                lock_video=_segment_context_mode(generation_job.timeline, segment_index) == "full")
         return io.NodeOutput(positive, latent, frame_plan.locked_frames)
 
 
@@ -675,9 +834,9 @@ class MiniMaxH3PromptPreview(io.ComfyNode):
         seen_numbers = set()
 
         for index, (start, end) in enumerate(ranges):
-            available = round((ranges[index - 1][1] - ranges[index - 1][0]) * 24) if index else 0
-            frame_plan = _segment_frame_plan(generation_job.continuity_seconds, available,
-                round((end - start) * FPS))
+            available = _segment_visible_frames(*ranges[index - 1]) if index else 0
+            frame_plan = _segment_frame_plan(_segment_continuity_seconds(generation_job, index, ranges), available,
+                _segment_visible_frames(start, end))
             compiled, motion_references, standalone_audios = _compile_generation_segment(generation_job, index, frame_plan)
             rendered = _segment_result(generation_job.timeline, start, end)
             settings = compiled.video_settings
@@ -705,12 +864,16 @@ class MiniMaxH3PromptPreview(io.ComfyNode):
             for offset, _ in enumerate(standalone_audios, paired_audio_count + 1):
                 references.append(f"<Audio {offset}> = 当前片段独立音频语义参考")
             if frame_plan.locked_frames:
-                references.insert(0,
+                context_mode = _segment_context_mode(generation_job.timeline, index, ranges)
+                trailing = (f"并裁掉尾部 {frame_plan.trailing_frames} 帧对齐冗余" if frame_plan.trailing_frames else "")
+                references.insert(0, (f"段间引导 = 仅强锁定上一片段末尾对应的 {_time(frame_plan.locked_frames / FPS)} 秒音频，"
+                    f"画面不继承上一段；生成后裁掉前 {frame_plan.locked_frames} 帧对应时长{trailing}（不占用参考视频槽位）"
+                    if context_mode == "audio" else
                     f"段间引导 = Latent 强锁定上一片段末尾 {frame_plan.locked_frames} 帧及对应音频，"
-                    f"生成后只裁掉这 {frame_plan.locked_frames} 帧（不占用参考视频槽位）")
+                    f"生成后裁掉前 {frame_plan.locked_frames} 帧{trailing}（不占用参考视频槽位）"))
             
             header = [f"========== 片段 {index + 1}/{len(ranges)} ==========",
-                f"时间轴范围：{_time(start)}–{_time(end)} 秒 | 动态输出时长：{_time(frame_plan.current_frames / FPS)} 秒"]
+                f"时间轴范围：{_time(start)}–{_time(end)} 秒 | 裁剪后输出：{frame_plan.requested_frames} 帧 / {_time(frame_plan.requested_frames / FPS)} 秒"]
             if rendered:
                 header.append(f"生成方式：使用已生成结果（版本 {rendered[1]}），跳过模型采样")
             header.extend(["【媒体绑定清单】：",

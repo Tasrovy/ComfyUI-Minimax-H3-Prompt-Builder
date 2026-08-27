@@ -6,9 +6,10 @@ from .cards import (MiniMaxH3ActorInstance, MiniMaxH3Character, MiniMaxH3Charact
     MiniMaxH3Environment, MiniMaxH3EnvironmentInstance, MiniMaxH3Language, MiniMaxH3Visual)
 from .clips import (MiniMaxH3Action, MiniMaxH3ActionResult, MiniMaxH3ActorTrack, MiniMaxH3AudioAction, MiniMaxH3Camera,
     MiniMaxH3EnvironmentAction, MiniMaxH3EnvironmentTrack, MiniMaxH3LightingAction,
-    MiniMaxH3MotionReference, MiniMaxH3SystemTrack, MiniMaxH3TrackList)
+    MiniMaxH3MotionReference, MiniMaxH3ReferenceVideoPerson, MiniMaxH3SystemTrack, MiniMaxH3TrackList)
 from .checkpoints import MiniMaxH3SegmentCheckpoint, MiniMaxH3SegmentCheckpointLoad
-from .pipeline import (MiniMaxH3MultiSegmentGenerate, MiniMaxH3MultiSegmentSecondPass,
+from .pipeline import (MiniMaxH3MultiSegmentGenerate, MiniMaxH3MultiSegmentLatentSecondPass,
+    MiniMaxH3MultiSegmentSecondPass,
     MiniMaxH3SecondPassBatchAppend, MiniMaxH3SecondPassBatchParser, MiniMaxH3SecondPassEntryPack,
     MiniMaxH3SecondPassLock, MiniMaxH3SecondPassResize, MiniMaxH3SecondPassUpscale, MiniMaxH3SegmentJoin,
     MiniMaxH3SegmentResultPrepare, MiniMaxH3SegmentSampler, MiniMaxH3SegmentTrim)
@@ -29,12 +30,14 @@ class MiniMaxH3PromptBuilderExtension(ComfyExtension):
             MiniMaxH3AudioAction, MiniMaxH3EnvironmentAction, MiniMaxH3ActorTrack, MiniMaxH3EnvironmentTrack,
             MiniMaxH3SystemTrack, MiniMaxH3TrackList, MiniMaxH3Timeline, MiniMaxH3FinalPrompt,
             MiniMaxH3PromptParser, MiniMaxH3Ref2VAAdapter, MiniMaxH3GenerationJob, MiniMaxH3MotionReference,
+            MiniMaxH3ReferenceVideoPerson,
             MiniMaxH3PromptPreview, MiniMaxH3SegmentConditioning, MiniMaxH3SegmentTrim, MiniMaxH3SegmentJoin,
             MiniMaxH3SegmentResultPrepare, MiniMaxH3SegmentSampler,
             MiniMaxH3SecondPassResize, MiniMaxH3SecondPassEntryPack, MiniMaxH3SecondPassBatchAppend,
             MiniMaxH3SecondPassBatchParser, MiniMaxH3SecondPassLock, MiniMaxH3SecondPassUpscale,
             MiniMaxH3SegmentCheckpoint, MiniMaxH3SegmentCheckpointLoad,
-            MiniMaxH3MultiSegmentGenerate, MiniMaxH3MultiSegmentSecondPass]
+            MiniMaxH3MultiSegmentGenerate, MiniMaxH3MultiSegmentSecondPass,
+            MiniMaxH3MultiSegmentLatentSecondPass]
 
 
 async def comfy_entrypoint():

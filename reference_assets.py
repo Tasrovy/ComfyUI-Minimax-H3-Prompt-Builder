@@ -17,6 +17,7 @@ VERSION = 1
 FPS = 24
 MAX_UPLOAD_BYTES = 1024 * 1024 * 1024
 ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,96}$")
+PERSON_ID_PATTERN = re.compile(r"^person_[1-9][0-9]*$")
 
 
 def _asset_directories():
@@ -38,7 +39,32 @@ def _load_asset(path):
         asset = json.load(file)
     if not isinstance(asset, dict) or asset.get("format") != FORMAT or int(asset.get("version", 0)) != VERSION:
         raise ValueError(f"参考视频资产格式错误：{os.path.basename(path)}")
+    asset["description"] = str(asset.get("description", "")).strip()
+    asset["people"] = _normalize_people(asset.get("people", []))
     return asset
+
+
+def _normalize_people(value):
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > 32:
+        raise ValueError("参考视频人物声明必须是最多 32 项的数组")
+    people = []
+    ids = set()
+    for index, item in enumerate(value, 1):
+        if not isinstance(item, dict):
+            raise ValueError(f"参考视频人物声明 {index} 格式错误")
+        person_id = str(item.get("id", "")).strip()
+        description = str(item.get("description", "")).strip()
+        if not PERSON_ID_PATTERN.fullmatch(person_id):
+            raise ValueError(f"参考视频人物编号格式错误：{person_id or index}")
+        if person_id in ids:
+            raise ValueError(f"参考视频人物编号重复：{person_id}")
+        if not description or len(description) > 1000:
+            raise ValueError(f"参考视频人物 {person_id} 需要 1–1000 字的识别描述")
+        ids.add(person_id)
+        people.append({"id": person_id, "description": description})
+    return people
 
 
 def _load_assets():
@@ -75,8 +101,6 @@ def _preprocess(source, target, start, end):
     if start < 0 or start >= finish:
         raise ValueError("截取开始时间必须早于视频结束时间")
     duration = finish - start
-    if duration > 15.0 + 1e-6:
-        raise ValueError("MiniMax H3 单个参考视频资产不能超过 15 秒")
     command = [ffmpeg, "-y", "-ss", f"{start:.6f}", "-i", source, "-t", f"{duration:.6f}",
         "-map", "0:v:0", "-map", "0:a?", "-vf", f"fps={FPS}", "-c:v", "libx264", "-preset", "medium",
         "-crf", "16", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", target]
@@ -146,6 +170,8 @@ async def import_reference_asset(request):
             "duration": duration,
             "width": width,
             "height": height,
+            "description": "",
+            "people": [],
         }
         _write_asset(os.path.join(metadata, asset_id + ".json"), asset)
         return web.json_response({"success": True, "asset": asset})
@@ -156,6 +182,30 @@ async def import_reference_asset(request):
     finally:
         if os.path.exists(source_path):
             os.unlink(source_path)
+
+
+async def update_reference_asset(request):
+    try:
+        path = _asset_path(request.match_info["asset_id"])
+        if not os.path.isfile(path):
+            raise ValueError("参考视频资产不存在")
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("参考视频资产属性格式错误")
+        asset = _load_asset(path)
+        display_name = str(body.get("display_name", asset.get("display_name", ""))).strip()
+        description = str(body.get("description", asset.get("description", ""))).strip()
+        if not display_name or len(display_name) > 200:
+            raise ValueError("参考视频资产名称需要 1–200 字")
+        if len(description) > 4000:
+            raise ValueError("参考视频内容说明不能超过 4000 字")
+        asset["display_name"] = display_name
+        asset["description"] = description
+        asset["people"] = _normalize_people(body.get("people", asset.get("people", [])))
+        _write_asset(path, asset)
+        return web.json_response({"success": True, "asset": asset})
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        return web.json_response({"success": False, "error": str(error)}, status=400)
 
 
 async def delete_reference_asset(request):
@@ -174,6 +224,7 @@ def register_routes():
         return
     server.routes.get("/minimax-h3/reference-assets")(get_reference_assets)
     server.routes.post("/minimax-h3/reference-assets")(import_reference_asset)
+    server.routes.put("/minimax-h3/reference-assets/{asset_id}")(update_reference_asset)
     server.routes.delete("/minimax-h3/reference-assets/{asset_id}")(delete_reference_asset)
 
 

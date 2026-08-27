@@ -78,6 +78,12 @@ safe_card = mod.MiniMaxH3Character.execute("Luluka", "A short girl with long blu
 assert not any((safe_card.default_position, safe_card.default_pose, safe_card.default_emotion,
     safe_card.default_appearance))
 assert safe_card.preservation == "Preserve identity and fixed appearance throughout the video."
+assert mod.MiniMaxH3ActorInstance.execute(safe_card, actor_id="actor_7")[0].actor_id == "actor_7"
+try:
+    mod.MiniMaxH3ActorInstance.execute(safe_card, actor_id="hero")
+    raise AssertionError("Invalid actor instance macro was accepted")
+except ValueError as error:
+    assert "actor_1" in str(error)
 safe_environment = mod.MiniMaxH3Environment.execute("bridge", "A steel pedestrian bridge.",
     "Fixed railings line both sides.", image)[0]
 assert not safe_environment.default_time_weather and not safe_environment.default_atmosphere
@@ -89,6 +95,25 @@ source = s.ReferenceVideoData(motion_frames, motion_audio, 2.0)
 motion = s.ActorPerformanceReferenceData(source)
 aligned_clip = mod.MiniMaxH3Action.execute("body", 0.0, 4.0, "follows the dance", motion_reference=motion)[0]
 assert aligned_clip.motion_reference is motion
+audio_context_action = mod.MiniMaxH3Action.execute("body", 2.0, 4.0, "continues speaking",
+    use_previous_context=False, audio_only_context=True)[0]
+assert not audio_context_action.use_previous_context and audio_context_action.audio_only_context
+context_timeline = s.TimelineData(group, style, env,
+    s.TrackListData((s.TimelineTrackData("actor", actor, (
+        mod.MiniMaxH3Action.execute("body", 0.0, 2.0, "walks", result="PREVIOUS_VISUAL_STATE_MUST_NOT_LEAK")[0],
+        audio_context_action)),)), 4.0)
+assert mod.segments._segment_context_mode(context_timeline, 1) == "audio"
+audio_context_job = s.GenerationJobData(context_timeline, 0.4, "16:9", 0, "simple", 4, 1.0, "match", 2.0, "不输出")
+audio_context_plan = mod.segments._segment_frame_plan(2.0, 48, 48)
+audio_context_prompt = mod.segments._compile_generation_segment(audio_context_job, 1, audio_context_plan)[0].text
+assert "PREVIOUS_VISUAL_STATE_MUST_NOT_LEAK" not in audio_context_prompt
+assert mod.timeline._summary_clause("First action sentence. A future event must not enter the summary.") == "First action sentence"
+legacy_action = mod.MiniMaxH3Action.execute("body", 0.0, 3.0, "跳舞", quality="旧结束状态",
+    result="旧说话方式", use_previous_context="旧动作质量")[0]
+assert legacy_action.use_previous_context is True
+assert legacy_action.quality == "旧动作质量."
+assert legacy_action.result == "旧结束状态."
+assert legacy_action.delivery == "旧说话方式"
 aligned_track = s.TimelineTrackData("actor", actor, (aligned_clip,))
 aligned_timeline = s.TimelineData(group, style, env, s.TrackListData((aligned_track,)), 4.0)
 style_reference = s.StyleCardData("", "", "", "", u._reference(torch.ones_like(image), "visual style"))
@@ -105,17 +130,17 @@ assert torch.equal(aligned_reference.frames[-1], motion_frames[-1])
 assert torch.all(aligned_reference.frames[96:] == motion_frames[-1])
 assert aligned_reference.motion_duration == 4.0 and aligned_reference.audio is None
 aligned_instruction = next(iter(aligned_instructions.values()))
-assert "authoritative body performance" in aligned_instruction
+assert "authoritative body-performance" in aligned_instruction
 assert "complete motion order" in aligned_instruction
 assert "format padding" not in aligned_instruction
-assert "<Subject 2> is the body performance derived from <Video 1> and transferred to <Subject 1> (Luluka)." in aligned_definitions
+assert "<Subject 2> is the body performance derived from <Video 1> and transferred to <Subject 1> ({actor_1})." in aligned_definitions
 assert "<Subject 2> (appears in [Shot 1]): attribute_transfer" in aligned_retentions
 assert aligned_summary == "Body performance is transferred from <Subject 2>."
 
 full_clip = mod.MiniMaxH3Action.execute("body", 0.0, 4.0, "follows the complete performance",
     motion_reference=motion)[0]
 full_track = s.TimelineTrackData("actor", actor, (full_clip,))
-camera_clip = mod.MiniMaxH3Camera.execute(0.0, 4.0, "A low-angle wide shot frames Luluka.",
+camera_clip = mod.MiniMaxH3Camera.execute(0.0, 4.0, "A low-angle wide shot frames {actor_1}.",
     "The camera orbits clockwise.", "Deep focus keeps the stage sharp.")[0]
 camera_track = s.TimelineTrackData("camera", None, (camera_clip,))
 referenced_camera_clip = mod.MiniMaxH3Camera.execute(0.0, 4.0, "Conflicting camera text.",
@@ -150,13 +175,42 @@ assert "Conflicting camera" not in full_prompt and "Conflicting lighting" not in
 assert "Motion references:" not in full_prompt
 assert "authoritative camera movement" in full_prompt and "authoritative lighting behavior" in full_prompt
 
+shared_body = mod.MiniMaxH3Action.execute("body", 0.0, 4.0,
+    "{actor_1} follows person_1's body movement.", motion_reference=s.ActorPerformanceReferenceData(source))[0]
+shared_expression = mod.MiniMaxH3Action.execute("expression", 0.0, 4.0,
+    "{actor_1} follows {person_1}'s facial performance.", motion_reference=s.ActorPerformanceReferenceData(source))[0]
+shared_camera = mod.MiniMaxH3Camera.execute(0.0, 4.0, "", "", "",
+    camera_reference=s.CameraReferenceData(source))[0]
+shared_lighting = mod.MiniMaxH3LightingAction.execute(0.0, 4.0, "",
+    lighting_reference=s.LightingReferenceData(source))[0]
+shared_environment = mod.MiniMaxH3EnvironmentAction.execute(0.0, 4.0, "",
+    environment_reference=s.EnvironmentReferenceData(source))[0]
+shared_audio = mod.MiniMaxH3AudioAction.execute("music", 0.0, 4.0, "",
+    audio_reference=s.AudioReferenceData(source))[0]
+shared_timeline = s.TimelineData(group, style, env, s.TrackListData((
+    s.TimelineTrackData("actor", actor, (shared_body, shared_expression)),
+    s.TimelineTrackData("camera", None, (shared_camera,)),
+    s.TimelineTrackData("lighting", None, (shared_lighting,)),
+    s.TimelineTrackData("environment", env, (shared_environment,)),
+    s.TimelineTrackData("audio", None, (shared_audio,)))), 4.0, "中文")
+shared_job = s.GenerationJobData(shared_timeline, 0.4, "16:9", 0, "simple", 4, 1.0, "match", 0.92, "不输出")
+shared_compiled, shared_references, shared_audios = mod.segments._compile_generation_segment(shared_job, 0)
+shared_prompt = shared_compiled.text
+assert len(shared_references) == 1 and not shared_audios
+assert shared_references[0].role == "actor + camera + lighting + environment"
+assert "面部表演" in shared_prompt and "权威面部表演参考" in shared_prompt
+assert "只替换源人物" in shared_prompt
+assert "<Subject 4>（出现在[Shot 1]）：fully_preserved" in shared_prompt
+assert "{person_1}" not in shared_prompt and "person_1" in shared_prompt
+assert "<Audio 1>：reference" in shared_prompt and "fully_copy" not in shared_prompt
+
 reference_only_clip = mod.MiniMaxH3Action.execute("body", 0.0, 4.0, "", motion_reference=motion)[0]
 reference_only_timeline = mod.MiniMaxH3Timeline.execute(group, style, env,
     s.TrackListData((s.TimelineTrackData("actor", actor, (reference_only_clip,)),)), 4.0)[0]
 assert len(reference_only_timeline.tracks.tracks[0].clips) == 1
 reference_only_prompt = mod.segments._compile_generation_segment(
     s.GenerationJobData(reference_only_timeline, 0.4, "16:9", 0, "simple", 4, 1.0, "match", 0.92, "不输出"), 0)[0].text
-assert "authoritative body performance" in reference_only_prompt
+assert "authoritative body-performance" in reference_only_prompt
 
 standalone_audio_clip = mod.MiniMaxH3AudioAction.execute("music", 0.0, 4.0, "Follow the supplied rhythm.",
     audio_reference=s.AudioReferenceData(source))[0]
@@ -206,11 +260,36 @@ assert "Legacy stormy night" not in environment_prompt and "Legacy tense atmosph
 result_components = mod.checkpoints.Types.VideoComponents(torch.zeros(150, 32, 48, 3), Fraction(30),
     {"waveform": torch.zeros(1, 1, 220500), "sample_rate": 44100})
 result_video = mod.checkpoints.InputImpl.VideoFromComponents(result_components)
-split_motion, split_camera, split_lighting, split_audio = mod.MiniMaxH3MotionReference.execute(
+split_motion, split_camera, split_lighting, split_audio, split_environment = mod.MiniMaxH3MotionReference.execute(
     result_video, 1.0, 3.0)
 assert split_motion.source.frames.shape[0] == 48
-assert split_motion.source is split_camera.source is split_lighting.source is split_audio.source
+assert split_motion.source is split_camera.source is split_lighting.source is split_audio.source is split_environment.source
 assert split_motion.source.audio["waveform"].shape[-1] == 88200
+left_motion = mod.MiniMaxH3ReferenceVideoPerson.execute(
+    split_motion, "person_1", "the performer on the left wearing a white shirt")[0]
+right_motion = mod.MiniMaxH3ReferenceVideoPerson.execute(
+    split_motion, "person_2", "the performer on the right wearing a black jacket")[0]
+assert left_motion.source is right_motion.source is split_motion.source
+assert left_motion.person_id == "person_1" and "on the left" in left_motion.person_description
+second_card = s.CharacterCardData("Yona", "A young woman with short black hair.", "Preserve her identity.",
+    u._reference(torch.ones_like(image), "character identity"), "", "", "", "", "", "global")
+second_actor = s.ActorInstanceData(second_card, "", "", "", "", "actor_2")
+multi_group = s.CharacterGroupData((actor, second_actor))
+left_clip = mod.MiniMaxH3Action.execute("body", 0.0, 4.0, "dances on the left", motion_reference=left_motion)[0]
+right_clip = mod.MiniMaxH3Action.execute("body", 0.0, 4.0, "dances on the right", motion_reference=right_motion)[0]
+multi_timeline = s.TimelineData(multi_group, style, env, s.TrackListData((
+    s.TimelineTrackData("actor", actor, (left_clip,)),
+    s.TimelineTrackData("actor", second_actor, (right_clip,)))), 4.0)
+multi_prompt = mod.segments._compile_generation_segment(
+    s.GenerationJobData(multi_timeline, 0.4, "16:9", 0, "simple", 4, 1.0, "match", 0.0, "不输出"), 0)[0].text
+assert "source performer person_1 (the performer on the left wearing a white shirt)" in multi_prompt
+assert "source performer person_2 (the performer on the right wearing a black jacket)" in multi_prompt
+assert "follow only source performer person_1" in multi_prompt
+assert "follow only source performer person_2" in multi_prompt
+assert mod.reference_assets._normalize_people([
+    {"id": "person_1", "description": "left performer"},
+    {"id": "person_2", "description": "right performer"},
+]) == [{"id": "person_1", "description": "left performer"}, {"id": "person_2", "description": "right performer"}]
 result_clip = mod.MiniMaxH3ActionResult.execute(clip, result_video, 2)[0]
 result_track = s.TimelineTrackData("actor", actor, (result_clip,))
 result_timeline = s.TimelineData(group, style, env, s.TrackListData((result_track,)), 5.0)
@@ -242,6 +321,21 @@ assert "Strict chronological timeline" not in na
 assert "Do not anticipate" not in na
 assert "Main visible action: Luluka dances." in na
 
+direct_name_clip = s.TimelineClipData("body", 0.0, 5.0, "Luluka dances", "", "", lang, "", "on-screen", None, "", None)
+direct_name_timeline = s.TimelineData(group, style, env,
+    s.TrackListData((s.TimelineTrackData("actor", actor, (direct_name_clip,)),)), 5.0)
+direct_name_prompt = mod.MiniMaxH3FinalPrompt.execute(
+    direct_name_timeline, 0.98, "16:9", "Ref", None, None, "")[0].text
+assert "Luluka dances." in direct_name_prompt and "Luluka Luluka dances" not in direct_name_prompt
+invalid_clip = s.TimelineClipData("body", 0.0, 5.0, "{actor_2} dances", "", "", lang, "", "on-screen", None, "", None)
+invalid_timeline = s.TimelineData(group, style, env,
+    s.TrackListData((s.TimelineTrackData("actor", actor, (invalid_clip,)),)), 5.0)
+try:
+    mod.MiniMaxH3FinalPrompt.execute(invalid_timeline, 0.98, "16:9", "Ref", None, None, "")
+    raise AssertionError("Undeclared actor macro was accepted")
+except ValueError as error:
+    assert "未声明的人物宏" in str(error)
+
 audio_clip = s.TimelineClipData("audio", 0.0, 5.0, "Steady rain ambience", "", "", None, "", "on-screen",
     None, "ambience", None, None, 0)
 audio_track = s.TimelineTrackData("audio", None, (audio_clip,))
@@ -265,14 +359,17 @@ assert "Luluka (S1)" not in ordered_prompt
 
 short_plan = mod.segments._segment_frame_plan(0.92, 124, 96)
 assert (short_plan.requested_frames, short_plan.current_frames, short_plan.locked_frames,
-    short_plan.generation_frames) == (96, 102, 22, 124)
+    short_plan.generation_frames, short_plan.trailing_frames) == (96, 107, 22, 141, 12)
 long_plan = mod.segments._segment_frame_plan(2.0, 124, 96)
 assert (long_plan.requested_frames, long_plan.current_frames, long_plan.locked_frames,
-    long_plan.generation_frames) == (96, 102, 39, 141)
+    long_plan.generation_frames, long_plan.trailing_frames) == (96, 107, 39, 158, 12)
 first_plan = mod.segments._segment_frame_plan(2.0, 0, 96)
 assert (first_plan.requested_frames, first_plan.current_frames, first_plan.locked_frames,
     first_plan.generation_frames) == (96, 107, 0, 107)
 assert mod.segments._segment_frame_plan(2.0, 40, 96) == long_plan
+pv_ranges = ((0.0, 4.4), (4.4, 8.8), (8.8, 13.2), (13.2, 17.6), (17.6, 22.0))
+assert [mod.segments._segment_visible_frames(*item) for item in pv_ranges] == [106, 105, 106, 105, 106]
+assert sum(mod.segments._segment_visible_frames(*item) for item in pv_ranges) == 528
 assert mod.segments._empty_sections_mode("不输出") == "自动补全"
 
 previous_source = s.ReferenceVideoData(torch.ones(107, 16, 16, 3),
@@ -294,33 +391,56 @@ job = s.GenerationJobData(segmented_timeline, 0.4, "16:9", 0, "simple", 4, 1.0, 
 compiled_segment, segment_references, segment_audios = mod.segments._compile_generation_segment(job, 1, long_plan)
 assert not segment_audios
 segment_reference = segment_references[0]
-assert compiled_segment.video_settings.length == 141
-assert segment_reference.frames.shape[0] == 141
+assert compiled_segment.video_settings.length == 158
+assert segment_reference.frames.shape[0] == 158
 assert torch.all(segment_reference.frames[:39] == 1)
 assert torch.all(segment_reference.frames[39:] == 2)
 assert segment_reference.context_duration == 39 / 24
 assert segment_reference.locked_duration == 39 / 24
-assert segment_reference.audio["waveform"].shape[-1] == 188000
+assert segment_reference.audio["waveform"].shape[-1] == 210667
 assert torch.all(segment_reference.audio["waveform"][..., :52000] == 1)
-assert torch.all(segment_reference.audio["waveform"][..., 52000:] == 2)
+assert torch.all(segment_reference.audio["waveform"][..., 52000:194667] == 2)
+assert torch.all(segment_reference.audio["waveform"][..., 194667:] == 0)
 try:
     mod.segments._validate_motion_alignment((s.MotionReferenceData(
-        segment_reference.frames[:-1], None, "actor", 4.0, 140 / 24),), 141)
+        segment_reference.frames[:-1], None, "actor", 4.0, 157 / 24),), 158)
     raise AssertionError("Motion reference length mismatch was accepted")
 except ValueError as error:
-    assert "140 帧" in str(error) and "141 帧" in str(error)
-assert "The target video is a 5.88-second continuous single shot." in compiled_segment.text
+    assert "157 帧" in str(error) and "158 帧" in str(error)
+assert "The target video is a 6.58-second continuous single shot." in compiled_segment.text
 assert "[video continuation + reference generation + audio reference]" in compiled_segment.text
 assert "<Subject 2> is the body performance derived from <Video 1>" in compiled_segment.text
 assert "<Video 1> is the reference for [Shot 1]'s motion-transition context and current shot-aligned temporal order" in compiled_segment.text
 assert "The opening 1.62 seconds are hard-locked to the preceding generated segment" in compiled_segment.text
 assert "At 1.62 seconds, the current action continues directly from the locked final frame" in compiled_segment.text
-assert "Use <Subject 2> as <Subject 1> (Luluka)'s authoritative body performance" in compiled_segment.text
-assert "Transfer only body performance; do not copy the source performer" in compiled_segment.text
+assert "Use <Subject 2> as <Subject 1> (Luluka)'s authoritative body-performance" in compiled_segment.text
+assert "Transfer only body performance; do not copy source performer" in compiled_segment.text
 assert "<Subject 2> (appears in [Shot 1]): attribute_transfer" in compiled_segment.text
 assert "Motion references:" not in compiled_segment.text
 details = compiled_segment.text.split("detailed_description:\n", 1)[1]
-assert details.index("The opening 1.62 seconds") < details.index("From 1.62 to 5.88 seconds, Luluka performs the dance")
+assert details.index("The opening 1.62 seconds") < details.index("From 1.62 to 6.08 seconds, Luluka performs the dance")
+assert "From 6.08 to 6.58 seconds, the final visible state" in details
+
+speech_boundary = mod.MiniMaxH3Action.execute("speech", 1.0, 3.0, "你好", language=lang)[0]
+body_driven_track = s.TimelineTrackData("actor", actor, (previous_clip, current_clip, speech_boundary))
+body_driven_timeline = s.TimelineData(group, style, env, s.TrackListData((body_driven_track,)), 8.0)
+assert mod.segments._segment_ranges(body_driven_timeline) == ((0.0, 4.0), (4.0, 8.0))
+
+current_without_context = mod.MiniMaxH3Action.execute("body", 4.0, 8.0, "performs the dance",
+    motion_reference=s.ActorPerformanceReferenceData(current_source), use_previous_context=False)[0]
+no_context_track = s.TimelineTrackData("actor", actor, (previous_clip, current_without_context))
+no_context_timeline = s.TimelineData(group, style, env, s.TrackListData((no_context_track,)), 8.0)
+no_context_job = s.GenerationJobData(no_context_timeline, 0.4, "16:9", 0, "simple", 4, 1.0, "match", 2.0, "不输出")
+no_context_ranges = mod.segments._segment_ranges(no_context_timeline)
+assert mod.segments._segment_continuity_seconds(no_context_job, 1, no_context_ranges) == 0.0
+no_context_plan = mod.segments._segment_frame_plan(0.0, 96, 96)
+no_context_compiled, no_context_references, _ = mod.segments._compile_generation_segment(
+    no_context_job, 1, no_context_plan)
+assert no_context_plan.locked_frames == 0
+assert no_context_references[0].context_duration == 0.0
+assert "hard-locked to the preceding generated segment" not in no_context_compiled.text
+tail_source = torch.arange(12).reshape(12, 1, 1, 1)
+assert torch.equal(mod.segments._tail_align_frames(tail_source, 5).flatten(), torch.arange(7, 12))
 
 previous_without_reference = s.TimelineClipData("body", 0.0, 4.0, "walks forward", "", "", lang, "",
     "on-screen", None, "", None)
@@ -375,6 +495,14 @@ assert torch.all(video_mask[:, :, :7] == 0) and torch.all(video_mask[:, :, 7:] =
 assert torch.all(audio[..., :37] == 1)
 assert torch.all(audio_mask[..., :37] == 0) and torch.all(audio_mask[..., 37:] == 1)
 
+audio_locked = mod.segments._lock_context_prefix(latent, previous_images, previous_audio, None,
+    VideoVAE(), AudioVAE(), 22, 64, 64, lock_video=False)
+audio_only_video, audio_only_audio = audio_locked["samples"].unbind()
+audio_only_video_mask, audio_only_audio_mask = audio_locked["noise_mask"].unbind()
+assert torch.all(audio_only_video == 0) and torch.all(audio_only_video_mask == 1)
+assert torch.all(audio_only_audio[..., :37] == 1)
+assert torch.all(audio_only_audio_mask[..., :37] == 0) and torch.all(audio_only_audio_mask[..., 37:] == 1)
+
 class UnusedVAE:
     def encode(self, value):
         raise AssertionError("Direct Latent continuity unexpectedly re-encoded decoded media")
@@ -383,7 +511,13 @@ previous_video_latent = torch.arange(20, dtype=torch.float32).reshape(1, 1, 20, 
 previous_audio_latent = torch.arange(60, dtype=torch.float32).reshape(1, 1, 1, 60).repeat(1, 32, 2, 1)
 direct_previous = {"samples": mod.segments.comfy.nested_tensor.NestedTensor((
     previous_video_latent, previous_audio_latent))}
-direct_locked = mod.segments._lock_context_prefix(latent, previous_images, previous_audio, direct_previous,
+visible_locked = mod.segments._lock_context_prefix(latent, previous_images, previous_audio, direct_previous,
+    VideoVAE(), AudioVAE(), 22, 64, 64)
+visible_video, visible_audio = visible_locked["samples"].unbind()
+assert torch.all(visible_video[:, :, :7] == 1)
+assert torch.all(visible_audio[..., :37] == 1)
+
+direct_locked = mod.segments._lock_context_prefix(latent, None, None, direct_previous,
     UnusedVAE(), UnusedVAE(), 22, 64, 64)
 direct_video, direct_audio = direct_locked["samples"].unbind()
 assert torch.equal(direct_video[:, :, :7], previous_video_latent[:, :, -7:])
@@ -488,7 +622,7 @@ assert "Picture 2 (from Shot 1) aligns with the 5.17-second mark" in fl2va.text
 
 second_card = s.CharacterCardData("Yona", "She is another girl.", "Preserve her identity.",
     u._reference(image, "character identity"), "", "", "", "", "", "global")
-second_actor = s.ActorInstanceData(second_card, "", "", "", "")
+second_actor = s.ActorInstanceData(second_card, "", "", "", "", "actor_2")
 shared_group = s.CharacterGroupData((actor, second_actor))
 shared_timeline = s.TimelineData(shared_group, style, env, s.TrackListData(()), 5.0)
 shared = mod.MiniMaxH3FinalPrompt.execute(shared_timeline, 0.98, "16:9", "Ref", None, None, "")[0]
@@ -498,7 +632,7 @@ assert "<Subject 2> is Yona, whose identity and appearance come from <Picture 1>
 
 speech = s.TimelineClipData("speech", 0.0, 2.0, "来抱一个。", "", "", lang, "softly",
     "off-screen voiceover", None, "", None)
-silent_action = s.TimelineClipData("body", 0.0, 2.0, "turns toward Yona", "", "", lang, "",
+silent_action = s.TimelineClipData("body", 0.0, 2.0, "turns toward {actor_2}", "", "", lang, "",
     "on-screen", second_actor, "", None)
 speaker_tracks = s.TrackListData((s.TimelineTrackData("actor", actor, (silent_action,)),
     s.TimelineTrackData("actor", second_actor, (speech,))))
@@ -534,7 +668,8 @@ expanded = mod.MiniMaxH3MultiSegmentGenerate.execute(FakeModel(), object(), obje
     "重新生成全部片段", 0)
 assert expanded.expand is not None
 assert len(expanded.result) == 2
-entry = mod.MiniMaxH3SecondPassEntryPack.execute(object(), 0, 0, 5, 5 / 24, "segment_001_" + "0" * 24 + ".mp4",
+entry = mod.MiniMaxH3SecondPassEntryPack.execute(object(), 0, 0.0, 5.0, 0, 5, 5, 5 / 24,
+    "segment_001_" + "0" * 24 + ".mp4",
     conditioning=object(), latent={"samples": object()})[0]
 batch = mod.MiniMaxH3SecondPassBatchAppend.execute(entry)[0]
 assert batch.entries == (entry,)
@@ -543,10 +678,19 @@ assert parsed_batch[0] == [entry.latent]
 assert parsed_batch[1] == [entry.conditioning]
 assert parsed_batch[2] == [entry.video]
 assert parsed_batch[3] == [1]
-assert parsed_batch[4:] == ([0], [5], [5 / 24], [entry.cache_file])
+assert parsed_batch[4:] == ([0], [5], [5 / 24], [entry.cache_file], [0.0], [5.0], [5])
 second_pass = mod.MiniMaxH3MultiSegmentSecondPass.execute(FakeModel(), object(), object(), object(), batch,
     cache_mode="重新生成全部片段")
 assert second_pass.expand is not None
+latent_second_pass = mod.MiniMaxH3MultiSegmentLatentSecondPass.execute(
+    FakeModel(), object(), object(), object(), batch,
+    "minimax_h3_latent_upscaler_3d_fp16.safetensors", sigmas=torch.tensor([0.9, 0.0]),
+    cache_mode="重新生成全部片段")
+assert latent_second_pass.expand is not None
+latent_upscale_inputs = next(node["inputs"] for node in latent_second_pass.expand.values()
+    if node["class_type"] == "MinimaxH3LatentUpscaler3D")
+assert latent_upscale_inputs["mode"] == "megapixels"
+assert latent_upscale_inputs["mode.megapixels"] == 1.0
 
 camera_details = action_camera_prompt.split("detailed_description:\n", 1)[1]
 assert camera_details.index("A low-angle wide shot frames Luluka") < camera_details.index("Luluka follows the dance")
@@ -554,5 +698,40 @@ styled = mod.MiniMaxH3FinalPrompt.execute(
     s.TimelineData(group, s.StyleCardData("2D animation", "", "", "", None), env, tracks, 5.0),
     0.98, "16:9", "Ref", None, None, "")[0].text
 assert "detailed_description:\n2D animation.\n[Shot 1]" in styled
+
+chinese_card = s.CharacterCardData("露露卡", "蓝色长发、蓝色眼睛的少女。", "", u._reference(image, "character identity"),
+    "画面中央", "自然站立", "神情平静", "", "", "global")
+chinese_actor = s.ActorInstanceData(chinese_card, "", "", "", "")
+chinese_group = s.CharacterGroupData((chinese_actor,))
+chinese_clip = s.TimelineClipData("body", 1.0, 3.0, "向前走两步，然后停下", "动作自然连贯", "保持站立",
+    lang, "", "on-screen", None, "", None)
+chinese_timeline = s.TimelineData(chinese_group, style, env,
+    s.TrackListData((s.TimelineTrackData("actor", chinese_actor, (chinese_clip,)),)), 4.0, "中文")
+chinese_prompt = mod.MiniMaxH3FinalPrompt.execute(chinese_timeline, 0.4, "16:9", "Ref", None, None, "")[0].text
+assert "<Subject 1>是露露卡，其身份与外观来自<Picture 1>。" in chinese_prompt
+assert "目标视频是一个时长" in chinese_prompt
+assert "从1秒到3秒，露露卡向前走两步，然后停下" in chinese_prompt
+assert "随后，露露卡 保持站立" in chinese_prompt
+assert "The target video" not in chinese_prompt
+assert "Preserve identity" not in chinese_prompt
+chinese_i2va = mod.MiniMaxH3FinalPrompt.execute(
+    s.TimelineData(empty_group, empty_style, empty_env, s.TrackListData(()), 5.0, "中文"),
+    0.98, "16:9", "FL", image, None, "", empty_sections="输出 N/A")[0].text
+assert chinese_i2va.startswith("对于目标视频，在0.00秒处完整参考来自[Shot 1]的<Picture 1>。")
+assert "镜头从<Picture 1>开始" in chinese_i2va
+assert "The shot begins" not in chinese_i2va
+assert mod.MiniMaxH3Timeline.execute(chinese_group, style, env, s.TrackListData(()), 4.0)[0].prompt_language == "英文"
+assert mod.MiniMaxH3Timeline.execute(chinese_group, style, env, s.TrackListData(()), 4.0, "中文")[0].prompt_language == "中文"
+
+chinese_motion_clip = mod.MiniMaxH3Action.execute("body", 0.0, 4.0, "按照参考动作跳舞",
+    motion_reference=silent_motion)[0]
+chinese_motion_timeline = s.TimelineData(chinese_group, style, env,
+    s.TrackListData((s.TimelineTrackData("actor", chinese_actor, (chinese_motion_clip,)),)), 4.0, "中文")
+chinese_motion_prompt = mod.segments._compile_generation_segment(
+    s.GenerationJobData(chinese_motion_timeline, 0.4, "16:9", 0, "simple", 4, 1.0, "match", 0.92, "不输出"), 0)[0].text
+assert "是从<Video 1>提取并迁移给<Subject 1> (露露卡)的肢体表演" in chinese_motion_prompt
+assert "肢体表演迁移自<Subject 2>" in chinese_motion_prompt
+assert "权威肢体表演参考" in chinese_motion_prompt
+assert "body performance" not in chinese_motion_prompt
 
 print("PASS")

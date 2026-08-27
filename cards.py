@@ -1,3 +1,5 @@
+import re
+
 from comfy_api.latest import io
 
 from .schema import (CATEGORY, H3_ACTOR_INSTANCE, H3_CHARACTER_CARD, H3_CHARACTER_GROUP,
@@ -30,7 +32,8 @@ class MiniMaxH3ActorInstance(io.ComfyNode):
     @classmethod
     def define_schema(cls):
         return io.Schema(node_id="MiniMaxH3ActorInstance", display_name="MiniMax H3 人物实例（Actor Instance）", category=CATEGORY,
-            description="仅保存没有动作片段时使用的备用静态状态；存在动作指引时不会写入提示词。", inputs=[H3_CHARACTER_CARD.Input("character_card"),
+            description="声明 actor_1 形式的人物宏，并保存没有动作片段时使用的备用静态状态。其他节点推荐用 {actor_1} 引用人物；直接写人物名仍可编译但不利于复用。", inputs=[H3_CHARACTER_CARD.Input("character_card"),
+            io.String.Input("actor_id", display_name="人物实例宏", placeholder="例如 actor_1", default="actor_1"),
             io.String.Input("position_override", display_name="无动作时位置", placeholder="仅描述静态位置，不写移动过程", default="", multiline=True, optional=True),
             io.String.Input("pose_override", display_name="无动作时姿态", placeholder="仅描述静态姿态，不写动作过程", default="", multiline=True, optional=True),
             io.String.Input("emotion_override", display_name="无动作时表情", placeholder="仅描述静态表情，不写表情变化", default="", multiline=True, optional=True),
@@ -38,10 +41,15 @@ class MiniMaxH3ActorInstance(io.ComfyNode):
             outputs=[H3_ACTOR_INSTANCE.Output(display_name="actor_instance")])
 
     @classmethod
-    def execute(cls, character_card, position_override="", pose_override="", emotion_override="", appearance_override=""):
+    def execute(cls, character_card, position_override="", pose_override="", emotion_override="", appearance_override="",
+                actor_id="actor_1"):
         if not isinstance(character_card, CharacterCardData):
             raise TypeError("Actor instance requires a character card")
-        return io.NodeOutput(ActorInstanceData(character_card, *map(_text, (position_override, pose_override, emotion_override, appearance_override))))
+        actor_id = _text(actor_id)
+        if not re.fullmatch(r"actor_[1-9][0-9]*", actor_id):
+            raise ValueError("人物实例宏必须使用 actor_1、actor_2 这样的格式")
+        return io.NodeOutput(ActorInstanceData(character_card,
+            *map(_text, (position_override, pose_override, emotion_override, appearance_override)), actor_id))
 
 
 class MiniMaxH3CharacterGroup(io.ComfyNode):
@@ -58,6 +66,8 @@ class MiniMaxH3CharacterGroup(io.ComfyNode):
             raise TypeError("Character group accepts only actor instances")
         if len({id(actor) for actor in actors}) != len(actors):
             raise ValueError("The same actor instance is declared more than once")
+        if len({actor.actor_id for actor in actors}) != len(actors):
+            raise ValueError("人物组中的人物实例宏不能重复")
         return io.NodeOutput(CharacterGroupData(tuple(actors)))
 
 

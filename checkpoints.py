@@ -10,8 +10,8 @@ import comfy.nested_tensor
 import comfy.utils
 from comfy_api.latest import InputImpl, Types, io, ui
 
-from .segments import (_compile_generation_segment, _segment_frame_plan, _segment_ranges,
-    _segment_result)
+from .segments import (_compile_generation_segment, _segment_context_mode, _segment_continuity_seconds,
+    _segment_frame_plan, _segment_ranges, _segment_result, _segment_visible_frames)
 from .utils import _video_size
 
 
@@ -109,12 +109,12 @@ def segment_cache_files(generation_job, model, sampler, cache_version):
             previous = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
             files.append(f"segment_{index + 1:03d}_{previous[:24]}.mp4")
             continue
-        available = round((ranges[index - 1][1] - ranges[index - 1][0]) * 24) if index else 0
-        frame_plan = _segment_frame_plan(generation_job.continuity_seconds, available,
-            round((end - start) * 24))
+        available = _segment_visible_frames(*ranges[index - 1]) if index else 0
+        frame_plan = _segment_frame_plan(_segment_continuity_seconds(generation_job, index, ranges), available,
+            _segment_visible_frames(start, end))
         compiled, motion_references, standalone_audios = _compile_generation_segment(generation_job, index, frame_plan)
         payload = {
-            "pipeline": "latent-locked-dynamic-output-v4",
+            "pipeline": "latent-locked-visible-context-v6",
             "index": index,
             "range": [start, end],
             "prompt": compiled.text,
@@ -129,6 +129,8 @@ def segment_cache_files(generation_job, model, sampler, cache_version):
             "requested_frames": frame_plan.requested_frames,
             "current_frames": frame_plan.current_frames,
             "locked_frames": frame_plan.locked_frames,
+            "trailing_frames": frame_plan.trailing_frames,
+            "context_mode": _segment_context_mode(generation_job.timeline, index, ranges),
             "model": model_signature,
             "previous": previous,
             "images": [_tensor_digest(item.image, memo) for item in compiled.references],
@@ -156,11 +158,15 @@ def second_pass_cache_files(batch, model, sampler, settings, cache_version):
     files = []
     for entry in batch.entries:
         payload = {
-            "pipeline": "multi-segment-second-pass-v1",
+            "pipeline": "multi-segment-second-pass-v2",
             "segment": entry.segment_index,
             "source": entry.cache_file,
+            "start_time": entry.start_time,
+            "end_time": entry.end_time,
             "context_frames": entry.context_frames,
+            "context_mode": entry.context_mode,
             "generation_frames": entry.generation_frames,
+            "visible_frames": entry.visible_frames,
             "visible_duration": entry.visible_duration,
             "settings": settings,
             "model": model_signature,

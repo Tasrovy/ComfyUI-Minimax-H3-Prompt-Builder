@@ -205,7 +205,8 @@ function progressText(node, detail) {
 app.registerExtension({
     name: "MiniMaxH3.MultiSegmentProgress",
     async beforeRegisterNodeDef(nodeType, nodeData, app) {
-        if (!["MiniMaxH3MultiSegmentGenerate", "MiniMaxH3MultiSegmentSecondPass"].includes(nodeData.name)) {
+        if (!["MiniMaxH3MultiSegmentGenerate", "MiniMaxH3MultiSegmentSecondPass",
+            "MiniMaxH3MultiSegmentLatentSecondPass"].includes(nodeData.name)) {
             return;
         }
         const onNodeCreated = nodeType.prototype.onNodeCreated;
@@ -232,7 +233,8 @@ app.registerExtension({
 
 api.addEventListener("execution_start", () => {
     for (const node of app.graph?._nodes ?? []) {
-        if (!["MiniMaxH3MultiSegmentGenerate", "MiniMaxH3MultiSegmentSecondPass"].includes(node.type)
+        if (!["MiniMaxH3MultiSegmentGenerate", "MiniMaxH3MultiSegmentSecondPass",
+            "MiniMaxH3MultiSegmentLatentSecondPass"].includes(node.type)
             || !node.segmentProgressWidget) {
             continue;
         }
@@ -243,7 +245,8 @@ api.addEventListener("execution_start", () => {
 
 api.addEventListener("progress_state", ({ detail }) => {
     for (const node of app.graph?._nodes ?? []) {
-        if (!["MiniMaxH3MultiSegmentGenerate", "MiniMaxH3MultiSegmentSecondPass"].includes(node.type)
+        if (!["MiniMaxH3MultiSegmentGenerate", "MiniMaxH3MultiSegmentSecondPass",
+            "MiniMaxH3MultiSegmentLatentSecondPass"].includes(node.type)
             || !node.segmentProgressWidget) {
             continue;
         }

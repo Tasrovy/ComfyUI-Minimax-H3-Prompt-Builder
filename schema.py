@@ -22,6 +22,7 @@ H3_MOTION_REFERENCE = io.Custom("MINIMAX_H3_MOTION_REFERENCE")
 H3_CAMERA_REFERENCE = io.Custom("MINIMAX_H3_CAMERA_REFERENCE")
 H3_LIGHTING_REFERENCE = io.Custom("MINIMAX_H3_LIGHTING_REFERENCE")
 H3_AUDIO_REFERENCE = io.Custom("MINIMAX_H3_AUDIO_REFERENCE")
+H3_ENVIRONMENT_REFERENCE = io.Custom("MINIMAX_H3_ENVIRONMENT_REFERENCE")
 H3_TIMELINE_CLIP = io.Custom("MINIMAX_H3_TIMELINE_CLIP")
 H3_TIMELINE_TRACK = io.Custom("MINIMAX_H3_TIMELINE_TRACK")
 H3_TRACK_LIST = io.Custom("MINIMAX_H3_TRACK_LIST")
@@ -61,6 +62,7 @@ class ActorInstanceData:
     pose_override: str
     emotion_override: str
     appearance_override: str
+    actor_id: str = "actor_1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +117,8 @@ class ReferenceVideoData:
 @dataclass(frozen=True, slots=True)
 class ActorPerformanceReferenceData:
     source: ReferenceVideoData
+    person_id: str = ""
+    person_description: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +133,11 @@ class LightingReferenceData:
 
 @dataclass(frozen=True, slots=True)
 class AudioReferenceData:
+    source: ReferenceVideoData
+
+
+@dataclass(frozen=True, slots=True)
+class EnvironmentReferenceData:
     source: ReferenceVideoData
 
 
@@ -167,6 +176,9 @@ class TimelineClipData:
     camera_reference: CameraReferenceData | None = None
     lighting_reference: LightingReferenceData | None = None
     audio_reference: AudioReferenceData | None = None
+    environment_reference: EnvironmentReferenceData | None = None
+    use_previous_context: bool = True
+    audio_only_context: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +200,7 @@ class TimelineData:
     environment: EnvironmentInstanceData
     tracks: TrackListData
     duration: float
+    prompt_language: str = "英文"
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,10 +241,14 @@ class SecondPassEntryData:
     conditioning: object | None
     latent: object | None
     video: object
+    start_time: float
+    end_time: float
     context_frames: int
     generation_frames: int
+    visible_frames: int
     visible_duration: float
     cache_file: str
+    context_mode: str = "full"
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,7 +262,7 @@ for custom_type, data_type in ((H3_CHARACTER_CARD, CharacterCardData), (H3_ACTOR
                                (H3_ENVIRONMENT_INSTANCE, EnvironmentInstanceData),
                                (H3_MOTION_REFERENCE, ActorPerformanceReferenceData),
                                (H3_CAMERA_REFERENCE, CameraReferenceData), (H3_LIGHTING_REFERENCE, LightingReferenceData),
-                               (H3_AUDIO_REFERENCE, AudioReferenceData),
+                               (H3_AUDIO_REFERENCE, AudioReferenceData), (H3_ENVIRONMENT_REFERENCE, EnvironmentReferenceData),
                                (H3_TIMELINE_CLIP, TimelineClipData),
                                (H3_TIMELINE_TRACK, TimelineTrackData), (H3_TRACK_LIST, TrackListData),
                                (H3_TIMELINE, TimelineData), (H3_PROMPT, CompletePromptData),

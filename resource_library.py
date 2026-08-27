@@ -1,10 +1,12 @@
+import hashlib
 import json
 import os
 import re
 import tempfile
+import urllib.parse
 import uuid
 
-from aiohttp import web
+from aiohttp import ClientError, ClientSession, ClientTimeout, web
 import folder_paths
 from server import PromptServer
 
@@ -20,6 +22,7 @@ ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,96}$")
 MAX_RESOURCES = 1000
 MAX_TEXT = 20000
 MAX_FILE_BYTES = 2 * 1024 * 1024
+MAX_ANIMA_IMAGE_BYTES = 12 * 1024 * 1024
 
 
 def _default_library():
@@ -430,12 +433,58 @@ async def put_resources(request):
         return web.json_response({"success": False, "error": str(error)}, status=400)
 
 
+async def import_anima_character_image(request):
+    try:
+        body = await request.json()
+        name = str(body.get("name", "")).strip()
+        copyright = str(body.get("copyright", "")).strip()
+        if not name or len(name) > 200 or len(copyright) > 200:
+            raise ValueError("Anima 角色名称无效")
+        raw_name = f"{name}, {copyright}" if copyright else name
+        digest = hashlib.sha256(raw_name.encode("utf-8")).hexdigest()[:12]
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")[:64] or "character"
+        subfolder = os.path.join("minimax_h3", "anima_characters")
+        directory = os.path.join(folder_paths.get_input_directory(), subfolder)
+        os.makedirs(directory, exist_ok=True)
+        filename = f"{stem}-{digest}.webp"
+        path = os.path.join(directory, filename)
+        source_url = f"https://blobs.animadex.net/Outputs/thumbs/{urllib.parse.quote(raw_name, safe='')}.webp"
+        if not os.path.isfile(path):
+            async with ClientSession(timeout=ClientTimeout(total=30)) as session:
+                async with session.get(source_url) as response:
+                    if response.status != 200:
+                        raise ValueError(f"Anima 参考图下载失败（HTTP {response.status}）")
+                    if not response.headers.get("Content-Type", "").lower().startswith("image/"):
+                        raise ValueError("Anima 返回的内容不是图片")
+                    if response.content_length is not None and response.content_length > MAX_ANIMA_IMAGE_BYTES:
+                        raise ValueError("Anima 参考图超过 12 MB")
+                    image = await response.read()
+            if not image or len(image) > MAX_ANIMA_IMAGE_BYTES:
+                raise ValueError("Anima 参考图无效或超过 12 MB")
+            fd, temp_path = tempfile.mkstemp(prefix=".anima-", suffix=".webp", dir=directory)
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(image)
+                os.replace(temp_path, path)
+            finally:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+        return web.json_response({
+            "success": True,
+            "reference_image": {"type": "input", "subfolder": subfolder.replace("\\", "/"), "filename": filename},
+            "source_url": source_url,
+        })
+    except (TypeError, ValueError, OSError, ClientError, json.JSONDecodeError) as error:
+        return web.json_response({"success": False, "error": str(error)}, status=400)
+
+
 def register_routes():
     server = getattr(PromptServer, "instance", None)
     if server is None:
         return
     server.routes.get("/minimax-h3/resources")(get_resources)
     server.routes.put("/minimax-h3/resources")(put_resources)
+    server.routes.post("/minimax-h3/anima-character-image")(import_anima_character_image)
 
 
 register_routes()

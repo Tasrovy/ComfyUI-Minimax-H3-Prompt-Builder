@@ -3,3 +3,11 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .venv/
+
+# Local projects and imported/generated assets
+*.h3proj
+*.h3proj.json
+/assets/
+/media/
+/reference_videos/
+/resources/

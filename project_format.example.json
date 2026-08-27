@@ -1,0 +1,63 @@
+{
+  "format": "minimax-h3-director-project",
+  "version": 1,
+  "project": {
+    "id": "example_project",
+    "name": "示例项目",
+    "duration_seconds": 5,
+    "prompt_language": "中文"
+  },
+  "assets": [],
+  "characters": [
+    {
+      "id": "actor_1",
+      "card": {
+        "name": "人物 1",
+        "description": "一名黑色长发、穿深红色外套的年轻女性。",
+        "style_priority": "global",
+        "character_style": ""
+      },
+      "instance": {
+        "actor_id": "actor_1",
+        "position_override": "",
+        "pose_override": "",
+        "emotion_override": "",
+        "appearance_override": ""
+      },
+      "reference_asset": null
+    }
+  ],
+  "style": {
+    "card": {
+      "style": "电影写实风格。",
+      "rendering": "材质自然，运动符合物理规律。",
+      "color_palette": "克制的电影配色。",
+      "texture": "细节稳定，无闪烁。",
+      "reference_usage": ""
+    },
+    "reference_asset": null
+  },
+  "environment": {
+    "card": {
+      "name": "城市天桥",
+      "location": "城市街道上方的人行天桥。",
+      "default_background": "栏杆后方可以看到远处车流和霓虹灯。"
+    },
+    "instance": {
+      "location_override": "",
+      "time_weather_override": "",
+      "background_override": "",
+      "atmosphere_override": ""
+    },
+    "reference_asset": null
+  },
+  "tracks": [
+    {
+      "id": "track_1",
+      "type": "actor",
+      "owner": "actor_1",
+      "clips": []
+    }
+  ],
+  "extensions": {}
+}

@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "project_format.schema.json",
+  "title": "MiniMax H3 Director Project",
+  "type": "object",
+  "required": ["format", "version", "project", "assets", "characters", "style", "environment", "tracks"],
+  "properties": {
+    "format": { "const": "minimax-h3-director-project" },
+    "version": { "const": 1 },
+    "project": {
+      "type": "object",
+      "required": ["id", "name", "duration_seconds", "prompt_language"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string" },
+        "duration_seconds": { "type": "number", "minimum": 0.21, "maximum": 60 },
+        "prompt_language": { "enum": ["英文", "中文"] }
+      }
+    },
+    "assets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "kind", "path"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "kind": { "enum": ["image", "video"] },
+          "path": { "type": "string", "minLength": 1, "description": "ComfyUI input 目录内的相对路径" }
+        }
+      }
+    },
+    "characters": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "card", "instance"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "card": { "$ref": "#/$defs/freeObject" },
+          "instance": {
+            "type": "object",
+            "properties": {
+              "actor_id": { "type": "string", "pattern": "^actor_[1-9][0-9]*$" }
+            },
+            "additionalProperties": true
+          },
+          "reference_asset": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "style": {
+      "type": "object",
+      "required": ["card"],
+      "properties": {
+        "card": { "$ref": "#/$defs/freeObject" },
+        "reference_asset": { "type": ["string", "null"] }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "required": ["card", "instance"],
+      "properties": {
+        "card": { "$ref": "#/$defs/freeObject" },
+        "instance": { "$ref": "#/$defs/freeObject" },
+        "reference_asset": { "type": ["string", "null"] }
+      }
+    },
+    "tracks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "type", "owner", "clips"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "type": { "enum": ["actor", "environment", "system"] },
+          "owner": { "type": ["string", "null"] },
+          "clips": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id", "type", "fields"],
+              "properties": {
+                "id": { "type": "string", "minLength": 1 },
+                "type": { "enum": ["action", "camera", "lighting", "audio", "environment"] },
+                "fields": { "$ref": "#/$defs/freeObject" },
+                "target": { "type": ["string", "null"] },
+                "language": { "type": ["object", "null"] },
+                "reference": { "$ref": "#/$defs/mediaBinding" },
+                "cached_result": { "$ref": "#/$defs/mediaBinding" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "extensions": { "type": "object", "additionalProperties": true }
+  },
+  "$defs": {
+    "freeObject": { "type": "object", "additionalProperties": true },
+    "mediaBinding": {
+      "type": ["object", "null"],
+      "properties": {
+        "asset": { "type": "string" },
+        "trim_start": { "type": "number", "minimum": 0 },
+        "trim_end": { "type": "number", "minimum": 0 },
+        "person_id": { "type": "string", "pattern": "^person_[1-9][0-9]*$" },
+        "person_description": { "type": "string", "minLength": 1 },
+        "version": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

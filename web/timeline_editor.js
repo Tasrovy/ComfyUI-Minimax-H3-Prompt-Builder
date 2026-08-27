@@ -18,13 +18,19 @@ const TYPES = {
     visual: "MiniMaxH3Visual",
     environment: "MiniMaxH3Environment",
     environmentInstance: "MiniMaxH3EnvironmentInstance",
+    characterGroup: "MiniMaxH3CharacterGroup",
+    language: "MiniMaxH3Language",
     motionReference: "MiniMaxH3MotionReference",
+    videoPerson: "MiniMaxH3ReferenceVideoPerson",
+    loadImage: "LoadImage",
     loadVideo: "LoadVideo",
 };
 
 const FIELD_SETS = {
     [TYPES.action]: [
         ["action_type", "动作种类"], ["start_time", "开始时间（秒）"], ["end_time", "结束时间（秒）"],
+        ["use_previous_context", "继承前一动作片段的段间引导"],
+        ["audio_only_context", "仅段间音频引导"],
         ["content", "动作或台词内容", "textarea"], ["speech_type", "说话类型"],
         ["quality", "动作质量", "textarea"], ["result", "结束状态", "textarea"], ["delivery", "说话方式", "textarea"],
     ],
@@ -50,6 +56,7 @@ const FIELD_SETS = {
         ["character_style", "人物风格", "textarea"],
     ],
     [TYPES.actor]: [
+        ["actor_id", "人物实例宏"],
         ["position_override", "无动作时位置", "textarea"], ["pose_override", "无动作时姿态", "textarea"],
         ["emotion_override", "无动作时表情", "textarea"], ["appearance_override", "无动作时附加状态", "textarea"],
     ],
@@ -66,6 +73,9 @@ const FIELD_SETS = {
         ["location_override", "当前地点变体", "textarea"], ["time_weather_override", "当前时间与天气", "textarea"],
         ["background_override", "当前背景变体", "textarea"], ["atmosphere_override", "当前环境氛围", "textarea"],
     ],
+    [TYPES.videoPerson]: [
+        ["person_id", "源人物编号"], ["person_description", "源人物识别描述", "textarea"],
+    ],
 };
 
 const KIND_NAMES = {
@@ -74,13 +84,34 @@ const KIND_NAMES = {
 };
 
 const CLIP_TYPES = new Set([TYPES.action, TYPES.camera, TYPES.lighting, TYPES.audio, TYPES.environmentAction]);
+const PACKAGE_NODE_TYPES = new Set([
+    ...Object.values(TYPES).filter((type) => type.startsWith("MiniMaxH3")),
+    "MiniMaxH3FinalPrompt", "MiniMaxH3PromptParser", "MiniMaxH3Ref2VAAdapter",
+    "MiniMaxH3GenerationJob", "MiniMaxH3PromptPreview", "MiniMaxH3SegmentConditioning",
+    "MiniMaxH3SegmentTrim", "MiniMaxH3SegmentJoin", "MiniMaxH3SegmentResultPrepare",
+    "MiniMaxH3SegmentSampler", "MiniMaxH3SecondPassResize", "MiniMaxH3SecondPassEntryPack",
+    "MiniMaxH3SecondPassBatchAppend", "MiniMaxH3SecondPassBatchParser", "MiniMaxH3SecondPassLock",
+    "MiniMaxH3SecondPassUpscale", "MiniMaxH3SegmentCheckpoint", "MiniMaxH3SegmentCheckpointLoad",
+    "MiniMaxH3MultiSegmentGenerate", "MiniMaxH3MultiSegmentSecondPass",
+    "MiniMaxH3MultiSegmentLatentSecondPass",
+]);
 const RESOURCE_NAMES = { characters: "人物", environments: "环境", styles: "风格" };
+const PROJECT_FORMAT = "minimax-h3-director-project";
+const PROJECT_VERSION = 1;
+const PROJECT_CLIP_TYPES = {
+    action: TYPES.action,
+    camera: TYPES.camera,
+    lighting: TYPES.lighting,
+    audio: TYPES.audio,
+    environment: TYPES.environmentAction,
+};
 const TRACK_KIND_NAMES = { body: "人物·肢体", expression: "人物·表情", gaze: "人物·视线", environment: "环境", camera: "镜头", lighting: "灯光", audio: "音频" };
 const REFERENCE_SLOTS = {
     [TYPES.action]: { input: "motion_reference", output: 0, label: "人物表演" },
     [TYPES.camera]: { input: "camera_reference", output: 1, label: "镜头" },
     [TYPES.lighting]: { input: "lighting_reference", output: 2, label: "灯光" },
     [TYPES.audio]: { input: "audio_reference", output: 3, label: "音频" },
+    [TYPES.environmentAction]: { input: "environment_reference", output: 4, label: "环境" },
 };
 const RESOURCE_FORMS = {
     characters: [
@@ -115,6 +146,29 @@ function widget(node, name) {
 function widgetValue(node, name, fallback = "") {
     const item = widget(node, name);
     return item?.value ?? fallback;
+}
+
+function migrateActionContextWidget(node) {
+    if (nodeType(node) !== TYPES.action) return false;
+    const context = widget(node, "use_previous_context");
+    if (!context || typeof context.value === "boolean") return false;
+    if (context.value === "true" || context.value === "false") {
+        context.value = context.value === "true";
+        node._minimaxH3ContextMigrated = true;
+        return true;
+    }
+    const quality = widget(node, "quality");
+    const result = widget(node, "result");
+    const delivery = widget(node, "delivery");
+    const oldQuality = context.value;
+    const oldResult = quality?.value ?? "";
+    const oldDelivery = result?.value ?? "";
+    context.value = true;
+    if (quality) quality.value = oldQuality;
+    if (result) result.value = oldResult;
+    if (delivery) delivery.value = oldDelivery;
+    node._minimaxH3ContextMigrated = true;
+    return true;
 }
 
 function linkedNode(node, inputName) {
@@ -155,6 +209,18 @@ function setWidgetValue(node, name, value) {
     return true;
 }
 
+function addWidgetOption(node, name, value) {
+    const item = widget(node, name);
+    const values = item?.options?.values;
+    if (!item || !Array.isArray(values) || values.includes(value)) return;
+    values.push(value);
+}
+
+function setImageLoaderValue(node, value) {
+    addWidgetOption(node, "image", value);
+    return setWidgetValue(node, "image", value);
+}
+
 function escapeHtml(value) {
     const element = document.createElement("div");
     element.textContent = String(value ?? "");
@@ -192,6 +258,87 @@ function connectNodes(origin, outputName, target, inputName) {
     if (output < 0 || input < 0) return false;
     origin.connect(output, target, input);
     return true;
+}
+
+function outputTargets(node) {
+    return (node?.outputs || []).flatMap((output) => output.links || [])
+        .map((linkId) => app.graph?.links?.[linkId]?.target_id)
+        .filter((id) => id != null);
+}
+
+function isManagedMediaNode(node) {
+    if (node?.properties?.minimax_h3_managed_media || node?.properties?.minimax_h3_reference_upload
+        || node?.properties?.minimax_h3_reference_asset) return true;
+    if (nodeType(node) === TYPES.loadImage) {
+        return String(widgetValue(node, "image", "")).replaceAll("\\", "/").startsWith("minimax_h3/");
+    }
+    if (nodeType(node) === TYPES.loadVideo) {
+        return String(widgetValue(node, "file", "")).replaceAll("\\", "/").startsWith("minimax_h3/");
+    }
+    return false;
+}
+
+function isCleanupCandidate(node) {
+    return PACKAGE_NODE_TYPES.has(nodeType(node)) || isManagedMediaNode(node);
+}
+
+function unusedGraphNodes(root) {
+    if (!root) return [];
+    const used = new Set();
+    const pending = [root];
+    while (pending.length) {
+        const node = pending.pop();
+        if (!node || used.has(node.id)) continue;
+        used.add(node.id);
+        for (const input of node.inputs || []) {
+            if (input.link == null) continue;
+            const origin = app.graph?.getNodeById(app.graph.links?.[input.link]?.origin_id);
+            if (origin && !used.has(origin.id)) pending.push(origin);
+        }
+        for (const output of node.outputs || []) {
+            for (const linkId of output.links || []) {
+                const target = app.graph?.getNodeById(app.graph.links?.[linkId]?.target_id);
+                if (target && !used.has(target.id)) pending.push(target);
+            }
+        }
+    }
+    return (app.graph?._nodes || []).filter((node) => !used.has(node.id) && isCleanupCandidate(node));
+}
+
+function upstreamGraphNodes(root) {
+    const upstream = new Map();
+    const pending = [root];
+    while (pending.length) {
+        const node = pending.pop();
+        for (const input of node?.inputs || []) {
+            if (input.link == null) continue;
+            const origin = app.graph?.getNodeById(app.graph.links?.[input.link]?.origin_id);
+            if (!origin || upstream.has(origin.id)) continue;
+            upstream.set(origin.id, origin);
+            pending.push(origin);
+        }
+    }
+    return [...upstream.values()];
+}
+
+function abandonedUpstreamNodes(nodes) {
+    const candidates = new Set(nodes.map((node) => node.id));
+    const abandoned = new Set();
+    let changed = true;
+    while (changed) {
+        changed = false;
+        for (const node of nodes) {
+            if (abandoned.has(node.id)) continue;
+            const targets = outputTargets(node);
+            if (targets.every((id) => abandoned.has(id))) {
+                abandoned.add(node.id);
+                changed = true;
+            } else if (targets.some((id) => !candidates.has(id))) {
+                continue;
+            }
+        }
+    }
+    return nodes.filter((node) => abandoned.has(node.id));
 }
 
 function freeAutogrowInput(node, prefix) {
@@ -270,6 +417,7 @@ function collectTimeline(timeline) {
     return {
         timeline,
         duration,
+        promptLanguage: widgetValue(timeline, "prompt_language", "英文") || "英文",
         tracks,
         characterGroup: linkedNode(timeline, "character_group"),
         style: linkedNode(timeline, "style_card"),
@@ -277,8 +425,140 @@ function collectTimeline(timeline) {
     };
 }
 
+function nodeWidgetValues(node, names) {
+    return Object.fromEntries(names.map((name) => [name, widgetValue(node, name, "")]));
+}
+
+function projectAssetPath(value) {
+    const path = String(value || "").trim().replaceAll("\\", "/");
+    if (!path || path.startsWith("/") || path.includes(":") || path.split("/").includes("..")) {
+        throw new Error(`资源路径无效：${value || "空路径"}`);
+    }
+    return path;
+}
+
+const CRC32_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let value = 0; value < 256; value++) {
+        let crc = value;
+        for (let bit = 0; bit < 8; bit++) crc = (crc & 1) ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1;
+        table[value] = crc >>> 0;
+    }
+    return table;
+})();
+
+function crc32(bytes) {
+    let crc = 0xffffffff;
+    for (const byte of bytes) crc = CRC32_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+    return (crc ^ 0xffffffff) >>> 0;
+}
+
+function joinBytes(parts) {
+    const result = new Uint8Array(parts.reduce((size, part) => size + part.length, 0));
+    let offset = 0;
+    for (const part of parts) {
+        result.set(part, offset);
+        offset += part.length;
+    }
+    return result;
+}
+
+function zipProjectEntries(entries) {
+    const encoder = new TextEncoder();
+    const localParts = [];
+    const centralParts = [];
+    let offset = 0;
+    for (const entry of entries) {
+        const name = encoder.encode(entry.name);
+        const data = entry.data instanceof Uint8Array ? entry.data : new Uint8Array(entry.data);
+        const crc = crc32(data);
+        const local = new Uint8Array(30 + name.length);
+        const localView = new DataView(local.buffer);
+        localView.setUint32(0, 0x04034b50, true);
+        localView.setUint16(4, 20, true);
+        localView.setUint16(6, 0x0800, true);
+        localView.setUint16(8, 0, true);
+        localView.setUint32(14, crc, true);
+        localView.setUint32(18, data.length, true);
+        localView.setUint32(22, data.length, true);
+        localView.setUint16(26, name.length, true);
+        local.set(name, 30);
+        localParts.push(local, data);
+        const central = new Uint8Array(46 + name.length);
+        const centralView = new DataView(central.buffer);
+        centralView.setUint32(0, 0x02014b50, true);
+        centralView.setUint16(4, 20, true);
+        centralView.setUint16(6, 20, true);
+        centralView.setUint16(8, 0x0800, true);
+        centralView.setUint16(10, 0, true);
+        centralView.setUint32(16, crc, true);
+        centralView.setUint32(20, data.length, true);
+        centralView.setUint32(24, data.length, true);
+        centralView.setUint16(28, name.length, true);
+        centralView.setUint32(42, offset, true);
+        central.set(name, 46);
+        centralParts.push(central);
+        offset += local.length + data.length;
+    }
+    const central = joinBytes(centralParts);
+    const end = new Uint8Array(22);
+    const endView = new DataView(end.buffer);
+    endView.setUint32(0, 0x06054b50, true);
+    endView.setUint16(8, entries.length, true);
+    endView.setUint16(10, entries.length, true);
+    endView.setUint32(12, central.length, true);
+    endView.setUint32(16, offset, true);
+    return joinBytes([...localParts, central, end]);
+}
+
+function unzipProjectEntries(buffer) {
+    const bytes = new Uint8Array(buffer);
+    const view = new DataView(buffer);
+    let endOffset = -1;
+    for (let offset = bytes.length - 22; offset >= Math.max(0, bytes.length - 65557); offset--) {
+        if (view.getUint32(offset, true) === 0x06054b50) {
+            endOffset = offset;
+            break;
+        }
+    }
+    if (endOffset < 0) throw new Error("项目包 ZIP 目录损坏");
+    const count = view.getUint16(endOffset + 10, true);
+    let offset = view.getUint32(endOffset + 16, true);
+    const decoder = new TextDecoder();
+    const entries = new Map();
+    for (let index = 0; index < count; index++) {
+        if (view.getUint32(offset, true) !== 0x02014b50) throw new Error("项目包目录项损坏");
+        const method = view.getUint16(offset + 10, true);
+        if (method !== 0) throw new Error("项目包使用了不支持的压缩方式，请使用本节点包重新打包");
+        const expectedCrc = view.getUint32(offset + 16, true);
+        const size = view.getUint32(offset + 24, true);
+        const nameLength = view.getUint16(offset + 28, true);
+        const extraLength = view.getUint16(offset + 30, true);
+        const commentLength = view.getUint16(offset + 32, true);
+        const localOffset = view.getUint32(offset + 42, true);
+        const name = decoder.decode(bytes.subarray(offset + 46, offset + 46 + nameLength));
+        if (view.getUint32(localOffset, true) !== 0x04034b50) throw new Error(`项目包文件 ${name} 的数据头损坏`);
+        const localNameLength = view.getUint16(localOffset + 26, true);
+        const localExtraLength = view.getUint16(localOffset + 28, true);
+        const dataOffset = localOffset + 30 + localNameLength + localExtraLength;
+        const data = bytes.slice(dataOffset, dataOffset + size);
+        if (crc32(data) !== expectedCrc) throw new Error(`项目包文件 ${name} 校验失败`);
+        entries.set(name, data);
+        offset += 46 + nameLength + extraLength + commentLength;
+    }
+    return entries;
+}
+
 function timelineNodes() {
     return (app.graph?._nodes || []).filter((node) => nodeType(node) === TYPES.timeline);
+}
+
+function syncImageLoaderOptions() {
+    for (const node of app.graph?._nodes || []) {
+        if (nodeType(node) !== TYPES.loadImage) continue;
+        const value = String(widgetValue(node, "image", ""));
+        if (value) addWidgetOption(node, "image", value);
+    }
 }
 
 function loadStyle() {
@@ -299,65 +579,260 @@ class H3TimelineEditor {
         this.snap = 0.05;
         this.playhead = 0;
         this.playing = false;
+        this.scrub = null;
         this.drag = null;
+        this.dockResize = null;
         this.library = null;
         this.referenceAssets = null;
-        this.libraryTab = "scene";
         this.resourceFilter = "";
         this.resourceModal = null;
         this.referenceAssetModal = false;
         this.trackModal = null;
+        this.confirmResolver = null;
         this.createdOffset = 0;
         this.autoSave = localStorage.getItem("minimax_h3_timeline_autosave") !== "false";
+        this.dockLayout = this.loadDockLayout();
         this.saveTimer = null;
         this.changeVersion = 0;
         this.root = document.createElement("div");
         this.root.className = "h3te-root";
+        this.root.tabIndex = -1;
         this.root.innerHTML = this.shell();
         document.body.appendChild(this.root);
+        this.applyDockLayout();
         this.bind();
     }
 
     shell() {
         return `
             <header class="h3te-header">
-                <div class="h3te-brand"><span class="h3te-mark">H3</span><div><strong>导演时间轴</strong><small>MiniMax H3 Prompt Builder</small></div></div>
-                <label class="h3te-timeline-select">总时间轴 <select data-role="timeline"></select></label>
-                <div class="h3te-transport">
-                    <button data-action="play" title="播放时间指针">▶</button>
-                    <span data-role="time">00:00.00</span>
+                <div class="h3te-header-row h3te-header-primary">
+                    <div class="h3te-brand"><span class="h3te-mark">H3</span><div><strong>导演时间轴</strong><small>MiniMax H3 Prompt Builder</small></div></div>
+                    <label class="h3te-timeline-select">总时间轴 <select data-role="timeline"></select></label>
+                    <div class="h3te-transport">
+                        <button data-action="play" title="播放时间指针">▶</button>
+                        <span data-role="time">00:00:00:00</span>
+                    </div>
+                    <button class="h3te-close" data-action="close">关闭</button>
                 </div>
-                <div class="h3te-tools">
-                    <label>时长 <input class="h3te-duration" data-role="duration" type="number" min="0.21" max="60" step="0.05"></label>
-                    <label>吸附 <select data-role="snap"><option value="0">关闭</option><option value="0.01">0.01秒</option><option value="0.05" selected>0.05秒</option><option value="0.1">0.1秒</option><option value="0.25">0.25秒</option></select></label>
-                    <label>缩放 <input data-role="zoom" type="range" min="60" max="260" value="115"></label>
-                    <button data-action="fit">适应宽度</button><button data-action="bootstrap">补全工程</button><button data-action="layout">自动排布</button><button data-action="create-track">＋轨道</button>
-                    <label class="h3te-autosave"><input data-role="autosave" type="checkbox" ${this.autoSave ? "checked" : ""}>自动保存</label><button data-action="save">保存</button><button data-action="refresh">刷新</button><button class="h3te-close" data-action="close">关闭</button>
+                <div class="h3te-header-row h3te-header-secondary">
+                    <div class="h3te-tools">
+                        <label>时长 <input class="h3te-duration" data-role="duration" type="number" min="0.21" max="60" step="0.05"></label>
+                        <label>提示词 <select data-role="prompt-language"><option value="英文">英文</option><option value="中文">中文</option></select></label>
+                        <label>吸附 <select data-role="snap"><option value="0">关闭</option><option value="0.01">0.01秒</option><option value="0.05" selected>0.05秒</option><option value="0.1">0.1秒</option><option value="0.25">0.25秒</option></select></label>
+                        <label>缩放 <input data-role="zoom" type="range" min="60" max="260" value="115"></label>
+                        <button data-action="fit">适应宽度</button><button data-action="bootstrap">补全工程</button><button data-action="export-project">导出 JSON</button><button data-action="package-project">打包项目</button><button data-action="import-project">导入并覆盖</button><button data-action="cleanup">清理未使用节点</button><button data-action="create-track">＋轨道</button>
+                        <label class="h3te-autosave"><input data-role="autosave" type="checkbox" ${this.autoSave ? "checked" : ""}>自动保存</label><button data-action="save">保存</button><button data-action="refresh">刷新</button>
+                        <input data-role="project-file" type="file" accept=".json,.h3proj,.h3proj.json,application/json,application/zip" hidden>
+                    </div>
                 </div>
             </header>
-            <main class="h3te-main">
-                <aside class="h3te-library">
-                    <div class="h3te-panel-title">资源</div>
-                    <div class="h3te-library-tabs"><button class="is-active" data-library-tab="scene">当前工程</button><button data-library-tab="resources">卡片</button><button data-library-tab="media">参考视频</button></div>
-                    <div data-role="library"></div>
-                </aside>
-                <section class="h3te-stage">
+            <main class="h3te-main" data-role="dock-root">
+                <aside class="h3te-dock-panel h3te-library" data-dock-panel="scene" data-dock-title="当前工程"><div data-role="library-scene"></div></aside>
+                <aside class="h3te-dock-panel h3te-library" data-dock-panel="cards" data-dock-title="卡片"><div data-role="library-resources"></div></aside>
+                <aside class="h3te-dock-panel h3te-library" data-dock-panel="media" data-dock-title="参考视频"><div data-role="library-media"></div></aside>
+                <section class="h3te-dock-panel h3te-stage" data-dock-panel="timeline" data-dock-title="轨道时间轴">
                     <div class="h3te-ruler-wrap"><div class="h3te-track-label h3te-ruler-label">轨道</div><div class="h3te-ruler-scroll"><div class="h3te-ruler" data-role="ruler"></div></div></div>
                     <div class="h3te-tracks" data-role="tracks"></div>
                 </section>
-                <aside class="h3te-inspector"><div class="h3te-panel-title">属性</div><div data-role="inspector" class="h3te-inspector-body"></div></aside>
+                <aside class="h3te-dock-panel h3te-inspector" data-dock-panel="inspector" data-dock-title="属性"><div data-role="inspector" class="h3te-inspector-body"></div></aside>
             </main>
-            <footer class="h3te-footer"><span data-role="status">修改会直接同步到 ComfyUI 工作流</span><span data-role="save-status">${this.autoSave ? "自动保存已开启" : "自动保存已关闭"}</span><span>拖动片段调整时间 · 拖动两端改变长度</span></footer>
+            <footer class="h3te-footer"><span data-role="status">修改会直接同步到 ComfyUI 工作流</span><span data-role="save-status">${this.autoSave ? "自动保存已开启" : "自动保存已关闭"}</span><span>拖动播放头预览 · 空格播放 · ←/→逐帧</span></footer>
             <div class="h3te-modal-layer" data-role="resource-modal"></div>
             <div class="h3te-modal-layer" data-role="reference-asset-modal"></div>
-            <div class="h3te-modal-layer" data-role="track-modal"></div>`;
+            <div class="h3te-modal-layer" data-role="track-modal"></div>
+            <div class="h3te-modal-layer" data-role="confirm-modal"></div>`;
+    }
+
+    defaultDockLayout() {
+        return {
+            version: 2,
+            root: { type: "split", id: "split_root", direction: "row", sizes: [18, 57, 25], children: [
+                { type: "group", id: "group_resources", panels: ["scene", "cards", "media"], active: "scene" },
+                { type: "group", id: "group_timeline", panels: ["timeline"], active: "timeline" },
+                { type: "group", id: "group_inspector", panels: ["inspector"], active: "inspector" },
+            ] },
+        };
+    }
+
+    loadDockLayout() {
+        try {
+            const stored = JSON.parse(localStorage.getItem("minimax_h3_timeline_docks") || "null");
+            if (stored?.version === 2 && stored.root) return stored;
+        } catch {
+        }
+        return this.defaultDockLayout();
+    }
+
+    saveDockLayout() {
+        localStorage.setItem("minimax_h3_timeline_docks", JSON.stringify(this.dockLayout));
+    }
+
+    applyDockLayout() {
+        const panels = new Map([...this.root.querySelectorAll("[data-dock-panel]")].map((panel) => [panel.dataset.dockPanel, panel]));
+        const root = $("[data-role=dock-root]", this.root);
+        root.innerHTML = "";
+        const renderNode = (layout) => {
+            if (layout.type === "group") {
+                const group = document.createElement("section");
+                group.className = "h3te-dock-group";
+                group.dataset.dockGroup = layout.id;
+                if (!layout.panels.includes(layout.active)) layout.active = layout.panels[0] || null;
+                group.innerHTML = `<div class="h3te-dock-tabs">${layout.panels.map((id) => {
+                    const panel = panels.get(id);
+                    return `<button class="h3te-dock-tab ${id === layout.active ? "is-active" : ""}" draggable="true" data-dock-tab="${id}">${escapeHtml(panel?.dataset.dockTitle || id)}</button>`;
+                }).join("")}</div><div class="h3te-dock-body"></div><div class="h3te-dock-guide"><i data-dock-position="top"></i><i data-dock-position="left"></i><i data-dock-position="center"></i><i data-dock-position="right"></i><i data-dock-position="bottom"></i></div>`;
+                const body = $(".h3te-dock-body", group);
+                for (const id of layout.panels) {
+                    const panel = panels.get(id);
+                    if (!panel) continue;
+                    body.appendChild(panel);
+                    panel.hidden = id !== layout.active;
+                }
+                return group;
+            }
+            const split = document.createElement("div");
+            split.className = `h3te-dock-split ${layout.direction}`;
+            split.dataset.dockSplit = layout.id;
+            const total = layout.sizes.reduce((sum, value) => sum + value, 0) || layout.children.length;
+            layout.children.forEach((child, index) => {
+                const cell = document.createElement("div");
+                cell.className = "h3te-dock-cell";
+                cell.style.flexBasis = `${100 * (layout.sizes[index] || 1) / total}%`;
+                cell.appendChild(renderNode(child));
+                split.appendChild(cell);
+                if (index < layout.children.length - 1) {
+                    const resizer = document.createElement("div");
+                    resizer.className = "h3te-dock-resizer";
+                    resizer.dataset.dockResize = `${layout.id}:${index}`;
+                    split.appendChild(resizer);
+                }
+            });
+            return split;
+        };
+        root.appendChild(renderNode(this.dockLayout.root));
+        this.saveDockLayout();
+    }
+
+    findDockNode(id, node = this.dockLayout.root) {
+        if (node.id === id) return node;
+        if (node.type === "split") for (const child of node.children) {
+            const found = this.findDockNode(id, child);
+            if (found) return found;
+        }
+        return null;
+    }
+
+    findDockParent(id, node = this.dockLayout.root) {
+        if (node.type !== "split") return null;
+        const index = node.children.findIndex((child) => child.id === id);
+        if (index >= 0) return { node, index };
+        for (const child of node.children) {
+            const found = this.findDockParent(id, child);
+            if (found) return found;
+        }
+        return null;
+    }
+
+    removeDockPanel(panelId, node = this.dockLayout.root) {
+        if (node.type === "group") {
+            node.panels = node.panels.filter((id) => id !== panelId);
+            if (node.active === panelId) node.active = node.panels[0] || null;
+            return;
+        }
+        for (const child of node.children) this.removeDockPanel(panelId, child);
+    }
+
+    normalizeDockNode(node) {
+        if (node.type === "group") return node.panels.length ? node : null;
+        const entries = node.children.map((child, index) => ({ child: this.normalizeDockNode(child), size: node.sizes[index] }))
+            .filter((entry) => entry.child);
+        if (!entries.length) return null;
+        if (entries.length === 1) return entries[0].child;
+        node.children = entries.map((entry) => entry.child);
+        node.sizes = entries.map((entry) => entry.size || 1);
+        return node;
+    }
+
+    dockPanel(panelId, groupId, position = "center", beforeId = null) {
+        const valid = ["scene", "cards", "media", "timeline", "inspector"];
+        const target = this.findDockNode(groupId);
+        if (!valid.includes(panelId) || target?.type !== "group") return;
+        this.removeDockPanel(panelId);
+        if (position === "center") {
+            const index = beforeId ? target.panels.indexOf(beforeId) : -1;
+            if (index >= 0) target.panels.splice(index, 0, panelId);
+            else target.panels.push(panelId);
+            target.active = panelId;
+        } else {
+            const direction = ["left", "right"].includes(position) ? "row" : "column";
+            const group = { type: "group", id: `group_${crypto.randomUUID()}`, panels: [panelId], active: panelId };
+            const first = ["left", "top"].includes(position) ? group : target;
+            const second = first === group ? target : group;
+            const split = { type: "split", id: `split_${crypto.randomUUID()}`, direction, sizes: [1, 1], children: [first, second] };
+            const parent = this.findDockParent(target.id);
+            if (parent) parent.node.children[parent.index] = split;
+            else this.dockLayout.root = split;
+        }
+        this.dockLayout.root = this.normalizeDockNode(this.dockLayout.root);
+        this.applyDockLayout();
+        this.renderTracks();
+    }
+
+    activateDockPanel(panelId) {
+        const find = (node) => node.type === "group" ? (node.panels.includes(panelId) ? node : null)
+            : node.children.map(find).find(Boolean);
+        const group = find(this.dockLayout.root);
+        if (!group) return;
+        group.active = panelId;
+        this.applyDockLayout();
+        if (panelId === "timeline") this.renderTracks();
     }
 
     bind() {
         this.root.addEventListener("click", (event) => this.onClick(event));
+        this.root.addEventListener("dragstart", (event) => {
+            const tab = event.target.closest("[data-dock-tab]");
+            if (!tab) return;
+            event.dataTransfer.effectAllowed = "move";
+            event.dataTransfer.setData("text/minimax-h3-panel", tab.dataset.dockTab);
+            tab.classList.add("is-dragging");
+        });
+        this.root.addEventListener("dragover", (event) => {
+            const group = event.target.closest("[data-dock-group]");
+            if (!group || !event.dataTransfer.types.includes("text/minimax-h3-panel")) return;
+            event.preventDefault();
+            event.dataTransfer.dropEffect = "move";
+            for (const item of this.root.querySelectorAll(".h3te-dock-group.is-drop-target")) item.classList.remove("is-drop-target");
+            const rect = group.getBoundingClientRect();
+            const x = (event.clientX - rect.left) / Math.max(1, rect.width);
+            const y = (event.clientY - rect.top) / Math.max(1, rect.height);
+            let position = "center";
+            if (!event.target.closest(".h3te-dock-tabs")) {
+                if (x < 0.25) position = "left";
+                else if (x > 0.75) position = "right";
+                else if (y < 0.25) position = "top";
+                else if (y > 0.75) position = "bottom";
+            }
+            group.dataset.dropPosition = position;
+            group.classList.add("is-drop-target");
+        });
+        this.root.addEventListener("drop", (event) => {
+            const group = event.target.closest("[data-dock-group]");
+            const panelId = event.dataTransfer.getData("text/minimax-h3-panel");
+            if (!group || !panelId) return;
+            event.preventDefault();
+            const before = event.target.closest("[data-dock-tab]")?.dataset.dockTab || null;
+            this.dockPanel(panelId, group.dataset.dockGroup, group.dataset.dropPosition || "center", before === panelId ? null : before);
+            group.classList.remove("is-drop-target");
+        });
+        this.root.addEventListener("dragend", () => {
+            for (const item of this.root.querySelectorAll(".is-dragging,.is-drop-target")) item.classList.remove("is-dragging", "is-drop-target");
+        });
         $("[data-role=timeline]", this.root).addEventListener("change", (event) => {
             this.timelineId = Number(event.target.value);
             this.selection = null;
+            this.layoutProjectNodes(true);
             this.render();
         });
         $("[data-role=zoom]", this.root).addEventListener("input", (event) => {
@@ -365,6 +840,16 @@ class H3TimelineEditor {
             this.renderTracks();
         });
         $("[data-role=snap]", this.root).addEventListener("change", (event) => this.snap = Number(event.target.value));
+        $("[data-role=prompt-language]", this.root).addEventListener("change", (event) => {
+            const timeline = this.currentTimeline();
+            if (!timeline) return;
+            app.graph.beforeChange?.();
+            setWidgetValue(timeline, "prompt_language", event.target.value);
+            app.graph.afterChange?.();
+            this.markWorkflowChanged();
+            this.setStatus(`提示词语言已切换为${event.target.value}`);
+        });
+        $("[data-role=project-file]", this.root).addEventListener("change", (event) => this.importProjectFile(event));
         $("[data-role=autosave]", this.root).addEventListener("change", (event) => {
             this.autoSave = event.target.checked;
             localStorage.setItem("minimax_h3_timeline_autosave", String(this.autoSave));
@@ -400,11 +885,28 @@ class H3TimelineEditor {
             }
         });
         this.root.addEventListener("pointerdown", (event) => this.onPointerDown(event));
+        this.root.addEventListener("loadedmetadata", (event) => {
+            if (event.target.matches?.("[data-timeline-preview]")) this.syncTimelinePreview();
+        }, true);
         window.addEventListener("pointermove", (event) => this.onPointerMove(event));
-        window.addEventListener("pointerup", () => this.onPointerUp());
+        window.addEventListener("pointerup", (event) => this.onPointerUp(event));
         window.addEventListener("keydown", (event) => {
-            if (event.key !== "Escape" || !this.root.classList.contains("is-open")) return;
-            if (this.resourceModal) {
+            if (!this.root.classList.contains("is-open")) return;
+            const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || "");
+            if (!typing && [" ", "ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+                event.preventDefault();
+                if (event.key === " ") return this.togglePlay();
+                const frame = event.shiftKey ? 1 : 1 / 24;
+                if (event.key === "ArrowLeft") this.setPlayhead(this.playhead - frame, { scrollIntoView: true });
+                else if (event.key === "ArrowRight") this.setPlayhead(this.playhead + frame, { scrollIntoView: true });
+                else if (event.key === "Home") this.setPlayhead(0, { scrollIntoView: true });
+                else this.setPlayhead(this.data?.duration || 0, { scrollIntoView: true });
+                return;
+            }
+            if (event.key !== "Escape") return;
+            if (this.confirmResolver) {
+                this.closeConfirm(false);
+            } else if (this.resourceModal) {
                 this.resourceModal = null;
                 this.renderResourceModal();
             } else if (this.referenceAssetModal) {
@@ -423,15 +925,80 @@ class H3TimelineEditor {
         const timelines = timelineNodes();
         if (timeline) this.timelineId = timeline.id;
         if (!timelines.some((node) => node.id === this.timelineId)) this.timelineId = timelines[0]?.id ?? null;
+        syncImageLoaderOptions();
+        this.migrateActionContextWidgets();
+        this.migrateActorMacros();
+        this.layoutProjectNodes(true);
         this.root.classList.add("is-open");
+        this.root.focus({ preventScroll: true });
         document.body.classList.add("h3te-open");
         this.render();
         this.loadResourceLibrary();
         this.loadReferenceAssets();
     }
 
+    migrateActionContextWidgets() {
+        const nodes = (app.graph?._nodes || []).filter((node) => nodeType(node) === TYPES.action &&
+            (node._minimaxH3ContextMigrated || typeof widget(node, "use_previous_context")?.value !== "boolean"));
+        if (!nodes.length) return;
+        app.graph.beforeChange?.();
+        let changed = false;
+        for (const node of nodes) {
+            changed = migrateActionContextWidget(node) || node._minimaxH3ContextMigrated || changed;
+            delete node._minimaxH3ContextMigrated;
+        }
+        app.graph.afterChange?.();
+        if (!changed) return;
+        app.graph.setDirtyCanvas(true, true);
+        this.markWorkflowChanged();
+        this.setStatus(`已修复 ${nodes.length} 个旧动作片段的段间引导字段`);
+    }
+
+    migrateActorMacros() {
+        const timeline = this.currentTimeline();
+        const group = linkedNode(timeline, "character_group");
+        const actors = group ? numberedInputs(group, ["actors", "actor"]) : [];
+        if (!actors.length) return;
+        const used = new Set();
+        const replacements = [];
+        app.graph.beforeChange?.();
+        let changed = false;
+        for (const [index, actor] of actors.entries()) {
+            let actorId = String(widgetValue(actor, "actor_id", "")).trim();
+            if (!/^actor_[1-9][0-9]*$/.test(actorId) || used.has(actorId)) {
+                let number = index + 1;
+                while (used.has(`actor_${number}`)) number += 1;
+                actorId = `actor_${number}`;
+                changed = setWidgetValue(actor, "actor_id", actorId) || changed;
+            }
+            used.add(actorId);
+            const name = String(widgetValue(findCardForActor(actor), "name", "")).trim();
+            if (name) replacements.push([name, `{${actorId}}`]);
+        }
+        for (const node of upstreamGraphNodes(timeline)) {
+            if (nodeType(node) === TYPES.character) continue;
+            for (const [fieldName] of FIELD_SETS[nodeType(node)] || []) {
+                if (fieldName === "actor_id") continue;
+                const item = widget(node, fieldName);
+                if (!item || typeof item.value !== "string") continue;
+                let value = item.value;
+                for (const [name, token] of replacements) {
+                    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                    value = value.replace(new RegExp(`(^|[^\\p{L}\\p{N}_])${escaped}(?=$|[^\\p{L}\\p{N}_])`, "giu"), `$1${token}`);
+                }
+                if (value !== item.value) changed = setWidgetValue(node, fieldName, value) || changed;
+            }
+        }
+        app.graph.afterChange?.();
+        if (!changed) return;
+        app.graph.setDirtyCanvas(true, true);
+        this.markWorkflowChanged();
+        this.setStatus("已将旧人物名称引用迁移为人物实例宏");
+    }
+
     close() {
         this.playing = false;
+        this.closeConfirm(false);
         this.resourceModal = null;
         this.referenceAssetModal = false;
         this.trackModal = null;
@@ -442,8 +1009,490 @@ class H3TimelineEditor {
         document.body.classList.remove("h3te-open");
     }
 
+    confirmDelete(message, title = "确认删除", confirmText = "删除") {
+        this.closeConfirm(false);
+        const host = $("[data-role=confirm-modal]", this.root);
+        host.classList.add("is-open");
+        host.innerHTML = `<div class="h3te-confirm-box"><strong>${escapeHtml(title)}</strong><p>${escapeHtml(message)}</p><div><button data-action="cancel-delete">取消</button><button class="danger" data-action="confirm-delete">${escapeHtml(confirmText)}</button></div></div>`;
+        return new Promise((resolve) => this.confirmResolver = resolve);
+    }
+
+    closeConfirm(result) {
+        if (!this.confirmResolver) return;
+        const resolve = this.confirmResolver;
+        this.confirmResolver = null;
+        const host = $("[data-role=confirm-modal]", this.root);
+        host.classList.remove("is-open");
+        host.innerHTML = "";
+        resolve(result);
+    }
+
     currentTimeline() {
         return app.graph?.getNodeById(this.timelineId);
+    }
+
+    nextActorMacro(timeline = this.currentTimeline()) {
+        const group = linkedNode(timeline, "character_group");
+        const used = new Set((group ? numberedInputs(group, ["actors", "actor"]) : [])
+            .map((actor) => String(widgetValue(actor, "actor_id", ""))));
+        let number = 1;
+        while (used.has(`actor_${number}`)) number += 1;
+        return `actor_${number}`;
+    }
+
+    serializeProject() {
+        const timeline = this.currentTimeline();
+        if (!timeline) throw new Error("当前没有可导出的总时间轴");
+        timeline.properties ||= {};
+        timeline.properties.minimax_h3_project ||= { id: crypto.randomUUID(), extensions: {} };
+        const data = collectTimeline(timeline);
+        const assets = [];
+        const assetIds = new Map();
+        const addAsset = (kind, path) => {
+            if (!path) return null;
+            path = projectAssetPath(path);
+            const key = `${kind}:${path}`;
+            if (assetIds.has(key)) return assetIds.get(key);
+            const id = `${kind}_${assets.length + 1}`;
+            assetIds.set(key, id);
+            assets.push({ id, kind, path });
+            return id;
+        };
+        const imageAsset = (card) => {
+            const loader = linkedNode(card, "reference_image");
+            return nodeType(loader) === TYPES.loadImage ? addAsset("image", widgetValue(loader, "image", "")) : null;
+        };
+        const videoAsset = (consumer, inputName) => {
+            const source = linkedNode(consumer, inputName);
+            return nodeType(source) === TYPES.loadVideo ? addAsset("video", widgetValue(source, "file", "")) : null;
+        };
+        const actors = data.characterGroup ? numberedInputs(data.characterGroup, ["actors", "actor"]) : [];
+        const actorIds = new Map(actors.map((actor, index) => [actor.id, `actor_${index + 1}`]));
+        const characters = actors.map((actor, index) => {
+            const card = findCardForActor(actor);
+            return {
+                id: `actor_${index + 1}`,
+                card: nodeWidgetValues(card, ["name", "description", "style_priority", "character_style"]),
+                instance: nodeWidgetValues(actor, ["actor_id", "position_override", "pose_override", "emotion_override", "appearance_override"]),
+                reference_asset: imageAsset(card),
+            };
+        });
+        const style = data.style ? {
+            card: nodeWidgetValues(data.style, ["style", "rendering", "color_palette", "texture", "reference_usage"]),
+            reference_asset: imageAsset(data.style),
+        } : null;
+        const environmentCard = findCardForEnvironment(data.environment);
+        const environment = data.environment ? {
+            card: nodeWidgetValues(environmentCard, ["name", "location", "default_background"]),
+            instance: nodeWidgetValues(data.environment, ["location_override", "time_weather_override", "background_override", "atmosphere_override"]),
+            reference_asset: imageAsset(environmentCard),
+        } : null;
+        const tracks = data.tracks.map((track, trackIndex) => ({
+            id: `track_${trackIndex + 1}`,
+            type: track.type === TYPES.actorTrack ? "actor" : track.type === TYPES.environmentTrack ? "environment" : "system",
+            owner: track.owner ? actorIds.get(track.owner.id) || "environment" : null,
+            clips: track.clips.map((clip, clipIndex) => {
+                const type = nodeType(clip.node);
+                const fields = nodeWidgetValues(clip.node, (FIELD_SETS[type] || []).map(([name]) => name));
+                const target = linkedNode(clip.node, "target");
+                const language = linkedNode(clip.node, "language");
+                const config = REFERENCE_SLOTS[type];
+                const reference = config ? linkedNode(clip.node, config.input) : null;
+                const split = nodeType(reference) === TYPES.videoPerson ? linkedNode(reference, "motion_reference") : reference;
+                const referenceAsset = split ? videoAsset(split, "video") : null;
+                const resultAsset = clip.resultNode ? videoAsset(clip.resultNode, "video") : null;
+                return {
+                    id: `track_${trackIndex + 1}_clip_${clipIndex + 1}`,
+                    type: Object.entries(PROJECT_CLIP_TYPES).find(([, nodeTypeId]) => nodeTypeId === type)?.[0],
+                    fields,
+                    target: target ? actorIds.get(target.id) || null : null,
+                    language: language ? nodeWidgetValues(language, ["language", "variant", "accent", "pronunciation"]) : null,
+                    reference: referenceAsset ? {
+                        asset: referenceAsset,
+                        trim_start: Number(widgetValue(split, "trim_start", 0)) || 0,
+                        trim_end: Number(widgetValue(split, "trim_end", 0)) || 0,
+                        ...(nodeType(reference) === TYPES.videoPerson ? {
+                            person_id: widgetValue(reference, "person_id", ""),
+                            person_description: widgetValue(reference, "person_description", ""),
+                        } : {}),
+                    } : null,
+                    cached_result: resultAsset ? {
+                        asset: resultAsset,
+                        version: Number(widgetValue(clip.resultNode, "result_version", 0)) || 0,
+                    } : null,
+                };
+            }),
+        }));
+        return {
+            format: PROJECT_FORMAT,
+            version: PROJECT_VERSION,
+            project: {
+                id: timeline.properties.minimax_h3_project.id,
+                name: timeline.title || "MiniMax H3 项目",
+                duration_seconds: data.duration,
+                prompt_language: data.promptLanguage,
+            },
+            assets,
+            characters,
+            style,
+            environment,
+            tracks,
+            extensions: structuredClone(timeline.properties.minimax_h3_project.extensions || {}),
+        };
+    }
+
+    exportProject() {
+        try {
+            const project = this.serializeProject();
+            const blob = new Blob([`${JSON.stringify(project, null, 2)}\n`], { type: "application/json" });
+            this.downloadProjectBlob(blob, project.project.name, ".h3proj.json");
+        } catch (error) {
+            this.setStatus(`项目导出失败：${error?.message || error}`);
+        }
+    }
+
+    downloadProjectBlob(blob, projectName, extension) {
+        const link = document.createElement("a");
+        const name = String(projectName || "minimax-h3-project").replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").trim() || "minimax-h3-project";
+        link.href = URL.createObjectURL(blob);
+        link.download = `${name}${extension}`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+        this.setStatus(`项目已导出：${link.download}`);
+    }
+
+    async packageProject() {
+        try {
+            const project = this.serializeProject();
+            const packaged = structuredClone(project);
+            const entries = [];
+            for (const asset of packaged.assets) {
+                this.setStatus(`正在打包资源：${asset.path}`);
+                const response = await fetch(this.referenceVideoUrl(asset.path));
+                if (!response.ok) throw new Error(`读取资源失败（HTTP ${response.status}）：${asset.path}`);
+                const extension = asset.path.match(/(\.[a-z0-9]{1,10})$/i)?.[1]?.toLowerCase() || (asset.kind === "image" ? ".png" : ".mp4");
+                const safeId = String(asset.id).replace(/[^a-zA-Z0-9_-]/g, "_");
+                asset.source_path = asset.path;
+                asset.path = `assets/${safeId}${extension}`;
+                entries.push({ name: asset.path, data: new Uint8Array(await response.arrayBuffer()) });
+            }
+            entries.unshift({ name: "project.json", data: new TextEncoder().encode(`${JSON.stringify(packaged, null, 2)}\n`) });
+            const archive = zipProjectEntries(entries);
+            this.downloadProjectBlob(new Blob([archive], { type: "application/zip" }), project.project.name, ".h3proj");
+        } catch (error) {
+            this.setStatus(`项目打包失败：${error?.message || error}`);
+        }
+    }
+
+    validateProject(rawProject) {
+        const project = structuredClone(rawProject);
+        if (!project || project.format !== PROJECT_FORMAT) throw new Error("不是 MiniMax H3 导演项目文件");
+        if (project.version !== PROJECT_VERSION) throw new Error(`不支持项目格式版本 ${project.version}`);
+        const duration = Number(project.project?.duration_seconds);
+        if (!(duration >= 0.21 && duration <= 60)) throw new Error("项目时长必须在 0.21 到 60 秒之间");
+        if (!Array.isArray(project.characters) || !project.characters.length) throw new Error("项目至少需要一个人物");
+        if (!project.style || !project.environment || !Array.isArray(project.tracks)) throw new Error("项目缺少风格、环境或轨道数据");
+        const assets = new Map();
+        for (const asset of project.assets || []) {
+            if (!asset?.id || !["image", "video"].includes(asset.kind) || assets.has(asset.id)) throw new Error("资源清单包含无效或重复 ID");
+            assets.set(asset.id, { ...asset, path: projectAssetPath(asset.path) });
+        }
+        const actorIds = new Set();
+        const actorMacros = new Set();
+        const nameReplacements = [];
+        for (const [index, actor] of project.characters.entries()) {
+            if (!actor?.id || actorIds.has(actor.id)) throw new Error("人物包含无效或重复 ID");
+            actorIds.add(actor.id);
+            actor.instance ||= {};
+            let actorId = String(actor.instance.actor_id || "").trim();
+            if (!/^actor_[1-9][0-9]*$/.test(actorId) || actorMacros.has(actorId)) {
+                let number = index + 1;
+                while (actorMacros.has(`actor_${number}`)) number += 1;
+                actorId = `actor_${number}`;
+            }
+            actor.instance.actor_id = actorId;
+            actorMacros.add(actorId);
+            const name = String(actor.card?.name || "").trim();
+            if (name) nameReplacements.push([name, `{${actorId}}`]);
+        }
+        const migrateText = (value) => {
+            if (typeof value !== "string") return value;
+            for (const [name, token] of nameReplacements) {
+                const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                value = value.replace(new RegExp(`(^|[^\\p{L}\\p{N}_])${escaped}(?=$|[^\\p{L}\\p{N}_])`, "giu"), `$1${token}`);
+            }
+            return value;
+        };
+        const migrateObject = (object) => {
+            for (const [key, value] of Object.entries(object || {})) {
+                if (key === "actor_id") continue;
+                if (typeof value === "string") object[key] = migrateText(value);
+            }
+        };
+        for (const actor of project.characters) migrateObject(actor.instance);
+        migrateObject(project.style.card);
+        migrateObject(project.environment.card);
+        migrateObject(project.environment.instance);
+        const allowedTypes = new Set(Object.keys(PROJECT_CLIP_TYPES));
+        const requireAsset = (id, kind, label) => {
+            if (!id) return;
+            const asset = assets.get(id);
+            if (!asset) throw new Error(`${label}引用了不存在的资源 ${id}`);
+            if (asset.kind !== kind) throw new Error(`${label}必须引用${kind === "image" ? "图片" : "视频"}资源`);
+        };
+        for (const actor of project.characters) requireAsset(actor.reference_asset, "image", `人物 ${actor.id}`);
+        requireAsset(project.style.reference_asset, "image", "风格卡");
+        requireAsset(project.environment.reference_asset, "image", "环境卡");
+        for (const track of project.tracks) {
+            if (!["actor", "environment", "system"].includes(track?.type) || !Array.isArray(track.clips)) throw new Error("轨道结构无效");
+            if (track.type === "actor" && !actorIds.has(track.owner)) throw new Error(`人物轨道引用了不存在的人物 ${track.owner}`);
+            const clipKinds = new Set();
+            for (const clip of track.clips) {
+                const legacyType = Object.entries(PROJECT_CLIP_TYPES).find(([, nodeTypeId]) => nodeTypeId === clip?.type)?.[0];
+                if (legacyType) clip.type = legacyType;
+                if (!allowedTypes.has(clip?.type)) throw new Error(`不支持片段类型 ${clip?.type}`);
+                migrateObject(clip.fields);
+                for (const value of Object.values(clip.fields || {})) {
+                    if (typeof value !== "string") continue;
+                    for (const match of value.matchAll(/\{(actor[^}]*)\}/g)) {
+                        if (!actorMacros.has(match[1])) throw new Error(`片段 ${clip.id || "未命名"} 使用了未声明的人物宏 ${match[0]}`);
+                    }
+                }
+                clipKinds.add(clip.type);
+                if (track.type === "actor" && clip.type !== "action") throw new Error("人物轨道只能包含人物动作片段");
+                if (track.type === "environment" && clip.type !== "environment") throw new Error("环境轨道只能包含环境片段");
+                if (track.type === "system" && !["camera", "lighting", "audio"].includes(clip.type)) throw new Error("系统轨道只能包含镜头、灯光或音频片段");
+                if (clip.type === "action") {
+                    clip.fields.action_type ||= "body";
+                    if (!["body", "expression", "gaze", "speech"].includes(clip.fields.action_type)) {
+                        throw new Error(`人物动作片段 ${clip.id || "未命名"} 的动作种类无效`);
+                    }
+                }
+                const start = Number(clip.fields?.start_time);
+                const end = Number(clip.fields?.end_time);
+                if (!(start >= 0 && end > start && end <= duration + 1e-6)) throw new Error(`片段 ${clip.id || "未命名"} 的时间范围无效`);
+                if (clip.target && !actorIds.has(clip.target)) throw new Error(`片段目标人物不存在：${clip.target}`);
+                if (clip.type === "action" && clip.fields?.action_type === "speech" && !clip.language) throw new Error(`对话片段 ${clip.id || "未命名"} 缺少语言数据`);
+                requireAsset(clip.reference?.asset, "video", `片段 ${clip.id || "未命名"} 的参考视频`);
+                if (clip.reference && (clip.reference.person_id || clip.reference.person_description)) {
+                    if (clip.type !== "action" || !/^person_[1-9][0-9]*$/.test(clip.reference.person_id || "") || !String(clip.reference.person_description || "").trim()) {
+                        throw new Error(`片段 ${clip.id || "未命名"} 的参考视频人物解释无效`);
+                    }
+                }
+                requireAsset(clip.cached_result?.asset, "video", `片段 ${clip.id || "未命名"} 的缓存结果`);
+            }
+            if (track.type === "system" && clipKinds.size > 1) throw new Error("同一系统轨道不能混合镜头、灯光和音频片段");
+        }
+        return { project, assets };
+    }
+
+    async importProjectFile(event) {
+        const input = event.currentTarget;
+        const file = input.files?.[0];
+        input.value = "";
+        if (!file) return;
+        try {
+            const timeline = this.currentTimeline();
+            if (!timeline) throw new Error("请先创建或选择一个要覆盖的总时间轴");
+            if (!await this.confirmDelete(`用“${file.name}”覆盖当前项目“${timeline.title || `总时间轴 #${timeline.id}`}”？总时间轴节点及其全部下游生成连线会保留，现有卡片、轨道和片段会被替换。`, "确认覆盖", "覆盖")) return;
+            const bytes = new Uint8Array(await file.arrayBuffer());
+            const isZip = bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04;
+            const project = isZip ? await this.unpackProject(bytes.buffer) : JSON.parse(new TextDecoder().decode(bytes));
+            this.importProject(project);
+        } catch (error) {
+            this.setStatus(`项目导入失败：${error?.message || error}`);
+        }
+    }
+
+    async unpackProject(buffer) {
+        const entries = unzipProjectEntries(buffer);
+        const manifest = entries.get("project.json");
+        if (!manifest) throw new Error("项目包缺少 project.json");
+        const project = JSON.parse(new TextDecoder().decode(manifest));
+        if (!Array.isArray(project.assets)) throw new Error("项目包资源清单无效");
+        const projectId = String(project.project?.id || "imported").replace(/[^a-zA-Z0-9_-]/g, "_");
+        for (const asset of project.assets) {
+            const data = entries.get(projectAssetPath(asset.path));
+            if (!data) throw new Error(`项目包缺少资源文件：${asset.path}`);
+            const originalName = asset.path.split("/").pop();
+            const file = new File([data], originalName, { type: asset.kind === "image" ? "image/*" : "video/mp4" });
+            const body = new FormData();
+            body.append("image", file, originalName);
+            body.append("type", "input");
+            body.append("subfolder", `minimax_h3/projects/${projectId}`);
+            const response = await api.fetchApi("/upload/image", { method: "POST", body });
+            if (!response.ok) throw new Error(`恢复资源失败（HTTP ${response.status}）：${originalName}`);
+            const uploaded = await response.json();
+            asset.path = uploaded.subfolder ? `${uploaded.subfolder}/${uploaded.name || uploaded.filename}` : uploaded.name || uploaded.filename;
+        }
+        return project;
+    }
+
+    importProject(rawProject) {
+        const { project, assets } = this.validateProject(rawProject);
+        const timeline = this.currentTimeline();
+        if (!timeline) throw new Error("请先创建或选择一个要覆盖的总时间轴");
+        const created = [];
+        const anchor = timeline.pos;
+        const inputNames = ["character_group", "style_card", "environment", "tracks"];
+        const oldRoots = new Map(inputNames.map((name) => [name, linkedNode(timeline, name)]));
+        const oldUpstream = upstreamGraphNodes(timeline);
+        const oldState = {
+            title: timeline.title,
+            properties: structuredClone(timeline.properties || {}),
+            duration: widgetValue(timeline, "duration_seconds", 5),
+            language: widgetValue(timeline, "prompt_language", "英文"),
+        };
+        let swapped = false;
+        this.pendingCreatedNodes = created;
+        app.graph.beforeChange?.();
+        try {
+            const mediaNodes = new Map();
+            const mediaNode = (assetId) => {
+                if (!assetId) return null;
+                if (mediaNodes.has(assetId)) return mediaNodes.get(assetId);
+                const asset = assets.get(assetId);
+                const loader = this.createNode(asset.kind === "image" ? TYPES.loadImage : TYPES.loadVideo, [anchor[0] - 2000, anchor[1]],
+                    asset.kind === "image" ? {} : { file: asset.path });
+                loader.properties ||= {};
+                loader.properties.minimax_h3_managed_media = true;
+                if (asset.kind === "image") setImageLoaderValue(loader, asset.path);
+                mediaNodes.set(assetId, loader);
+                return loader;
+            };
+            const referenceNodes = new Map();
+            const referenceNode = (binding) => {
+                const start = Number(binding.trim_start) || 0;
+                const end = Number(binding.trim_end) || 0;
+                const key = `${binding.asset}\u0000${start}\u0000${end}`;
+                if (referenceNodes.has(key)) return { key, node: referenceNodes.get(key) };
+                const loader = mediaNode(binding.asset);
+                const reference = this.createNode(TYPES.motionReference, [anchor[0] - 1400, anchor[1]], {
+                    trim_start: start,
+                    trim_end: end,
+                });
+                if (!connectNodes(loader, loader.outputs?.[0]?.name, reference, "video")) throw new Error("无法连接片段参考视频");
+                referenceNodes.set(key, reference);
+                return { key, node: reference };
+            };
+            const personReferenceNodes = new Map();
+            const group = this.createNode(TYPES.characterGroup, [anchor[0] - 700, anchor[1]]);
+            const actorNodes = new Map();
+            for (const [actorIndex, actorData] of project.characters.entries()) {
+                const card = this.createNode(TYPES.character, [anchor[0] - 1600, anchor[1]], actorData.card || {});
+                const actor = this.createNode(TYPES.actor, [anchor[0] - 1200, anchor[1]], {
+                    ...(actorData.instance || {}),
+                    actor_id: actorData.instance?.actor_id || (/^actor_[1-9][0-9]*$/.test(actorData.id) ? actorData.id : `actor_${actorIndex + 1}`),
+                });
+                const image = mediaNode(actorData.reference_asset);
+                if (image && !connectNodes(image, image.outputs?.[0]?.name, card, "reference_image")) throw new Error("无法连接人物参考图");
+                if (!connectNodes(card, "character_card", actor, "character_card") || !this.connectAutogrow(actor, "actor_instance", group, "actor")) throw new Error("无法连接人物数据");
+                actorNodes.set(actorData.id, actor);
+            }
+            const style = this.createNode(TYPES.visual, [anchor[0] - 1600, anchor[1]], project.style.card || {});
+            const styleImage = mediaNode(project.style.reference_asset);
+            if (styleImage && !connectNodes(styleImage, styleImage.outputs?.[0]?.name, style, "reference_image")) throw new Error("无法连接风格参考图");
+            const environmentCard = this.createNode(TYPES.environment, [anchor[0] - 1600, anchor[1]], project.environment.card || {});
+            const environment = this.createNode(TYPES.environmentInstance, [anchor[0] - 1200, anchor[1]], project.environment.instance || {});
+            const environmentImage = mediaNode(project.environment.reference_asset);
+            if (environmentImage && !connectNodes(environmentImage, environmentImage.outputs?.[0]?.name, environmentCard, "reference_image")) throw new Error("无法连接环境参考图");
+            if (!connectNodes(environmentCard, "environment_card", environment, "environment_card")) throw new Error("无法连接环境数据");
+            const trackList = this.createNode(TYPES.trackList, [anchor[0] - 400, anchor[1]]);
+            for (const trackData of project.tracks) {
+                const trackType = trackData.type === "actor" ? TYPES.actorTrack : trackData.type === "environment" ? TYPES.environmentTrack : TYPES.systemTrack;
+                const track = this.createNode(trackType, [anchor[0] - 800, anchor[1]]);
+                if (trackData.type === "actor" && !connectNodes(actorNodes.get(trackData.owner), "actor_instance", track, "actor")) throw new Error("无法连接人物轨道");
+                if (trackData.type === "environment" && !connectNodes(environment, "environment_instance", track, "environment")) throw new Error("无法连接环境轨道");
+                for (const clipData of trackData.clips) {
+                    const clipType = PROJECT_CLIP_TYPES[clipData.type];
+                    const clip = this.createNode(clipType, [anchor[0] - 1100, anchor[1]], clipData.fields || {});
+                    if (clipData.type === "action") {
+                        const actionType = clipData.fields?.action_type || "body";
+                        if (widgetValue(clip, "action_type", "") !== actionType) setWidgetValue(clip, "action_type", actionType);
+                        if (widgetValue(clip, "action_type", "") !== actionType) throw new Error(`无法设置人物动作种类 ${actionType}`);
+                    }
+                    if (clipData.target && !connectNodes(actorNodes.get(clipData.target), "actor_instance", clip, "target")) throw new Error("无法连接片段目标人物");
+                    if (clipData.language) {
+                        const language = this.createNode(TYPES.language, [anchor[0] - 1400, anchor[1]], clipData.language);
+                        if (!connectNodes(language, "language", clip, "language")) throw new Error("无法连接对话语言");
+                    }
+                    const config = REFERENCE_SLOTS[clipType];
+                    if (clipData.reference && config) {
+                        const split = referenceNode(clipData.reference);
+                        const reference = split.node;
+                        let semanticNode = reference;
+                        let semanticOutput = config.output;
+                        if (clipData.type === "action" && clipData.reference.person_description) {
+                            const personKey = `${split.key}\u0000${clipData.reference.person_id}\u0000${clipData.reference.person_description}`;
+                            semanticNode = personReferenceNodes.get(personKey);
+                            if (!semanticNode) {
+                                semanticNode = this.createNode(TYPES.videoPerson, [anchor[0] - 1200, anchor[1]], {
+                                    person_id: clipData.reference.person_id,
+                                    person_description: clipData.reference.person_description,
+                                });
+                                if (!connectNodes(reference, reference.outputs?.[0]?.name, semanticNode, "motion_reference")) throw new Error("无法连接参考视频人物解释");
+                                personReferenceNodes.set(personKey, semanticNode);
+                            }
+                            semanticOutput = 0;
+                        }
+                        if (!connectNodes(semanticNode, semanticNode.outputs?.[semanticOutput]?.name, clip, config.input)) throw new Error("无法连接片段参考视频语义");
+                    }
+                    let trackSource = clip;
+                    if (clipData.cached_result && clipData.type === "action") {
+                        const loader = mediaNode(clipData.cached_result.asset);
+                        const result = this.createNode(TYPES.actionResult, [anchor[0] - 900, anchor[1]], { result_version: Number(clipData.cached_result.version) || 0 });
+                        if (!connectNodes(clip, "clip", result, "clip") || !connectNodes(loader, loader.outputs?.[0]?.name, result, "video")) throw new Error("无法连接动作缓存结果");
+                        trackSource = result;
+                    }
+                    if (!this.connectAutogrow(trackSource, "clip", track, "clip")) throw new Error("轨道没有可用片段插槽");
+                }
+                if (!this.connectAutogrow(track, "track", trackList, "track")) throw new Error("轨道数组没有可用插槽");
+            }
+            swapped = true;
+            for (const name of inputNames) {
+                const index = slotIndex(timeline, name);
+                if (index >= 0 && timeline.inputs[index].link != null) timeline.disconnectInput(index);
+            }
+            if (!connectNodes(group, "character_group", timeline, "character_group") || !connectNodes(style, "style_card", timeline, "style_card") ||
+                !connectNodes(environment, "environment_instance", timeline, "environment") || !connectNodes(trackList, "tracks", timeline, "tracks")) throw new Error("无法替换总时间轴基础数据");
+            setWidgetValue(timeline, "duration_seconds", Number(project.project.duration_seconds));
+            setWidgetValue(timeline, "prompt_language", project.project.prompt_language === "中文" ? "中文" : "英文");
+            timeline.title = String(project.project.name || "MiniMax H3 项目");
+            timeline.properties ||= {};
+            timeline.properties.minimax_h3_project = {
+                id: String(project.project.id || crypto.randomUUID()),
+                extensions: structuredClone(project.extensions || {}),
+            };
+            const removed = abandonedUpstreamNodes(oldUpstream);
+            for (const node of removed.reverse()) app.graph.remove(node);
+            this.layoutProjectNodes(false);
+            app.graph.afterChange?.();
+            app.graph.setDirtyCanvas(true, true);
+            this.markWorkflowChanged();
+            this.selection = null;
+            this.render();
+            this.setStatus(`已用“${timeline.title}”覆盖当前时间轴：创建 ${created.length} 个节点，移除 ${removed.length} 个旧节点，下游生成连线保持不变`);
+        } catch (error) {
+            if (swapped) {
+                for (const name of inputNames) {
+                    const index = slotIndex(timeline, name);
+                    if (index >= 0 && timeline.inputs[index].link != null) timeline.disconnectInput(index);
+                    const oldRoot = oldRoots.get(name);
+                    if (oldRoot) connectNodes(oldRoot, oldRoot.outputs?.[0]?.name, timeline, name);
+                }
+                setWidgetValue(timeline, "duration_seconds", oldState.duration);
+                setWidgetValue(timeline, "prompt_language", oldState.language);
+                timeline.title = oldState.title;
+                timeline.properties = oldState.properties;
+            }
+            for (const node of created.reverse()) app.graph.remove(node);
+            app.graph.afterChange?.();
+            throw error;
+        } finally {
+            this.pendingCreatedNodes = null;
+        }
     }
 
     markWorkflowChanged() {
@@ -500,6 +1549,8 @@ class H3TimelineEditor {
         if (this.data) this.playhead = Math.min(this.playhead, this.data.duration);
         $("[data-role=duration]", this.root).value = this.data?.duration ?? "";
         $("[data-role=duration]", this.root).disabled = !this.data;
+        $("[data-role=prompt-language]", this.root).value = this.data?.promptLanguage || "英文";
+        $("[data-role=prompt-language]", this.root).disabled = !this.data;
         this.renderLibrary();
         this.renderTracks();
         this.renderInspector();
@@ -522,23 +1573,16 @@ class H3TimelineEditor {
     }
 
     renderLibrary() {
-        const host = $("[data-role=library]", this.root);
-        this.root.querySelectorAll("[data-library-tab]").forEach((button) => button.classList.toggle("is-active", button.dataset.libraryTab === this.libraryTab));
-        if (this.libraryTab === "media") {
-            this.renderReferenceAssets(host);
-            return;
-        }
-        if (this.libraryTab === "resources") {
-            this.renderResourceLibrary(host);
-            return;
-        }
+        const host = $("[data-role=library-scene]", this.root);
+        this.renderResourceLibrary($("[data-role=library-resources]", this.root));
+        this.renderReferenceAssets($("[data-role=library-media]", this.root));
         if (!this.data) {
             host.innerHTML = `<div class="h3te-empty">工作流中没有 MiniMax H3 总时间轴节点。</div>`;
             return;
         }
         const items = this.sceneItems();
         host.innerHTML = items.length ? items.map((item, index) => `
-            <button class="h3te-resource ${item.color}" data-resource="${index}"><span>${escapeHtml(item.type)}</span><strong>${escapeHtml(item.title)}</strong></button>`).join("") : `<div class="h3te-empty">总时间轴尚未连接场景资源。</div>`;
+            <div class="h3te-scene-resource"><button class="h3te-resource ${item.color}" data-resource="${index}"><span>${escapeHtml(item.type)}</span><strong>${escapeHtml(item.title)}</strong></button><button class="h3te-delete-resource" data-delete-scene-node="${item.node.id}" title="删除${escapeAttribute(item.type)}">×</button></div>`).join("") : `<div class="h3te-empty">总时间轴尚未连接场景资源。</div>`;
         this.resources = items;
     }
 
@@ -565,7 +1609,7 @@ class H3TimelineEditor {
         } catch (error) {
             this.referenceAssets = { error: String(error?.message || error) };
         }
-        if (this.libraryTab === "media") this.renderLibrary();
+        this.renderReferenceAssets($("[data-role=library-media]", this.root));
     }
 
     referenceAssetPath(asset) {
@@ -584,12 +1628,79 @@ class H3TimelineEditor {
             return;
         }
         const canAttach = this.selection?.kind === "clip" && REFERENCE_SLOTS[nodeType(this.selection.node)];
+        const actionSelection = canAttach && nodeType(this.selection.node) === TYPES.action;
         host.innerHTML = `${toolbar}<div class="h3te-resource-count">${this.referenceAssets.length} 个已预处理资产 · 统一为 24 FPS</div>${this.referenceAssets.length ? this.referenceAssets.map((asset) => `
             <article class="h3te-library-card media">
                 <video class="h3te-video-preview" controls preload="metadata" src="${escapeAttribute(this.referenceVideoUrl(this.referenceAssetPath(asset)))}"></video>
-                <div><span>参考视频资产</span><strong>${escapeHtml(asset.display_name)}</strong><small>${Number(asset.duration).toFixed(2)} 秒 · ${asset.width}×${asset.height} · ${asset.preprocess?.fps || 24} FPS</small></div>
-                <div class="h3te-library-actions">${canAttach ? `<button data-use-reference-asset="${asset.id}">用于当前片段</button>` : ""}<button data-instantiate-reference-asset="${asset.id}">创建四路输出</button><button class="danger" data-delete-reference-asset="${asset.id}">移出资产库</button></div>
+                <div><span>参考视频资产</span><strong>${escapeHtml(asset.display_name)}</strong><small>${Number(asset.duration).toFixed(2)} 秒 · ${asset.width}×${asset.height} · ${asset.preprocess?.fps || 24} FPS · ${(asset.people || []).length} 个人物声明</small>${asset.description ? `<small>${escapeHtml(asset.description)}</small>` : ""}</div>
+                <div class="h3te-library-actions">
+                    ${canAttach && !actionSelection ? `<button data-use-reference-asset="${asset.id}">用于当前片段</button>` : ""}
+                    ${actionSelection ? ((asset.people || []).length ? (asset.people || []).map((person) => `<button data-use-reference-person="${asset.id}:${person.id}">${escapeHtml(person.id)} → 当前人物</button>`).join("") : `<button disabled>请先声明源人物</button>`) : ""}
+                    <button data-edit-reference-asset="${asset.id}">属性</button>
+                    <button data-instantiate-reference-asset="${asset.id}">创建四路输出</button>
+                    <button class="danger" data-delete-reference-asset="${asset.id}">移出资产库</button>
+                </div>
             </article>`).join("") : `<div class="h3te-empty">尚未导入参考视频。导入时会完成截取、24 FPS 重采样和音频标准化封装。</div>`}`;
+    }
+
+    editReferenceAsset(assetId) {
+        const asset = Array.isArray(this.referenceAssets) ? this.referenceAssets.find((item) => item.id === assetId) : null;
+        if (!asset) return;
+        this.selection = { kind: "video_asset", asset: structuredClone(asset), title: asset.display_name };
+        this.renderInspector();
+    }
+
+    referenceAssetForm(asset) {
+        return `<section class="h3te-form-section">
+            <div class="h3te-form-title"><div><small>MiniMax H3 Reference Asset</small><strong>${escapeHtml(asset.display_name)}</strong></div></div>
+            <video class="h3te-video-preview" controls preload="metadata" src="${escapeAttribute(this.referenceVideoUrl(this.referenceAssetPath(asset)))}"></video>
+            <label class="h3te-field"><span>资产名称</span><input type="text" value="${escapeAttribute(asset.display_name)}" data-reference-asset-field="display_name"></label>
+            <label class="h3te-field"><span>视频内容说明</span><textarea rows="4" data-reference-asset-field="description">${escapeHtml(asset.description || "")}</textarea></label>
+            <div class="h3te-form-title"><div><small>按画面中的稳定特征区分人物</small><strong>源视频人物声明</strong></div><button data-add-reference-person>＋人物</button></div>
+            ${(asset.people || []).map((person, index) => `<div class="h3te-reference-person-row">
+                <label class="h3te-field"><span>人物编号</span><input type="text" value="${escapeAttribute(person.id)}" data-reference-person-field="id" data-reference-person-index="${index}"></label>
+                <label class="h3te-field"><span>识别描述</span><textarea rows="3" data-reference-person-field="description" data-reference-person-index="${index}">${escapeHtml(person.description)}</textarea></label>
+                <button class="danger" data-remove-reference-person="${index}">删除人物声明</button>
+            </div>`).join("") || `<div class="h3te-empty">尚未声明人物。多人视频应为每位表演者添加稳定、可见、互不混淆的识别描述。</div>`}
+            <button class="primary" data-save-reference-asset="${asset.id}">保存视频资产属性</button>
+        </section>`;
+    }
+
+    addReferencePerson() {
+        const asset = this.selection?.kind === "video_asset" ? this.selection.asset : null;
+        if (!asset) return;
+        asset.people ||= [];
+        const used = new Set(asset.people.map((person) => person.id));
+        let index = 1;
+        while (used.has(`person_${index}`)) index++;
+        asset.people.push({ id: `person_${index}`, description: "" });
+        this.renderInspector();
+    }
+
+    removeReferencePerson(index) {
+        const asset = this.selection?.kind === "video_asset" ? this.selection.asset : null;
+        if (!asset?.people?.[index]) return;
+        asset.people.splice(index, 1);
+        this.renderInspector();
+    }
+
+    async saveReferenceAsset(assetId) {
+        const asset = this.selection?.kind === "video_asset" && this.selection.asset.id === assetId ? this.selection.asset : null;
+        if (!asset) return;
+        try {
+            const response = await api.fetchApi(`/minimax-h3/reference-assets/${encodeURIComponent(assetId)}`, {
+                method: "PUT", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ display_name: asset.display_name, description: asset.description, people: asset.people }),
+            });
+            const result = await response.json();
+            if (!response.ok || !result.success) throw new Error(result.error || "保存参考视频属性失败");
+            this.selection.asset = structuredClone(result.asset);
+            await this.loadReferenceAssets();
+            this.renderInspector();
+            this.setStatus("参考视频内容与人物声明已保存");
+        } catch (error) {
+            this.setStatus(`保存失败：${error?.message || error}`);
+        }
     }
 
     renderReferenceAssetModal() {
@@ -607,7 +1718,7 @@ class H3TimelineEditor {
                 <label class="h3te-field"><span>视频文件</span><input name="video" type="file" accept="video/*" required></label>
                 <label class="h3te-field"><span>截取开始（秒）</span><input name="trim_start" type="number" min="0" step="0.01" value="0"></label>
                 <label class="h3te-field"><span>截取结束（秒，0 为原片结尾）</span><input name="trim_end" type="number" min="0" step="0.01" value="0"></label>
-                <small>导入时会生成独立 MP4 资产，按 24 FPS 预处理并保留原宽高比；单个资产最长 15 秒。</small>
+                <small>导入时会生成独立 MP4 资产，按 24 FPS 预处理并保留原宽高比。长视频可导入一次，再由不同轨道片段分别截取使用。</small>
                 <div class="h3te-form-error" data-role="reference-asset-error"></div>
             </div>
             <div class="h3te-modal-actions"><button type="button" data-action="close-reference-asset-modal">取消</button><button class="primary" type="submit">导入并预处理</button></div>
@@ -642,11 +1753,16 @@ class H3TimelineEditor {
         }
     }
 
-    instantiateReferenceAsset(assetId, attachToSelection = false) {
+    instantiateReferenceAsset(assetId, attachToSelection = false, personId = null) {
         const asset = Array.isArray(this.referenceAssets) ? this.referenceAssets.find((item) => item.id === assetId) : null;
         const clip = attachToSelection && this.selection?.kind === "clip" ? this.selection.node : null;
         const config = clip ? REFERENCE_SLOTS[nodeType(clip)] : null;
         if (!asset || (attachToSelection && !config)) return;
+        const person = personId ? (asset.people || []).find((item) => item.id === personId) : null;
+        if (clip && nodeType(clip) === TYPES.action && !person) {
+            this.setStatus("人物动作参考必须先选择视频资产中声明的源人物");
+            return;
+        }
         const timeline = this.currentTimeline();
         const base = clip?.pos || timeline?.pos || app.canvas.graph_mouse || [700, 300];
         const standaloneOffset = clip ? 0 : this.createdOffset++ * 170;
@@ -655,23 +1771,47 @@ class H3TimelineEditor {
         this.pendingCreatedNodes = created;
         app.graph.beforeChange?.();
         try {
-            const loader = this.createNode(TYPES.loadVideo, [anchor[0] - 620, anchor[1]], { file: this.referenceAssetPath(asset) });
-            const reference = this.createNode(TYPES.motionReference, [anchor[0] - 310, anchor[1]], { trim_start: 0, trim_end: 0 });
+            const previousReference = clip ? linkedNode(clip, config.input) : null;
+            const previousSplit = nodeType(previousReference) === TYPES.videoPerson ? linkedNode(previousReference, "motion_reference") : previousReference;
+            const previousLoader = previousSplit ? linkedNode(previousSplit, "video") : null;
+            const loader = this.createNode(TYPES.loadVideo, [anchor[0] - 760, anchor[1]], { file: this.referenceAssetPath(asset) });
+            const clipDuration = clip ? Math.max(0.05, Number(widgetValue(clip, "end_time", 1)) - Number(widgetValue(clip, "start_time", 0))) : 0;
+            const reference = this.createNode(TYPES.motionReference, [anchor[0] - 460, anchor[1]], {
+                trim_start: 0, trim_end: clip ? Math.min(Number(asset.duration) || clipDuration, clipDuration) : 0,
+            });
             if (!connectNodes(loader, loader.outputs?.[0]?.name, reference, "video")) throw new Error("无法连接参考视频资产");
+            let semanticNode = reference;
+            if (person) {
+                semanticNode = this.createNode(TYPES.videoPerson, [anchor[0] - 220, anchor[1]], {
+                    person_id: person.id, person_description: person.description,
+                });
+                if (!connectNodes(reference, reference.outputs?.[0]?.name, semanticNode, "motion_reference")) throw new Error("无法连接参考视频人物解释");
+            }
             if (clip) {
                 const input = slotIndex(clip, config.input);
-                if (input < 0 || !reference.outputs?.[config.output]) throw new Error("当前片段不支持该参考语义");
-                reference.connect(config.output, clip, input);
+                const output = person ? 0 : config.output;
+                if (input < 0 || !semanticNode.outputs?.[output]) throw new Error("当前片段不支持该参考语义");
+                semanticNode.connect(output, clip, input);
             }
             loader.properties ||= {};
             reference.properties ||= {};
             loader.properties.minimax_h3_reference_asset = asset.id;
             reference.properties.minimax_h3_reference_asset = asset.id;
+            if (person) {
+                semanticNode.properties ||= {};
+                semanticNode.properties.minimax_h3_reference_asset = asset.id;
+                semanticNode.properties.minimax_h3_reference_person = person.id;
+            }
+            if (clip) {
+                if (isManagedMediaNode(previousReference) && outputTargets(previousReference).length === 0) app.graph.remove(previousReference);
+                if (previousSplit !== previousReference && isManagedMediaNode(previousSplit) && outputTargets(previousSplit).length === 0) app.graph.remove(previousSplit);
+                if (isManagedMediaNode(previousLoader) && outputTargets(previousLoader).length === 0) app.graph.remove(previousLoader);
+            }
             if (timeline) this.layoutProjectNodes(false);
             app.graph.afterChange?.();
             this.markWorkflowChanged();
             this.render();
-            this.setStatus(clip ? `${asset.display_name} 已连接到当前片段` : `${asset.display_name} 已创建四路语义输出节点`);
+            this.setStatus(clip ? `${asset.display_name}${person ? ` 的 ${person.id}` : ""} 已连接到当前片段` : `${asset.display_name} 已创建四路语义输出节点`);
         } catch (error) {
             for (const node of created.reverse()) app.graph.remove(node);
             app.graph.afterChange?.();
@@ -683,7 +1823,7 @@ class H3TimelineEditor {
 
     async deleteReferenceAsset(assetId) {
         const asset = Array.isArray(this.referenceAssets) ? this.referenceAssets.find((item) => item.id === assetId) : null;
-        if (!asset || !confirm(`将“${asset.display_name}”移出资产库？已创建的工作流节点和媒体文件会保留。`)) return;
+        if (!asset || !await this.confirmDelete(`将“${asset.display_name}”移出资产库？已创建的工作流节点和媒体文件会保留。`)) return;
         const response = await api.fetchApi(`/minimax-h3/reference-assets/${encodeURIComponent(assetId)}`, { method: "DELETE" });
         const result = await response.json();
         if (!response.ok || !result.success) {
@@ -761,6 +1901,7 @@ class H3TimelineEditor {
     imageReferenceFromCard(card) {
         const source = linkedNode(card, "reference_image");
         const value = String(widgetValue(source, "image", "")).replaceAll("\\", "/").replace(/\s+\[(?:input|output|temp)\]$/, "");
+        if (nodeType(source) === TYPES.loadImage && value) addWidgetOption(source, "image", value);
         const parts = value.split("/").filter(Boolean);
         const filename = parts.pop();
         if (!filename || parts.includes("..") || filename === ".." || value.includes(":")) return null;
@@ -789,14 +1930,218 @@ class H3TimelineEditor {
     characterCardPicker(card) {
         const resources = Array.isArray(this.library?.characters) ? this.library.characters : [];
         const currentId = card.properties?.minimax_h3_resource?.resource_kind === "characters" ? card.properties.minimax_h3_resource.resource_id : "";
+        const animaTypes = globalThis.LiteGraph?.registered_node_types || {};
+        const hasAnimaLibrary = Boolean(animaTypes.AnimaCharacterTagSelector || animaTypes.AnimaCharacterTagSelectorPlus);
         return `<div class="h3te-card-picker">
             <label class="h3te-field"><span>选择已有人物卡</span><select data-character-card-select="${card.id}" ${resources.length ? "" : "disabled"}>
                 <option value="">${resources.length ? "请选择资源库人物卡" : "人物卡资源库为空"}</option>
                 ${resources.map((resource) => `<option value="${escapeAttribute(resource.id)}" ${resource.id === currentId ? "selected" : ""}>${escapeHtml(resource.display_name)}</option>`).join("")}
             </select></label>
             <button data-apply-character-card="${card.id}" ${resources.length ? "" : "disabled"}>应用到当前人物卡</button>
+            <button data-select-anima-character="${card.id}" ${hasAnimaLibrary ? "" : "disabled"}>从 Anima 角色库选择</button>
             <small>只替换固定外观、人物风格和参考图；人物实例状态与动作轨道保持不变。</small>
+            ${hasAnimaLibrary ? "<small>Anima 角色将转换为固定外观描述，不会写入动作或人物实例状态。</small>" : "<small>未检测到 Comfyui-Anima-Tools，安装并刷新前端后可使用其人物库。</small>"}
         </div>`;
+    }
+
+    cardImagePicker(card) {
+        const labels = { [TYPES.character]: "人物", [TYPES.environment]: "环境", [TYPES.visual]: "风格" };
+        const label = labels[nodeType(card)];
+        if (!label) return "";
+        const reference = this.imageReferenceFromCard(card);
+        const path = reference ? (reference.subfolder ? `${reference.subfolder}/${reference.filename}` : reference.filename) : "";
+        const preview = reference ? `<img class="h3te-image-preview" src="${escapeAttribute(this.referenceImageUrl(reference))}" alt="人物参考图预览">` : "";
+        return `<div class="h3te-card-picker">
+            ${preview}
+            <label class="h3te-field"><span>参考图片</span><input type="file" accept="image/*" data-card-image-file="${card.id}"></label>
+            <button data-attach-card-image="${card.id}">${reference ? `替换${label}参考图片` : `上传并连接${label}参考图片`}</button>
+            <small>${path ? `当前：${escapeHtml(path)}` : "尚未连接参考图片；上传后会自动创建原生加载图像节点。"}</small>
+        </div>`;
+    }
+
+    async attachCardImage(cardId) {
+        const card = app.graph.getNodeById(Number(cardId));
+        const input = $(`[data-card-image-file="${cardId}"]`, this.root);
+        const file = input?.files?.[0];
+        if (!card || ![TYPES.character, TYPES.environment, TYPES.visual].includes(nodeType(card)) || !file) {
+            this.setStatus("请先选择一张参考图片");
+            return;
+        }
+        this.setStatus("正在上传并连接参考图片…");
+        try {
+            const reference = await this.uploadResourceImage(file);
+            const path = reference.subfolder ? `${reference.subfolder}/${reference.filename}` : reference.filename;
+            const created = [];
+            this.pendingCreatedNodes = created;
+            app.graph.beforeChange?.();
+            try {
+                const loader = linkedNode(card, "reference_image");
+                if (nodeType(loader) === TYPES.loadImage) {
+                    setImageLoaderValue(loader, path);
+                } else {
+                    this.addReferenceImage({ reference_image: reference }, card, [card.pos[0] - 300, card.pos[1]]);
+                }
+                this.layoutProjectNodes(false);
+                app.graph.afterChange?.();
+                this.markWorkflowChanged();
+                this.data = collectTimeline(this.currentTimeline());
+                this.renderInspector();
+                this.setStatus("参考图片已上传并连接到当前卡片");
+            } catch (error) {
+                for (const node of created.reverse()) app.graph.remove(node);
+                app.graph.afterChange?.();
+                throw error;
+            } finally {
+                this.pendingCreatedNodes = null;
+            }
+        } catch (error) {
+            this.setStatus(`参考图片处理失败：${error?.message || error}`);
+        }
+    }
+
+    animaCharacterFromPrompt(prompt) {
+        const value = String(prompt || "").trim().toLowerCase();
+        const official = window.characterOfficialData || {};
+        return (window.characterData || []).map((item) => {
+            const key = `${item.name || ""}||${item.copyright || ""}`.toLowerCase();
+            const data = official[key] || {};
+            const trigger = String(data.trigger || (item.copyright ? `${item.name}, ${item.copyright}` : item.name) || "").trim();
+            return { item, data, trigger };
+        }).filter(({ trigger }) => trigger && (value === trigger.toLowerCase() || value.startsWith(`${trigger.toLowerCase()},`)))
+            .sort((a, b) => b.trigger.length - a.trigger.length)[0] || null;
+    }
+
+    animaCharacterDescription(item, official) {
+        const readable = (value) => String(value || "").replaceAll("_", " ").replace(/\s+/g, " ").trim();
+        const name = readable(item.name);
+        const copyright = readable(item.copyright);
+        const fallback = [item.gender, item.hair ? `${item.hair} hair` : "", item.eye ? `${item.eye} eyes` : ""].filter(Boolean);
+        const traits = (Array.isArray(official.tags) ? official.tags : fallback).map(readable).filter(Boolean).slice(0, 16);
+        const source = copyright ? `${name} from ${copyright}` : name;
+        return traits.length ? `${source}. Fixed visual appearance: ${traits.join(", ")}.` : `${source}. Preserve the character's fixed visual appearance.`;
+    }
+
+    async importAnimaCharacterImage(name, copyright) {
+        const response = await api.fetchApi("/minimax-h3/anima-character-image", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name, copyright }),
+        });
+        const result = await response.json();
+        if (!response.ok || !result.success) throw new Error(result.error || "Anima 人物参考图导入失败");
+        return result;
+    }
+
+    async selectAnimaCharacter(cardId) {
+        const card = app.graph.getNodeById(Number(cardId));
+        const animaTypes = globalThis.LiteGraph?.registered_node_types || {};
+        const selectorType = animaTypes.AnimaCharacterTagSelector ? "AnimaCharacterTagSelector" : animaTypes.AnimaCharacterTagSelectorPlus ? "AnimaCharacterTagSelectorPlus" : "";
+        if (!card || nodeType(card) !== TYPES.character || !selectorType) {
+            this.setStatus("未检测到 Comfyui-Anima-Tools 人物选择库");
+            return;
+        }
+        const selector = globalThis.LiteGraph.createNode(selectorType);
+        const tags = widget(selector, "character_tags");
+        const button = selector?.widgets?.find((item) => item.type === "button" && typeof item.callback === "function");
+        if (!tags || !button) {
+            this.setStatus("Anima 人物选择器未正确加载，请刷新 ComfyUI 前端");
+            return;
+        }
+
+        const selectedPrompt = await new Promise((resolve) => {
+            let finished = false;
+            let overlay = null;
+            let observer = null;
+            let waitForOverlay = null;
+            let loadTimeout = null;
+            const finish = (value) => {
+                if (finished) return;
+                finished = true;
+                clearInterval(waitForOverlay);
+                clearTimeout(loadTimeout);
+                observer?.disconnect();
+                resolve(value || "");
+            };
+            const originalCallback = tags.callback;
+            tags.callback = (value) => {
+                originalCallback?.(value);
+                finish(value);
+            };
+            waitForOverlay = setInterval(() => {
+                overlay = document.getElementById("anima-char-selector-overlay");
+                if (!overlay) return;
+                clearInterval(waitForOverlay);
+                clearTimeout(loadTimeout);
+                const editorZIndex = Number.parseInt(getComputedStyle(this.root).zIndex, 10) || 100000;
+                overlay.style.zIndex = String(editorZIndex + 2);
+                observer = new MutationObserver(() => {
+                    if (!document.body.contains(overlay)) finish(tags.value);
+                });
+                observer.observe(document.body, { childList: true });
+            }, 50);
+            loadTimeout = setTimeout(() => finish(""), 15000);
+            Promise.resolve(button.callback()).catch(() => finish(""));
+        });
+        if (!selectedPrompt) {
+            this.setStatus("已取消 Anima 人物选择");
+            return;
+        }
+        const selected = this.animaCharacterFromPrompt(selectedPrompt);
+        if (!selected) {
+            this.setStatus("无法识别 Anima 角色，请使用“应用触发词”或“应用触发词 + 标签”确认选择");
+            return;
+        }
+
+        this.setStatus(`正在导入“${selected.item.name}”的 Anima 参考图…`);
+        let importedImage = null;
+        let imageError = null;
+        try {
+            importedImage = await this.importAnimaCharacterImage(selected.item.name, selected.item.copyright || "");
+        } catch (error) {
+            imageError = error;
+        }
+
+        const created = [];
+        this.pendingCreatedNodes = created;
+        app.graph.beforeChange?.();
+        try {
+            setWidgetValue(card, "name", String(selected.item.name || "").replaceAll("_", " "));
+            setWidgetValue(card, "description", this.animaCharacterDescription(selected.item, selected.data));
+            if (importedImage?.reference_image) {
+                const reference = importedImage.reference_image;
+                const path = reference.subfolder ? `${reference.subfolder}/${reference.filename}` : reference.filename;
+                const loader = linkedNode(card, "reference_image");
+                if (nodeType(loader) === TYPES.loadImage) {
+                    setImageLoaderValue(loader, path);
+                } else {
+                    this.addReferenceImage({ reference_image: reference }, card, [card.pos[0] - 300, card.pos[1]]);
+                }
+            }
+            card.properties ||= {};
+            card.properties.minimax_h3_anima_character = {
+                name: selected.item.name,
+                copyright: selected.item.copyright || "",
+                trigger: selected.trigger,
+                source_url: importedImage?.source_url || "",
+                reference_image: importedImage?.reference_image || null,
+            };
+            delete card.properties.minimax_h3_resource;
+            this.layoutProjectNodes(false);
+            app.graph.afterChange?.();
+            this.markWorkflowChanged();
+            this.data = collectTimeline(this.currentTimeline());
+            this.renderLibrary();
+            this.renderInspector();
+            this.setStatus(imageError
+                ? `已载入“${selected.item.name}”的文字外观，但参考图导入失败：${imageError.message || imageError}`
+                : `已载入“${selected.item.name}”并将 Anima 图片连接为人物参考图`);
+        } catch (error) {
+            for (const node of created.reverse()) app.graph.remove(node);
+            app.graph.afterChange?.();
+            this.setStatus(`应用 Anima 人物失败：${error?.message || error}`);
+        } finally {
+            this.pendingCreatedNodes = null;
+        }
     }
 
     applyCharacterCard(cardId) {
@@ -811,11 +2156,15 @@ class H3TimelineEditor {
         this.pendingCreatedNodes = created;
         app.graph.beforeChange?.();
         try {
+            const previousLoader = linkedNode(card, "reference_image");
             if (resource.reference_image) {
-                this.addReferenceImage(resource, card, [card.pos[0] - 300, card.pos[1]]);
+                const path = resource.reference_image.subfolder ? `${resource.reference_image.subfolder}/${resource.reference_image.filename}` : resource.reference_image.filename;
+                if (nodeType(previousLoader) === TYPES.loadImage) setImageLoaderValue(previousLoader, path);
+                else this.addReferenceImage(resource, card, [card.pos[0] - 300, card.pos[1]]);
             } else {
                 const input = slotIndex(card, "reference_image");
                 if (input >= 0 && card.inputs[input].link != null) card.disconnectInput(input);
+                if (isManagedMediaNode(previousLoader) && outputTargets(previousLoader).length === 0) app.graph.remove(previousLoader);
             }
             for (const name of ["name", "description", "style_priority", "character_style"]) setWidgetValue(card, name, resource.card[name]);
             card.properties ||= {};
@@ -915,7 +2264,7 @@ class H3TimelineEditor {
 
     async deleteLibraryResource(kind, id) {
         const resource = this.findLibraryResource(kind, id);
-        if (!resource || !confirm(`删除资源“${resource.display_name}”？已实例化的工作流节点不会被删除。`)) return;
+        if (!resource || !await this.confirmDelete(`删除资源“${resource.display_name}”？已实例化的工作流节点不会被删除。`)) return;
         try {
             const next = structuredClone(this.library);
             next[kind] = next[kind].filter((item) => item.id !== id);
@@ -924,6 +2273,72 @@ class H3TimelineEditor {
         } catch (error) {
             this.setStatus(`删除失败：${error?.message || error}`);
         }
+    }
+
+    trackOwnedNodes(track) {
+        return [track?.node, ...(track?.clips || []).flatMap((clip) => [clip.resultNode, clip.node])].filter(Boolean);
+    }
+
+    deleteGraphNodes(nodes, message) {
+        const unique = [...new Map(nodes.filter(Boolean).map((node) => [node.id, node])).values()];
+        if (!unique.length) return;
+        app.graph.beforeChange?.();
+        try {
+            for (const node of unique.reverse()) app.graph.remove(node);
+            this.layoutProjectNodes(false);
+        } catch (error) {
+            this.setStatus(`删除失败：${error?.message || error}`);
+            return;
+        } finally {
+            app.graph.afterChange?.();
+        }
+        this.selection = null;
+        this.markWorkflowChanged();
+        this.data = collectTimeline(this.currentTimeline());
+        this.renderLibrary();
+        this.renderTracks();
+        this.renderInspector();
+        this.setStatus(message);
+    }
+
+    async cleanupUnusedNodes() {
+        const timeline = this.currentTimeline();
+        if (!timeline) {
+            this.setStatus("请先选择一个总时间轴，作为需要保留的当前工程");
+            return;
+        }
+        const nodes = unusedGraphNodes(timeline);
+        if (!nodes.length) {
+            this.setStatus("没有发现未使用的 MiniMax H3 工程或资源加载节点");
+            return;
+        }
+        if (!await this.confirmDelete(`删除 ${nodes.length} 个未被当前总时间轴使用的 MiniMax H3 工程或资源加载节点？模型、采样、解码、保存及其他第三方节点不在清理范围内。`)) return;
+        this.deleteGraphNodes(nodes, `已删除 ${nodes.length} 个未使用的 MiniMax H3 工程或资源加载节点`);
+    }
+
+    async deleteTrack(index) {
+        const track = this.data?.tracks?.[Number(index)];
+        if (!track || !await this.confirmDelete(`删除“${track.label}”及其 ${track.clips.length} 个片段？此操作不会删除共享的参考视频资产。`)) return;
+        this.deleteGraphNodes(this.trackOwnedNodes(track), `已删除轨道“${track.label}”及其片段`);
+    }
+
+    async deleteClip(nodeId) {
+        const clip = this.data?.tracks?.flatMap((track) => track.clips).find((item) => String(item.node.id) === String(nodeId));
+        if (!clip || !await this.confirmDelete(`删除${KIND_NAMES[clip.kind] || "当前"}片段？`)) return;
+        this.deleteGraphNodes([clip.resultNode, clip.node], "片段已删除");
+    }
+
+    async deleteSceneNode(nodeId) {
+        const resource = this.sceneItems().find((item) => String(item.node.id) === String(nodeId));
+        if (!resource) return;
+        const ownedTracks = this.data.tracks.filter((track) => track.owner === resource.node);
+        const nodes = [resource.node, resource.card, ...ownedTracks.flatMap((track) => this.trackOwnedNodes(track))].filter(Boolean);
+        const ids = new Set(nodes.map((node) => node.id));
+        const loader = resource.card ? linkedNode(resource.card, "reference_image") : linkedNode(resource.node, "reference_image");
+        if (nodeType(loader) === TYPES.loadImage && outputTargets(loader).every((targetId) => ids.has(targetId))) nodes.push(loader);
+        const trackText = ownedTracks.length ? `、${ownedTracks.length} 条专属轨道及其片段` : "";
+        if (!await this.confirmDelete(`删除${resource.type}“${resource.title}”${trackText}？共享参考视频资产不会被删除。`)) return;
+        this.deleteGraphNodes(nodes, `已从当前工程删除${resource.type}“${resource.title}”`);
     }
 
     createNode(type, position, values = {}, resource = null, kind = null) {
@@ -980,7 +2395,7 @@ class H3TimelineEditor {
             let actors = numberedInputs(group, ["actors", "actor"]);
             if (!actors.length) {
                 const card = this.createNode(TYPES.character, [tx - 900, ty - 160], { name: "人物 1", description: "", character_style: "" });
-                const actor = this.createNode(TYPES.actor, [tx - 600, ty - 160]);
+                const actor = this.createNode(TYPES.actor, [tx - 600, ty - 160], { actor_id: "actor_1" });
                 if (!connectNodes(card, "character_card", actor, "character_card") || !this.connectAutogrow(actor, "actor_instance", group, "actor")) throw new Error("无法创建并连接默认人物");
                 actors = [actor];
             }
@@ -1018,7 +2433,7 @@ class H3TimelineEditor {
         if (!timeline) return false;
         const data = collectTimeline(timeline);
         const [tx, ty] = timeline.pos;
-        const placed = new Set([timeline.id]);
+        const placed = new Set();
         let changed = false;
         const place = (node, x, y) => {
             if (!node || placed.has(node.id)) return;
@@ -1028,41 +2443,36 @@ class H3TimelineEditor {
                 changed = true;
             }
         };
+        const unique = (nodes) => [...new Map(nodes.filter(Boolean).map((node) => [node.id, node])).values()];
+        const placeColumn = (nodes, x, startY) => {
+            let y = startY;
+            unique(nodes).forEach((node) => {
+                place(node, x, y);
+                y += Math.max(150, Number(node.size?.[1]) + 55 || 150);
+            });
+        };
         if (record) app.graph.beforeChange?.();
-        place(data.style, tx - 300, ty - 500);
-        place(linkedNode(data.style, "reference_image"), tx - 600, ty - 500);
         const actors = data.characterGroup ? numberedInputs(data.characterGroup, ["actors", "actor"]) : [];
-        const actorTop = ty - 220;
-        actors.forEach((actor, index) => {
-            const y = actorTop + index * 190;
-            const card = findCardForActor(actor);
-            place(card, tx - 900, y);
-            place(linkedNode(card, "reference_image"), tx - 1200, y);
-            place(actor, tx - 600, y);
-        });
-        place(data.characterGroup, tx - 300, actorTop + Math.max(0, actors.length - 1) * 95);
-        const environmentY = actorTop + Math.max(1, actors.length) * 190 + 70;
+        const actorCards = actors.map(findCardForActor).filter(Boolean);
         const environmentCard = findCardForEnvironment(data.environment);
-        place(environmentCard, tx - 600, environmentY);
-        place(linkedNode(environmentCard, "reference_image"), tx - 900, environmentY);
-        place(data.environment, tx - 300, environmentY);
-        let trackY = environmentY + 260;
         const trackList = linkedNode(timeline, "tracks");
-        data.tracks.forEach((track) => {
-            const laneHeight = Math.max(210, track.clips.length * 150);
-            place(track.node, tx - 600, trackY);
-            track.clips.forEach((clip, index) => {
-                const y = trackY + index * 150;
-                place(clip.node, tx - 1050, y);
-                place(clip.resultNode, tx - 800, y);
+        const mediaNodes = [linkedNode(data.style, "reference_image"), ...actorCards.map((card) => linkedNode(card, "reference_image")), linkedNode(environmentCard, "reference_image")];
+        const clipNodes = [];
+        data.tracks.forEach((track) => track.clips.forEach((clip) => {
+                clipNodes.push(clip.node, clip.resultNode);
                 const config = REFERENCE_SLOTS[nodeType(clip.node)];
                 const reference = config ? linkedNode(clip.node, config.input) : null;
-                place(reference, tx - 1350, y);
-                place(linkedNode(reference, "video"), tx - 1650, y);
-            });
-            trackY += laneHeight;
-        });
-        place(trackList, tx - 300, environmentY + 260);
+                const split = nodeType(reference) === TYPES.videoPerson ? linkedNode(reference, "motion_reference") : reference;
+                mediaNodes.push(linkedNode(split, "video"), split, reference);
+            }));
+        const top = ty - 500;
+        const gap = 430;
+        placeColumn(mediaNodes, tx - gap * 5, top);
+        placeColumn([data.style, ...actorCards, environmentCard], tx - gap * 4, top);
+        placeColumn([data.characterGroup, ...actors, data.environment], tx - gap * 3, top);
+        placeColumn(clipNodes, tx - gap * 2, top);
+        placeColumn([...data.tracks.map((track) => track.node), trackList], tx - gap, top);
+        place(timeline, tx, ty);
         if (record) app.graph.afterChange?.();
         if (changed) {
             app.graph.setDirtyCanvas(true, true);
@@ -1078,8 +2488,10 @@ class H3TimelineEditor {
         loader.pos = position;
         app.graph.add(loader);
         this.pendingCreatedNodes?.push(loader);
+        loader.properties ||= {};
+        loader.properties.minimax_h3_managed_media = true;
         const path = resource.reference_image.subfolder ? `${resource.reference_image.subfolder}/${resource.reference_image.filename}` : resource.reference_image.filename;
-        setWidgetValue(loader, "image", path);
+        setImageLoaderValue(loader, path);
         if (!connectNodes(loader, loader.outputs?.[0]?.name || "IMAGE", card, "reference_image")) throw new Error("无法连接资源参考图");
         return loader;
     }
@@ -1098,7 +2510,10 @@ class H3TimelineEditor {
         try {
             if (kind === "characters") {
                 const card = this.createNode(TYPES.character, [x, y], resource.card, resource, kind);
-                const actor = this.createNode(TYPES.actor, [x + 330, y], resource.instance_defaults, resource, kind);
+                const actor = this.createNode(TYPES.actor, [x + 330, y], {
+                    ...resource.instance_defaults,
+                    actor_id: this.nextActorMacro(timeline),
+                }, resource, kind);
                 if (!connectNodes(card, "character_card", actor, "character_card")) throw new Error("无法连接人物卡和人物实例");
                 this.addReferenceImage(resource, card, [x - 300, y]);
                 if (timeline) {
@@ -1204,7 +2619,7 @@ class H3TimelineEditor {
         const values = { start_time: start, end_time: end };
         if (["body", "expression", "gaze"].includes(kind)) {
             values.action_type = kind;
-            values.content = kind === "body" ? "performs the planned action naturally" : kind === "expression" ? "changes expression naturally" : "shifts gaze naturally";
+            values.content = kind === "body" ? "{actor_1} performs the planned action naturally" : kind === "expression" ? "{actor_1} changes expression naturally" : "{actor_1} shifts gaze naturally";
         }
         return this.createNode(types[kind], position, values);
     }
@@ -1232,6 +2647,7 @@ class H3TimelineEditor {
                     if (["body", "expression", "gaze"].includes(kind)) {
                         const actor = this.timelineActors().find((item) => String(item.id) === form.elements.actor_id.value);
                         if (!actor) throw new Error("人物轨道必须选择时间轴人物组中的人物");
+                        setWidgetValue(clip, "content", String(widgetValue(clip, "content", "")).replace("{actor_1}", `{${widgetValue(actor, "actor_id", "actor_1")}}`));
                         track = this.createNode(TYPES.actorTrack, [anchor[0] - 600, anchor[1] + 250]);
                         if (!connectNodes(actor, "actor_instance", track, "actor")) throw new Error("无法连接人物到人物轨道");
                     } else if (kind === "environment") {
@@ -1285,7 +2701,7 @@ class H3TimelineEditor {
         this.markConflicts();
         host.innerHTML = this.data.tracks.map((track, index) => `
             <div class="h3te-track-row">
-                <div class="h3te-track-head"><button class="h3te-track-label" data-track="${index}"><span>${this.trackIcon(track)}</span><strong>${escapeHtml(track.label)}</strong><small>${track.clips.length} 个片段</small></button><button class="h3te-add-clip" data-add-clip="${index}" title="向此轨道添加片段">＋</button></div>
+                <div class="h3te-track-head"><button class="h3te-track-label" data-track="${index}"><span>${this.trackIcon(track)}</span><strong>${escapeHtml(track.label)}</strong><small>${track.clips.length} 个片段</small></button><button class="h3te-delete-track" data-delete-track="${index}" title="删除轨道">×</button><button class="h3te-add-clip" data-add-clip="${index}" title="向此轨道添加片段">＋</button></div>
                 <div class="h3te-lane-scroll" data-lane-scroll="${index}"><div class="h3te-lane" style="width:${width}px;--grid:${this.pixelsPerSecond}px" data-lane="${index}">
                     ${track.clips.map((clip) => this.clipHtml(clip)).join("")}
                     <div class="h3te-playhead" style="left:${this.playhead * this.pixelsPerSecond}px"></div>
@@ -1316,7 +2732,8 @@ class H3TimelineEditor {
         const width = Math.max(12, (clip.end - clip.start) * this.pixelsPerSecond);
         const selected = this.selection?.kind === "clip" && this.selection.node.id === clip.node.id;
         const title = `${KIND_NAMES[clip.kind] || clip.kind} · ${clip.start.toFixed(2)}–${clip.end.toFixed(2)} 秒`;
-        return `<button class="h3te-clip kind-${clip.kind} ${clip.conflict || clip.invalid ? "has-conflict" : ""} ${selected ? "is-selected" : ""}" data-node-id="${clip.node.id}" style="left:${left}px;width:${width}px" title="${escapeAttribute(title)}">
+        const active = this.playhead >= clip.start && this.playhead < clip.end;
+        return `<button class="h3te-clip kind-${clip.kind} ${clip.conflict || clip.invalid ? "has-conflict" : ""} ${selected ? "is-selected" : ""} ${active ? "is-active-at-playhead" : ""}" data-node-id="${clip.node.id}" style="left:${left}px;width:${width}px" title="${escapeAttribute(title)}">
             <span class="h3te-resize left" data-resize="left"></span><b>${escapeHtml(KIND_NAMES[clip.kind] || clip.kind)}</b><span>${escapeHtml(clipText(clip.node))}</span>${clip.resultNode ? "<i>缓存</i>" : ""}<span class="h3te-resize right" data-resize="right"></span>
         </button>`;
     }
@@ -1357,8 +2774,14 @@ class H3TimelineEditor {
 
     renderInspector() {
         const host = $("[data-role=inspector]", this.root);
+        const media = $("[data-role=library-media]", this.root);
+        if (media) this.renderReferenceAssets(media);
         if (!this.selection) {
             host.innerHTML = `<div class="h3te-empty"><strong>选择要编辑的内容</strong><br>点击时间轴片段，或左侧的人物、环境与风格资源。</div>`;
+            return;
+        }
+        if (this.selection.kind === "video_asset") {
+            host.innerHTML = this.referenceAssetForm(this.selection.asset);
             return;
         }
         const nodes = this.selection.nodes || [this.selection.node];
@@ -1366,14 +2789,20 @@ class H3TimelineEditor {
     }
 
     nodeForm(node, secondary) {
-        const fields = FIELD_SETS[nodeType(node)] || [];
+        const fields = (FIELD_SETS[nodeType(node)] || []).filter(([name]) =>
+            !["use_previous_context", "audio_only_context"].includes(name) || Number(widgetValue(node, "start_time", 0)) > 1e-6);
         const cardTitles = { [TYPES.character]: "人物卡", [TYPES.environment]: "环境卡", [TYPES.visual]: "风格卡" };
         const title = secondary ? cardTitles[nodeType(node)] || node.title || nodeType(node) : this.selection.title || node.title || nodeType(node);
         const saveActor = !secondary && nodeType(node) === TYPES.actor ? `<button data-save-actor-card="${node.id}">保存为人物卡</button>` : "";
-        const characterPicker = nodeType(node) === TYPES.character ? this.characterCardPicker(node) : "";
+        const characterCard = nodeType(node) === TYPES.actor ? findCardForActor(node) : nodeType(node) === TYPES.character ? node : null;
+        const referenceCard = characterCard || (nodeType(node) === TYPES.environmentInstance ? findCardForEnvironment(node) : [TYPES.environment, TYPES.visual].includes(nodeType(node)) ? node : null);
+        const characterPicker = !secondary && characterCard ? this.characterCardPicker(characterCard) : "";
+        const imagePicker = !secondary && referenceCard ? this.cardImagePicker(referenceCard) : "";
+        const deleteButton = !secondary && this.selection.kind === "resource" ? `<button class="danger" data-delete-scene-node="${node.id}">删除</button>` : !secondary && this.selection.kind === "clip" ? `<button class="danger" data-delete-clip="${node.id}">删除</button>` : "";
         return `<section class="h3te-form-section ${secondary ? "secondary" : ""}">
-            <div class="h3te-form-title"><div><small>${escapeHtml(nodeType(node))} · #${node.id}</small><strong>${escapeHtml(title)}</strong></div><div class="h3te-form-actions">${saveActor}<button data-locate="${node.id}">定位节点</button></div></div>
+            <div class="h3te-form-title"><div><small>${escapeHtml(nodeType(node))} · #${node.id}</small><strong>${escapeHtml(title)}</strong></div><div class="h3te-form-actions">${saveActor}${deleteButton}<button data-locate="${node.id}">定位节点</button></div></div>
             ${characterPicker}
+            ${imagePicker}
             ${fields.map(([name, label, hint]) => this.fieldHtml(node, name, label, hint)).join("") || `<div class="h3te-empty">此节点没有可在编辑器中修改的文字属性。</div>`}
         </section>`;
     }
@@ -1387,6 +2816,8 @@ class H3TimelineEditor {
         let control;
         if (Array.isArray(values)) {
             control = `<select ${attrs}>${values.map((value) => `<option ${value === item.value ? "selected" : ""}>${escapeHtml(value)}</option>`).join("")}</select>`;
+        } else if (typeof item.value === "boolean") {
+            control = `<select ${attrs}><option value="true" ${item.value ? "selected" : ""}>启用</option><option value="false" ${item.value ? "" : "selected"}>关闭</option></select>`;
         } else if (typeof item.value === "number") {
             control = `<input type="number" step="${item.options?.step || 0.05}" value="${item.value}" ${attrs}>`;
         } else if (hint === "textarea") {
@@ -1406,20 +2837,78 @@ class H3TimelineEditor {
         return api.apiURL(`/view?${query}`);
     }
 
+    referenceImageUrl(reference) {
+        if (!reference?.filename) return "";
+        const query = new URLSearchParams({ filename: reference.filename, subfolder: reference.subfolder || "", type: reference.type || "input" });
+        return api.apiURL(`/view?${query}`);
+    }
+
     referencePanel(node) {
         const config = REFERENCE_SLOTS[nodeType(node)];
         if (!config) return "";
         const reference = linkedNode(node, config.input);
-        const source = reference ? linkedNode(reference, "video") : null;
+        const split = nodeType(reference) === TYPES.videoPerson ? linkedNode(reference, "motion_reference") : reference;
+        const source = split ? linkedNode(split, "video") : null;
         const file = source ? widgetValue(source, "file", "") : "";
-        const preview = file ? `<video class="h3te-video-preview" controls preload="metadata" src="${escapeAttribute(this.referenceVideoUrl(file))}"></video><small>${escapeHtml(file)}</small>` : reference ? `<div class="h3te-empty">已连接外部参考视频，但其来源不是可直接预览的原生加载视频节点。</div>` : `<div class="h3te-empty">尚未连接${config.label}参考视频。</div>`;
+        const preview = file ? `<video class="h3te-video-preview" data-timeline-preview controls preload="metadata" src="${escapeAttribute(this.referenceVideoUrl(file))}"></video><small>${escapeHtml(file)}</small>` : reference ? `<div class="h3te-empty">已连接外部参考视频，但其来源不是可直接预览的原生加载视频节点。</div>` : `<div class="h3te-empty">尚未连接${config.label}参考视频。</div>`;
+        const assetPicker = this.referenceAssetPicker(node, reference, split, source);
         return `<section class="h3te-form-section secondary h3te-reference-panel">
-            <div class="h3te-form-title"><div><small>Ref2VA 语义输入</small><strong>${config.label}参考视频</strong></div>${reference ? `<button data-locate="${reference.id}">定位拆分节点</button>` : ""}</div>
+            <div class="h3te-form-title"><div><small>Ref2VA 语义输入</small><strong>${config.label}参考视频</strong></div>${reference ? `<button data-locate="${reference.id}">定位${nodeType(reference) === TYPES.videoPerson ? "人物解释" : "拆分"}节点</button>` : ""}</div>
             ${preview}
-            ${reference ? this.fieldHtml(reference, "trim_start", "参考截取开始（秒）") + this.fieldHtml(reference, "trim_end", "参考截取结束（秒，0为结尾）") : ""}
+            ${nodeType(reference) === TYPES.videoPerson ? this.fieldHtml(reference, "person_id", "源人物编号") + this.fieldHtml(reference, "person_description", "源人物识别描述", "textarea") : ""}
+            ${split ? this.fieldHtml(split, "trim_start", "参考截取开始（秒）") + this.fieldHtml(split, "trim_end", "参考截取结束（秒，0为结尾）") : ""}
+            ${assetPicker}
             <label class="h3te-field"><span>${reference ? "替换参考视频" : "上传参考视频"}</span><input type="file" accept="video/*" data-reference-file="${node.id}"></label>
             <button data-attach-reference="${node.id}">${reference ? "上传并替换连接" : "上传并创建参考节点"}</button>
         </section>`;
+    }
+
+    referenceAssetPicker(node, reference, split, source) {
+        if (!Array.isArray(this.referenceAssets)) {
+            return `<div class="h3te-empty">视频资产库尚未载入。请在“参考视频”窗口刷新资产库。</div>`;
+        }
+        const action = nodeType(node) === TYPES.action;
+        const currentAsset = reference?.properties?.minimax_h3_reference_asset
+            || split?.properties?.minimax_h3_reference_asset || source?.properties?.minimax_h3_reference_asset || "";
+        const currentPerson = reference?.properties?.minimax_h3_reference_person || "";
+        const choices = [];
+        for (const asset of this.referenceAssets) {
+            if (action) {
+                for (const person of asset.people || []) {
+                    const value = JSON.stringify([asset.id, person.id]);
+                    const selected = asset.id === currentAsset && person.id === currentPerson;
+                    choices.push(`<option value="${escapeAttribute(value)}" ${selected ? "selected" : ""}>${escapeHtml(asset.display_name)} · ${escapeHtml(person.id)} — ${escapeHtml(shortText(person.description, 42))}</option>`);
+                }
+            } else {
+                const value = JSON.stringify([asset.id, null]);
+                choices.push(`<option value="${escapeAttribute(value)}" ${asset.id === currentAsset ? "selected" : ""}>${escapeHtml(asset.display_name)} · ${Number(asset.duration).toFixed(2)} 秒</option>`);
+            }
+        }
+        const empty = action ? "资产库中没有已声明人物的视频。请先在参考视频资产属性中添加源人物。" : "视频资产库为空，请先导入并预处理视频。";
+        return `<div class="h3te-reference-asset-picker">
+            <label class="h3te-field"><span>直接选择视频资产${action ? "与源人物" : ""}</span><select data-reference-asset-choice="${node.id}" ${choices.length ? "" : "disabled"}><option value="">请选择…</option>${choices.join("")}</select></label>
+            <button data-attach-reference-asset="${node.id}" ${choices.length ? "" : "disabled"}>${reference ? "使用资产替换当前参考" : "连接所选视频资产"}</button>
+            ${choices.length ? "" : `<small>${empty}</small>`}
+        </div>`;
+    }
+
+    attachSelectedReferenceAsset(nodeId) {
+        const clip = app.graph.getNodeById(Number(nodeId));
+        const select = $(`[data-reference-asset-choice="${nodeId}"]`, this.root);
+        if (!clip || !select?.value) {
+            this.setStatus("请先选择视频资产" + (nodeType(clip) === TYPES.action ? "和源人物" : ""));
+            return;
+        }
+        let choice;
+        try {
+            choice = JSON.parse(select.value);
+        } catch {
+            this.setStatus("视频资产选择无效，请刷新资产库后重试");
+            return;
+        }
+        const selectedClip = this.data?.tracks.flatMap((track) => track.clips).find((item) => item.node === clip);
+        if (selectedClip) this.selection = { kind: "clip", node: clip, nodes: [clip], title: `${KIND_NAMES[selectedClip.kind] || selectedClip.kind}片段` };
+        this.instantiateReferenceAsset(choice[0], true, choice[1]);
     }
 
     async uploadReferenceVideo(file) {
@@ -1451,19 +2940,39 @@ class H3TimelineEditor {
             this.pendingCreatedNodes = created;
             app.graph.beforeChange?.();
             try {
-                const loader = this.createNode(TYPES.loadVideo, [clip.pos[0] - 620, clip.pos[1]], { file: path });
-                const reference = this.createNode(TYPES.motionReference, [clip.pos[0] - 310, clip.pos[1]], {
+                const previousReference = linkedNode(clip, config.input);
+                const previousSplit = nodeType(previousReference) === TYPES.videoPerson ? linkedNode(previousReference, "motion_reference") : previousReference;
+                const previousLoader = previousSplit ? linkedNode(previousSplit, "video") : null;
+                const loader = this.createNode(TYPES.loadVideo, [clip.pos[0] - 760, clip.pos[1]], { file: path });
+                const reference = this.createNode(TYPES.motionReference, [clip.pos[0] - 460, clip.pos[1]], {
                     trim_start: 0,
                     trim_end: Math.min(15, Math.max(0.05, Number(widgetValue(clip, "end_time", 1)) - Number(widgetValue(clip, "start_time", 0)))),
                 });
                 if (!connectNodes(loader, loader.outputs?.[0]?.name, reference, "video")) throw new Error("无法连接加载视频与语义拆分节点");
+                let semanticNode = reference;
+                let semanticOutput = config.output;
+                if (nodeType(clip) === TYPES.action) {
+                    semanticNode = this.createNode(TYPES.videoPerson, [clip.pos[0] - 220, clip.pos[1]], {
+                        person_id: nodeType(previousReference) === TYPES.videoPerson ? widgetValue(previousReference, "person_id", "person_1") : "person_1",
+                        person_description: nodeType(previousReference) === TYPES.videoPerson ? widgetValue(previousReference, "person_description", "the primary performer in the reference video") : "the primary performer in the reference video",
+                    });
+                    semanticOutput = 0;
+                    if (!connectNodes(reference, reference.outputs?.[0]?.name, semanticNode, "motion_reference")) throw new Error("无法连接参考视频人物解释");
+                }
                 const inputIndex = slotIndex(clip, config.input);
-                if (inputIndex < 0 || !reference.outputs?.[config.output]) throw new Error("片段不支持所选参考视频语义");
-                reference.connect(config.output, clip, inputIndex);
+                if (inputIndex < 0 || !semanticNode.outputs?.[semanticOutput]) throw new Error("片段不支持所选参考视频语义");
+                semanticNode.connect(semanticOutput, clip, inputIndex);
                 loader.properties ||= {};
                 loader.properties.minimax_h3_reference_upload = true;
                 reference.properties ||= {};
                 reference.properties.minimax_h3_reference_upload = true;
+                if (semanticNode !== reference) {
+                    semanticNode.properties ||= {};
+                    semanticNode.properties.minimax_h3_reference_upload = true;
+                }
+                if (isManagedMediaNode(previousReference) && outputTargets(previousReference).length === 0) app.graph.remove(previousReference);
+                if (previousSplit !== previousReference && isManagedMediaNode(previousSplit) && outputTargets(previousSplit).length === 0) app.graph.remove(previousSplit);
+                if (isManagedMediaNode(previousLoader) && outputTargets(previousLoader).length === 0) app.graph.remove(previousLoader);
                 this.layoutProjectNodes(false);
                 app.graph.afterChange?.();
                 app.graph.setDirtyCanvas(true, true);
@@ -1486,12 +2995,8 @@ class H3TimelineEditor {
     }
 
     onClick(event) {
-        const libraryTab = event.target.closest("[data-library-tab]");
-        if (libraryTab) {
-            this.libraryTab = libraryTab.dataset.libraryTab;
-            this.renderLibrary();
-            return;
-        }
+        const dockTab = event.target.closest("[data-dock-tab]");
+        if (dockTab) return this.activateDockPanel(dockTab.dataset.dockTab);
         const createResource = event.target.closest("[data-create-resource]");
         if (createResource) return this.openResourceModal(createResource.dataset.createResource);
         const editResource = event.target.closest("[data-edit-resource]");
@@ -1513,9 +3018,24 @@ class H3TimelineEditor {
         if (instantiateReference) return this.instantiateReferenceAsset(instantiateReference.dataset.instantiateReferenceAsset, false);
         const useReference = event.target.closest("[data-use-reference-asset]");
         if (useReference) return this.instantiateReferenceAsset(useReference.dataset.useReferenceAsset, true);
+        const useReferencePerson = event.target.closest("[data-use-reference-person]");
+        if (useReferencePerson) {
+            const [assetId, personId] = useReferencePerson.dataset.useReferencePerson.split(":");
+            return this.instantiateReferenceAsset(assetId, true, personId);
+        }
+        const editReference = event.target.closest("[data-edit-reference-asset]");
+        if (editReference) return this.editReferenceAsset(editReference.dataset.editReferenceAsset);
+        const addReferencePerson = event.target.closest("[data-add-reference-person]");
+        if (addReferencePerson) return this.addReferencePerson();
+        const removeReferencePerson = event.target.closest("[data-remove-reference-person]");
+        if (removeReferencePerson) return this.removeReferencePerson(Number(removeReferencePerson.dataset.removeReferencePerson));
+        const saveReferenceAsset = event.target.closest("[data-save-reference-asset]");
+        if (saveReferenceAsset) return this.saveReferenceAsset(saveReferenceAsset.dataset.saveReferenceAsset);
         const deleteReference = event.target.closest("[data-delete-reference-asset]");
         if (deleteReference) return this.deleteReferenceAsset(deleteReference.dataset.deleteReferenceAsset);
         const action = event.target.closest("[data-action]")?.dataset.action;
+        if (action === "confirm-delete") return this.closeConfirm(true);
+        if (action === "cancel-delete") return this.closeConfirm(false);
         if (action === "close-resource-modal") {
             this.resourceModal = null;
             return this.renderResourceModal();
@@ -1535,14 +3055,16 @@ class H3TimelineEditor {
         if (action === "reload-reference-assets") return this.loadReferenceAssets();
         if (action === "reload-library") return this.loadResourceLibrary();
         if (action === "close") return this.close();
-        if (action === "refresh") return this.render();
-        if (action === "save") return this.saveWorkflow(true);
-        if (action === "bootstrap") return this.bootstrapProject();
-        if (action === "layout") {
-            const changed = this.layoutProjectNodes(true);
-            this.setStatus(changed ? "已按人物、环境、轨道和参考媒体自动排布节点" : "当前工程节点已经排布整齐");
-            return;
+        if (action === "refresh") {
+            this.layoutProjectNodes(true);
+            return this.render();
         }
+        if (action === "save") return this.saveWorkflow(true);
+        if (action === "export-project") return this.exportProject();
+        if (action === "package-project") return this.packageProject();
+        if (action === "import-project") return $("[data-role=project-file]", this.root).click();
+        if (action === "bootstrap") return this.bootstrapProject();
+        if (action === "cleanup") return this.cleanupUnusedNodes();
         if (action === "create-track") return this.openTrackModal();
         if (action === "fit" && this.data) {
             const available = Math.max(480, $(".h3te-stage", this.root).clientWidth - 190);
@@ -1556,10 +3078,22 @@ class H3TimelineEditor {
         if (addClip) return this.openTrackModal(Number(addClip.dataset.addClip));
         const attachReference = event.target.closest("[data-attach-reference]");
         if (attachReference) return this.attachReferenceVideo(attachReference.dataset.attachReference);
+        const attachReferenceAsset = event.target.closest("[data-attach-reference-asset]");
+        if (attachReferenceAsset) return this.attachSelectedReferenceAsset(attachReferenceAsset.dataset.attachReferenceAsset);
         const saveActorCard = event.target.closest("[data-save-actor-card]");
         if (saveActorCard) return this.saveActorAsResource(app.graph.getNodeById(Number(saveActorCard.dataset.saveActorCard)));
         const applyCharacterCard = event.target.closest("[data-apply-character-card]");
         if (applyCharacterCard) return this.applyCharacterCard(applyCharacterCard.dataset.applyCharacterCard);
+        const selectAnimaCharacter = event.target.closest("[data-select-anima-character]");
+        if (selectAnimaCharacter) return this.selectAnimaCharacter(selectAnimaCharacter.dataset.selectAnimaCharacter);
+        const attachCardImage = event.target.closest("[data-attach-card-image]");
+        if (attachCardImage) return this.attachCardImage(attachCardImage.dataset.attachCardImage);
+        const deleteSceneNode = event.target.closest("[data-delete-scene-node]");
+        if (deleteSceneNode) return this.deleteSceneNode(deleteSceneNode.dataset.deleteSceneNode);
+        const deleteTrack = event.target.closest("[data-delete-track]");
+        if (deleteTrack) return this.deleteTrack(deleteTrack.dataset.deleteTrack);
+        const deleteClip = event.target.closest("[data-delete-clip]");
+        if (deleteClip) return this.deleteClip(deleteClip.dataset.deleteClip);
 
         const resourceButton = event.target.closest("[data-resource]");
         if (resourceButton) {
@@ -1584,22 +3118,51 @@ class H3TimelineEditor {
     }
 
     onFieldChange(event) {
+        const assetField = event.target.closest("[data-reference-asset-field]");
+        if (assetField && this.selection?.kind === "video_asset") {
+            this.selection.asset[assetField.dataset.referenceAssetField] = assetField.value;
+            return;
+        }
+        const personField = event.target.closest("[data-reference-person-field]");
+        if (personField && this.selection?.kind === "video_asset") {
+            const person = this.selection.asset.people?.[Number(personField.dataset.referencePersonIndex)];
+            if (person) person[personField.dataset.referencePersonField] = personField.value;
+            return;
+        }
         const field = event.target.closest("[data-field-node]");
         if (!field) return;
         const node = app.graph.getNodeById(Number(field.dataset.fieldNode));
         const current = widget(node, field.dataset.fieldName)?.value;
-        const value = typeof current === "number" ? Number(field.value) : field.value;
+        const value = typeof current === "number" ? Number(field.value) : typeof current === "boolean" ? field.value === "true" : field.value;
         if (setWidgetValue(node, field.dataset.fieldName, value)) {
             this.data = collectTimeline(this.currentTimeline());
             if (["start_time", "end_time", "action_type", "name"].includes(field.dataset.fieldName)) {
                 this.renderLibrary();
                 this.renderTracks();
+                if (field.dataset.fieldName === "start_time") this.renderInspector();
             }
             this.setStatus("已同步到工作流");
         }
     }
 
     onPointerDown(event) {
+        const resizer = event.target.closest("[data-dock-resize]");
+        if (resizer) {
+            event.preventDefault();
+            const [splitId, rawIndex] = resizer.dataset.dockResize.split(":");
+            const layout = this.findDockNode(splitId);
+            const split = resizer.parentElement;
+            const cells = [...split.children].filter((item) => item.classList.contains("h3te-dock-cell"));
+            const index = Number(rawIndex);
+            if (!layout || !cells[index] || !cells[index + 1]) return;
+            this.dockResize = {
+                layout, split, resizer, cells, index,
+                start: layout.direction === "row" ? event.clientX : event.clientY,
+                first: layout.sizes[index], second: layout.sizes[index + 1],
+            };
+            resizer.classList.add("is-dragging");
+            return;
+        }
         const clipElement = event.target.closest(".h3te-clip");
         if (clipElement) {
             event.preventDefault();
@@ -1608,7 +3171,6 @@ class H3TimelineEditor {
             if (!clip) return;
             this.selection = { kind: "clip", node, nodes: [node], title: `${KIND_NAMES[clip.kind] || clip.kind}片段${clip.resultNode ? " · 已缓存" : ""}` };
             this.renderInspector();
-            if (this.libraryTab === "media") this.renderLibrary();
             this.drag = {
                 clip,
                 mode: event.target.dataset.resize || "move",
@@ -1621,16 +3183,35 @@ class H3TimelineEditor {
             clipElement.classList.add("is-dragging");
             return;
         }
-        const ruler = event.target.closest(".h3te-ruler");
-        if (ruler && this.data) {
-            const rect = ruler.getBoundingClientRect();
-            this.playhead = Math.max(0, Math.min(this.data.duration, (event.clientX - rect.left) / this.pixelsPerSecond));
-            this.renderTracks();
-            this.updateTime();
+        const surface = event.target.closest(".h3te-ruler,.h3te-lane");
+        if (surface && this.data) {
+            event.preventDefault();
+            if (this.playing) this.togglePlay();
+            this.scrub = { surface, pointerId: event.pointerId };
+            surface.setPointerCapture?.(event.pointerId);
+            this.seekFromPointer(event, surface);
         }
     }
 
     onPointerMove(event) {
+        if (this.dockResize) {
+            const state = this.dockResize;
+            const pixels = state.layout.direction === "row" ? state.split.clientWidth : state.split.clientHeight;
+            const current = state.layout.direction === "row" ? event.clientX : event.clientY;
+            const total = state.layout.sizes.reduce((sum, value) => sum + value, 0);
+            const pair = state.first + state.second;
+            const minimum = Math.min(pair / 2, Math.max(pair * 0.12, total * 0.04));
+            const first = Math.max(minimum, Math.min(pair - minimum, state.first + (current - state.start) * total / Math.max(1, pixels)));
+            state.layout.sizes[state.index] = first;
+            state.layout.sizes[state.index + 1] = pair - first;
+            state.cells[state.index].style.flexBasis = `${100 * first / total}%`;
+            state.cells[state.index + 1].style.flexBasis = `${100 * (pair - first) / total}%`;
+            return;
+        }
+        if (this.scrub) {
+            this.seekFromPointer(event, this.scrub.surface);
+            return;
+        }
         if (!this.drag || !this.data) return;
         const delta = (event.clientX - this.drag.startX) / this.pixelsPerSecond;
         const duration = this.drag.end - this.drag.start;
@@ -1655,7 +3236,21 @@ class H3TimelineEditor {
         this.setStatus(`正在调整：${start.toFixed(2)}–${end.toFixed(2)} 秒`);
     }
 
-    onPointerUp() {
+    onPointerUp(event) {
+        if (this.dockResize) {
+            this.dockResize.resizer.classList.remove("is-dragging");
+            this.dockResize = null;
+            this.saveDockLayout();
+            this.renderTracks();
+            this.setStatus("窗口边界已调整并保存");
+            return;
+        }
+        if (this.scrub) {
+            this.scrub.surface.releasePointerCapture?.(this.scrub.pointerId ?? event?.pointerId);
+            this.scrub = null;
+            this.setStatus(`播放头：${this.formatTimecode(this.playhead)}`);
+            return;
+        }
         if (!this.drag) return;
         const start = this.drag.currentStart ?? this.drag.start;
         const end = this.drag.currentEnd ?? this.drag.end;
@@ -1673,33 +3268,88 @@ class H3TimelineEditor {
         return this.snap ? Math.round(value / this.snap) * this.snap : value;
     }
 
+    seekFromPointer(event, surface) {
+        const rect = surface.getBoundingClientRect();
+        this.setPlayhead((event.clientX - rect.left) / this.pixelsPerSecond);
+    }
+
+    setPlayhead(value, { scrollIntoView = false } = {}) {
+        if (!this.data) return;
+        this.playhead = Math.max(0, Math.min(this.data.duration, Number(value) || 0));
+        this.updatePlayheadVisuals();
+        this.syncTimelinePreview();
+        if (scrollIntoView) this.scrollPlayheadIntoView();
+    }
+
+    updatePlayheadVisuals() {
+        const left = `${this.playhead * this.pixelsPerSecond}px`;
+        this.root.querySelectorAll(".h3te-playhead").forEach((line) => line.style.left = left);
+        for (const element of this.root.querySelectorAll(".h3te-clip")) {
+            const clip = this.data?.tracks.flatMap((track) => track.clips).find((item) => item.node.id === Number(element.dataset.nodeId));
+            element.classList.toggle("is-active-at-playhead", Boolean(clip && this.playhead >= clip.start && this.playhead < clip.end));
+        }
+        this.updateTime();
+    }
+
+    scrollPlayheadIntoView() {
+        const ruler = $(".h3te-ruler-scroll", this.root);
+        if (!ruler) return;
+        const x = this.playhead * this.pixelsPerSecond;
+        const margin = Math.min(120, ruler.clientWidth * 0.2);
+        if (x < ruler.scrollLeft + margin) ruler.scrollLeft = Math.max(0, x - margin);
+        else if (x > ruler.scrollLeft + ruler.clientWidth - margin) ruler.scrollLeft = x - ruler.clientWidth + margin;
+        ruler.dispatchEvent(new Event("scroll"));
+    }
+
+    syncTimelinePreview() {
+        const video = $("[data-timeline-preview]", this.root);
+        if (!video || this.selection?.kind !== "clip") return;
+        const clip = this.data?.tracks.flatMap((track) => track.clips).find((item) => item.node === this.selection.node);
+        if (!clip || this.playhead < clip.start || this.playhead > clip.end || !Number.isFinite(video.duration)) return;
+        const config = REFERENCE_SLOTS[nodeType(clip.node)];
+        const reference = config ? linkedNode(clip.node, config.input) : null;
+        const split = nodeType(reference) === TYPES.videoPerson ? linkedNode(reference, "motion_reference") : reference;
+        const trimStart = Math.max(0, Number(widgetValue(split, "trim_start", 0)) || 0);
+        const trimEndValue = Number(widgetValue(split, "trim_end", 0)) || 0;
+        const trimEnd = trimEndValue > trimStart ? Math.min(video.duration, trimEndValue) : video.duration;
+        const progress = (this.playhead - clip.start) / Math.max(0.001, clip.end - clip.start);
+        const target = trimStart + progress * Math.max(0, trimEnd - trimStart);
+        if (Math.abs(video.currentTime - target) > 1 / 48) video.currentTime = target;
+    }
+
+    formatTimecode(value) {
+        const totalFrames = Math.max(0, Math.round(value * 24));
+        const frames = totalFrames % 24;
+        const totalSeconds = Math.floor(totalFrames / 24);
+        const seconds = totalSeconds % 60;
+        const minutes = Math.floor(totalSeconds / 60) % 60;
+        const hours = Math.floor(totalSeconds / 3600);
+        return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}:${String(frames).padStart(2, "0")}`;
+    }
+
     togglePlay() {
         if (!this.data) return;
         this.playing = !this.playing;
         $("[data-action=play]", this.root).textContent = this.playing ? "❚❚" : "▶";
         if (!this.playing) return;
-        if (this.playhead >= this.data.duration) this.playhead = 0;
+        if (this.playhead >= this.data.duration) this.setPlayhead(0);
         let previous = performance.now();
         const frame = (now) => {
             if (!this.playing) return;
-            this.playhead += (now - previous) / 1000;
+            const next = this.playhead + (now - previous) / 1000;
             previous = now;
-            if (this.playhead >= this.data.duration) {
-                this.playhead = this.data.duration;
+            if (next >= this.data.duration) {
                 this.playing = false;
                 $("[data-action=play]", this.root).textContent = "▶";
             }
-            this.root.querySelectorAll(".h3te-playhead").forEach((line) => line.style.left = `${this.playhead * this.pixelsPerSecond}px`);
-            this.updateTime();
+            this.setPlayhead(Math.min(next, this.data.duration), { scrollIntoView: true });
             if (this.playing) requestAnimationFrame(frame);
         };
         requestAnimationFrame(frame);
     }
 
     updateTime() {
-        const minutes = Math.floor(this.playhead / 60);
-        const seconds = this.playhead - minutes * 60;
-        $("[data-role=time]", this.root).textContent = `${String(minutes).padStart(2, "0")}:${seconds.toFixed(2).padStart(5, "0")}`;
+        $("[data-role=time]", this.root).textContent = this.formatTimecode(this.playhead);
     }
 
     locateNode(id) {
@@ -1737,6 +3387,14 @@ app.registerExtension({
     }],
     menuCommands: [{ path: ["MiniMax H3"], commands: ["MiniMaxH3.openTimelineEditor"] }],
     async beforeRegisterNodeDef(nodeType, nodeData) {
+        if (nodeData.name === TYPES.action) {
+            const onConfigure = nodeType.prototype.onConfigure;
+            nodeType.prototype.onConfigure = function () {
+                onConfigure?.apply(this, arguments);
+                migrateActionContextWidget(this);
+            };
+            return;
+        }
         if (nodeData.name !== TYPES.timeline) return;
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {

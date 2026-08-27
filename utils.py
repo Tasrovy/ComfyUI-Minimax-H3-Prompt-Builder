@@ -79,12 +79,14 @@ def _lower_first(value):
     return value[:1].lower() + value[1:] if value else ""
 
 
-def _actor_state(label, default, override):
+def _actor_state(label, default, override, name=""):
     state = _text(override) or _text(default)
     if not state:
         return ""
-    name = label.rsplit(" (S", 1)[0] if " (S" in label else ""
-    state = _strip_leading_subject(state, name)
+    if state.startswith(label) or (name and re.match(rf"{re.escape(name)}(?!\w)", state, flags=re.IGNORECASE)):
+        return _sentence(state)
+    legacy_name = label.rsplit(" (S", 1)[0] if " (S" in label else ""
+    state = _strip_leading_subject(state, legacy_name)
     if not state:
         return ""
     return _sentence(f"{label} {state}")
@@ -96,15 +98,15 @@ def _bind_actor_tokens(value, actor_labels):
         return ""
 
     def replace_actor(match):
-        socket_suffix = match.group(1)
-        if not re.fullmatch(r"_\d+", socket_suffix):
-            raise ValueError(f"Invalid actor placeholder {match.group(0)}; use {{actor_0}}, {{actor_1}}, and so on")
-        index = int(socket_suffix[1:])
-        if index >= len(actor_labels):
-            raise ValueError(f"{match.group(0)} exceeds the Character Group, which contains {len(actor_labels)} actor(s)")
-        return actor_labels[index]
+        actor_id = match.group(1)
+        if not re.fullmatch(r"actor_[1-9][0-9]*", actor_id):
+            raise ValueError(f"Invalid actor placeholder {match.group(0)}; use {{actor_1}}, {{actor_2}}, and so on")
+        if actor_id not in actor_labels:
+            raise ValueError(f"{match.group(0)} is not declared by an Actor Instance")
+        return actor_labels[actor_id]
 
-    return re.sub(r"\{actor([^}]*)\}", replace_actor, value)
+    value = re.sub(r"\{(actor[^}]*)\}", replace_actor, value)
+    return re.sub(r"\{(person_[1-9][0-9]*)\}", r"\1", value)
 
 
 def _video_size(megapixels, aspect_ratio):

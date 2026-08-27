@@ -3,6 +3,7 @@ import json
 import comfy.model_management
 import comfy.sample
 import comfy.utils
+import folder_paths
 import torch
 
 from comfy_api.latest import io
@@ -10,7 +11,8 @@ from comfy_execution.graph_utils import GraphBuilder
 
 from .schema import (ASPECT_RATIOS, CATEGORY, FPS, H3_GENERATION_JOB, H3_SECOND_PASS_BATCH,
     H3_SECOND_PASS_ENTRY, SecondPassBatchData, SecondPassEntryData)
-from .segments import _lock_context_prefix, _segment_frame_plan, _segment_ranges, _segment_result
+from .segments import (_lock_context_prefix, _segment_context_mode, _segment_continuity_seconds,
+    _segment_frame_plan, _segment_ranges, _segment_result, _segment_visible_frames)
 from .checkpoints import (_cache_path, _latent_path, second_pass_cache_files,
     segment_cache_files)
 from .utils import _video_size
@@ -25,6 +27,14 @@ SECOND_PASS_UPSCALE_METHODS = {
 }
 SECOND_PASS_CROP_MODES = {"拉伸到目标比例": "disabled", "居中裁切到目标比例": "center"}
 AUDIO_SAMPLE_TOLERANCE = 8
+
+
+def _latent_upscaler_models():
+    try:
+        models = folder_paths.get_filename_list("latent_upscale_models")
+    except KeyError:
+        models = []
+    return models or ["请先安装 Minimax H3 Latent Upscaler 3D 并放入模型"]
 
 
 class MiniMaxH3SegmentSampler(io.ComfyNode):
@@ -107,16 +117,17 @@ class MiniMaxH3SegmentTrim(io.ComfyNode):
         return io.Schema(node_id="MiniMaxH3SegmentTrim", display_name="MiniMax H3 片段裁切（内部）",
             category=f"{CATEGORY}/内部", inputs=[io.Image.Input("images"), io.Audio.Input("audio"),
             io.Int.Input("context_frames", min=0), io.Float.Input("duration_seconds", min=0.01, step=0.01),
-            io.Int.Input("generated_frames", min=0, default=0, optional=True)],
+            io.Int.Input("generated_frames", min=0, default=0, optional=True),
+            io.Int.Input("visible_frames", min=0, default=0, optional=True)],
             outputs=[io.Image.Output(display_name="images"), io.Audio.Output(display_name="audio")])
 
     @classmethod
-    def execute(cls, images, audio, context_frames, duration_seconds, generated_frames=0):
+    def execute(cls, images, audio, context_frames, duration_seconds, generated_frames=0, visible_frames=0):
         if generated_frames and images.shape[0] != generated_frames:
             raise ValueError(f"模型解码得到 {images.shape[0]} 帧，但本次参考视频与生成目标均为 {generated_frames} 帧")
         context_frames = min(max(0, int(context_frames)), max(0, images.shape[0] - 1))
         images = images[context_frames:]
-        frame_count = min(images.shape[0], max(1, round(duration_seconds * FPS)))
+        frame_count = min(images.shape[0], max(1, visible_frames or round(duration_seconds * FPS)))
         images = images[:frame_count]
         sample_rate = audio["sample_rate"]
         audio_offset = min(audio["waveform"].shape[-1], round((context_frames / FPS) * sample_rate))
@@ -155,16 +166,18 @@ class MiniMaxH3SecondPassEntryPack(io.ComfyNode):
         return io.Schema(node_id="MiniMaxH3SecondPassEntryPack",
             display_name="MiniMax H3 二采片段打包（内部）", category=f"{CATEGORY}/内部",
             inputs=[io.Video.Input("video"), io.Int.Input("segment_index"),
+                io.Float.Input("start_time"), io.Float.Input("end_time"),
                 io.Int.Input("context_frames"), io.Int.Input("generation_frames"),
-                io.Float.Input("visible_duration"), io.String.Input("cache_file"),
+                io.Int.Input("visible_frames"), io.Float.Input("visible_duration"), io.String.Input("cache_file"),
+                io.Combo.Input("context_mode", options=["full", "audio", "off"], default="full"),
                 io.Conditioning.Input("conditioning", optional=True), io.Latent.Input("latent", optional=True)],
             outputs=[H3_SECOND_PASS_ENTRY.Output(display_name="entry")])
 
     @classmethod
-    def execute(cls, video, segment_index, context_frames, generation_frames, visible_duration, cache_file,
-                conditioning=None, latent=None):
-        return io.NodeOutput(SecondPassEntryData(segment_index, conditioning, latent, video, context_frames,
-            generation_frames, visible_duration, cache_file))
+    def execute(cls, video, segment_index, start_time, end_time, context_frames, generation_frames,
+                visible_frames, visible_duration, cache_file, context_mode="full", conditioning=None, latent=None):
+        return io.NodeOutput(SecondPassEntryData(segment_index, conditioning, latent, video, start_time,
+            end_time, context_frames, generation_frames, visible_frames, visible_duration, cache_file, context_mode))
 
 
 class MiniMaxH3SecondPassBatchAppend(io.ComfyNode):
@@ -195,7 +208,10 @@ class MiniMaxH3SecondPassBatchParser(io.ComfyNode):
                 io.Int.Output(display_name="context_frames", is_output_list=True),
                 io.Int.Output(display_name="generation_frames", is_output_list=True),
                 io.Float.Output(display_name="visible_duration", is_output_list=True),
-                io.String.Output(display_name="cache_file", is_output_list=True)])
+                io.String.Output(display_name="cache_file", is_output_list=True),
+                io.Float.Output(display_name="start_time", is_output_list=True),
+                io.Float.Output(display_name="end_time", is_output_list=True),
+                io.Int.Output(display_name="visible_frames", is_output_list=True)])
 
     @classmethod
     def execute(cls, second_pass_batch):
@@ -214,6 +230,9 @@ class MiniMaxH3SecondPassBatchParser(io.ComfyNode):
             [entry.generation_frames for entry in entries],
             [entry.visible_duration for entry in entries],
             [entry.cache_file for entry in entries],
+            [entry.start_time for entry in entries],
+            [entry.end_time for entry in entries],
+            [entry.visible_frames for entry in entries],
         )
 
 
@@ -223,16 +242,24 @@ class MiniMaxH3SecondPassLock(io.ComfyNode):
         return io.Schema(node_id="MiniMaxH3SecondPassLock",
             display_name="MiniMax H3 二采段间锁定（内部）", category=f"{CATEGORY}/内部",
             inputs=[io.Latent.Input("latent"), io.Vae.Input("video_vae"), io.Vae.Input("audio_vae"),
-                io.Int.Input("locked_frames"), io.Int.Input("width"), io.Int.Input("height"),
+                io.Int.Input("locked_frames"),
+                io.Boolean.Input("lock_video", default=True),
+                io.Int.Input("width", default=0, min=0, optional=True),
+                io.Int.Input("height", default=0, min=0, optional=True),
                 io.Image.Input("previous_images", optional=True), io.Audio.Input("previous_audio", optional=True),
                 io.Latent.Input("previous_latent", optional=True)],
             outputs=[io.Latent.Output(display_name="latent")])
 
     @classmethod
-    def execute(cls, latent, video_vae, audio_vae, locked_frames, width, height, previous_images=None,
+    def execute(cls, latent, video_vae, audio_vae, locked_frames, lock_video=True, width=0, height=0, previous_images=None,
                 previous_audio=None, previous_latent=None):
+        if not width or not height:
+            video = latent["samples"][0]
+            ratio = int(video_vae.spacial_compression_encode())
+            height = video.shape[-2] * ratio
+            width = video.shape[-1] * ratio
         return io.NodeOutput(_lock_context_prefix(latent, previous_images, previous_audio, previous_latent,
-            video_vae, audio_vae, locked_frames, width, height))
+            video_vae, audio_vae, locked_frames, width, height, lock_video=lock_video))
 
 
 class MiniMaxH3SecondPassUpscale(io.ComfyNode):
@@ -377,22 +404,34 @@ class MiniMaxH3MultiSegmentSecondPass(io.ComfyNode):
     def execute(cls, model, video_vae, audio_vae, sampler, second_pass_batch, megapixels=1.0,
                 aspect_ratio="16:9", upscale_method="Lanczos（高质量）", crop_mode="拉伸到目标比例",
                 seed=0, scheduler="beta", steps=4, denoise=0.2, cache_mode="复用已完成片段",
-                cache_version=0):
+                cache_version=0, _latent_upscale=None, _sigmas=None, _parent_node_id=None):
         if not isinstance(second_pass_batch, SecondPassBatchData) or not second_pass_batch.entries:
             raise ValueError("二采任务包为空")
         settings = {"megapixels": megapixels, "aspect_ratio": aspect_ratio,
             "upscale_method": upscale_method, "crop_mode": crop_mode, "seed": seed,
             "scheduler": scheduler, "steps": steps, "denoise": denoise}
+        if _latent_upscale is not None:
+            settings["latent_upscale"] = _latent_upscale
+        if _sigmas is not None:
+            settings["sigmas"] = _sigmas.detach().to(device="cpu", dtype=torch.float32).tolist()
         cache_files = second_pass_cache_files(second_pass_batch, model, sampler, settings, cache_version)
-        width, height = _video_size(megapixels, aspect_ratio)
+        width, height = _video_size(megapixels, aspect_ratio) if _latent_upscale is None else (0, 0)
         graph = GraphBuilder()
-        parent_node_id = cls.hidden.unique_id if cls.hidden is not None else None
+        parent_node_id = (_parent_node_id if _parent_node_id is not None else
+            (cls.hidden.unique_id if cls.hidden is not None else None))
 
         def stage_node(class_type, node_id, **inputs):
             node = graph.node(class_type, id=node_id, **inputs)
             if parent_node_id is not None:
                 node.set_override_display_id(parent_node_id)
             return node
+
+        def upscale_latent(latent, node_id):
+            return stage_node("MinimaxH3LatentUpscaler3D", node_id, latent=latent,
+                model_name=_latent_upscale["model_name"],
+                mode="megapixels", **{"mode.megapixels": megapixels},
+                align=_latent_upscale["align"], enable_chunking=_latent_upscale["enable_chunking"],
+                device=_latent_upscale["device"], precision=_latent_upscale["precision"]).out(0)
 
         accumulated_images = None
         accumulated_audio = None
@@ -411,29 +450,40 @@ class MiniMaxH3MultiSegmentSecondPass(io.ComfyNode):
                     checkpoint_latent = checkpoint.out(1)
             elif entry.latent is None or entry.conditioning is None:
                 source = stage_node("GetVideoComponents", f"{stage}_source_components", video=entry.video)
-                resized = stage_node("MiniMaxH3SecondPassResize", f"{stage}_resize", images=source.out(0),
-                    megapixels=megapixels, aspect_ratio=aspect_ratio, upscale_method=upscale_method,
-                    crop_mode=crop_mode)
+                if _latent_upscale is None:
+                    resized_images = stage_node("MiniMaxH3SecondPassResize", f"{stage}_resize",
+                        images=source.out(0), megapixels=megapixels, aspect_ratio=aspect_ratio,
+                        upscale_method=upscale_method, crop_mode=crop_mode).out(0)
+                else:
+                    source_latent = stage_node("VAEEncode", f"{stage}_encode",
+                        pixels=source.out(0), vae=video_vae)
+                    upscaled = upscale_latent(source_latent.out(0), f"{stage}_resize")
+                    resized_images = stage_node("VAEDecode", f"{stage}_video_decode",
+                        samples=upscaled, vae=video_vae).out(0)
                 segment_video = stage_node("CreateVideo", f"{stage}_segment_video",
-                    images=resized.out(0), fps=float(FPS), audio=source.out(1))
+                    images=resized_images, fps=float(FPS), audio=source.out(1))
                 checkpoint = stage_node("MiniMaxH3SegmentCheckpoint", f"{stage}_checkpoint",
                     video=segment_video.out(0), cache_file=cache_files[position], preview_files=preview_files)
             else:
                 separated = stage_node("LTXVSeparateAVLatent", f"{stage}_separate", av_latent=entry.latent)
-                decoded = stage_node("VAEDecode", f"{stage}_source_decode",
-                    samples=separated.out(0), vae=video_vae)
-                resized = stage_node("MiniMaxH3SecondPassResize", f"{stage}_resize", images=decoded.out(0),
-                    megapixels=megapixels, aspect_ratio=aspect_ratio, upscale_method=upscale_method,
-                    crop_mode=crop_mode)
-                video_latent = stage_node("VAEEncode", f"{stage}_encode",
-                    pixels=resized.out(0), vae=video_vae)
+                if _latent_upscale is None:
+                    decoded = stage_node("VAEDecode", f"{stage}_source_decode",
+                        samples=separated.out(0), vae=video_vae)
+                    resized = stage_node("MiniMaxH3SecondPassResize", f"{stage}_resize", images=decoded.out(0),
+                        megapixels=megapixels, aspect_ratio=aspect_ratio, upscale_method=upscale_method,
+                        crop_mode=crop_mode)
+                    video_latent = stage_node("VAEEncode", f"{stage}_encode",
+                        pixels=resized.out(0), vae=video_vae).out(0)
+                else:
+                    video_latent = upscale_latent(separated.out(0), f"{stage}_resize")
                 av_latent = stage_node("LTXVConcatAVLatent", f"{stage}_concat",
-                    video_latent=video_latent.out(0), audio_latent=separated.out(1))
+                    video_latent=video_latent, audio_latent=separated.out(1))
                 latent = av_latent.out(0)
-                if entry.context_frames and previous_images is not None:
+                if entry.context_frames and previous_audio is not None:
                     lock_inputs = {"latent": latent, "video_vae": video_vae, "audio_vae": audio_vae,
                         "locked_frames": entry.context_frames, "width": width, "height": height,
-                        "previous_images": previous_images, "previous_audio": previous_audio}
+                        "lock_video": entry.context_mode == "full", "previous_images": previous_images,
+                        "previous_audio": previous_audio}
                     if previous_latent is not None:
                         lock_inputs["previous_latent"] = previous_latent
                     latent = stage_node("MiniMaxH3SecondPassLock", f"{stage}_lock", **lock_inputs).out(0)
@@ -441,10 +491,11 @@ class MiniMaxH3MultiSegmentSecondPass(io.ComfyNode):
                     noise_seed=(seed + entry.segment_index) & 0xffffffffffffffff)
                 guider = stage_node("BasicGuider", f"{stage}_guider",
                     model=model, conditioning=entry.conditioning)
-                sigmas = stage_node("BasicScheduler", f"{stage}_scheduler", model=model,
-                    scheduler=scheduler, steps=steps, denoise=denoise)
+                sigmas = (_sigmas if _sigmas is not None else
+                    stage_node("BasicScheduler", f"{stage}_scheduler", model=model,
+                        scheduler=scheduler, steps=steps, denoise=denoise).out(0))
                 sampled = stage_node("MiniMaxH3SegmentSampler", f"{stage}_sampling", noise=noise.out(0),
-                    guider=guider.out(0), sampler=sampler, sigmas=sigmas.out(0), latent_image=latent)
+                    guider=guider.out(0), sampler=sampler, sigmas=sigmas, latent_image=latent)
                 decoded_images = stage_node("VAEDecode", f"{stage}_video_decode",
                     samples=sampled.out(0), vae=video_vae).out(0)
                 decoded_audio = stage_node("VAEDecodeAudio", f"{stage}_audio_decode",
@@ -459,12 +510,12 @@ class MiniMaxH3MultiSegmentSecondPass(io.ComfyNode):
             components = stage_node("GetVideoComponents", f"{stage}_components", video=checkpoint.out(0))
             images = components.out(0)
             audio = components.out(1)
-            if entry.context_frames:
-                trimmed = stage_node("MiniMaxH3SegmentTrim", f"{stage}_trim", images=images,
-                    audio=audio, context_frames=entry.context_frames,
-                    duration_seconds=entry.visible_duration, generated_frames=entry.generation_frames)
-                images = trimmed.out(0)
-                audio = trimmed.out(1)
+            trimmed = stage_node("MiniMaxH3SegmentTrim", f"{stage}_trim", images=images,
+                audio=audio, context_frames=entry.context_frames,
+                duration_seconds=entry.visible_duration, generated_frames=entry.generation_frames,
+                visible_frames=entry.visible_frames)
+            images = trimmed.out(0)
+            audio = trimmed.out(1)
             previous_images = images
             previous_audio = audio
             previous_latent = checkpoint_latent
@@ -481,6 +532,54 @@ class MiniMaxH3MultiSegmentSecondPass(io.ComfyNode):
         video = stage_node("CreateVideo", f"segment_{total}_of_{total}_final_video",
             images=accumulated_images, fps=float(FPS), audio=accumulated_audio)
         return io.NodeOutput(video.out(0), expand=graph.finalize())
+
+
+class MiniMaxH3MultiSegmentLatentSecondPass(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(node_id="MiniMaxH3MultiSegmentLatentSecondPass",
+            display_name="MiniMax H3 多段 Latent 模型二采（Decoded Video）", category=CATEGORY,
+            description="使用 Minimax H3 3D Latent 放大模型逐段升分辨率、二采、缓存，并按任务包自动裁剪和拼接。",
+            inputs=[io.Model.Input("model"), io.Vae.Input("video_vae"), io.Vae.Input("audio_vae"),
+                io.Sampler.Input("sampler"), H3_SECOND_PASS_BATCH.Input("second_pass_batch"),
+                io.Combo.Input("upscaler_model", display_name="Latent 放大模型",
+                    options=_latent_upscaler_models()),
+                io.Float.Input("megapixels", display_name="目标百万像素", default=1.0,
+                    min=0.1, max=8.0, step=0.1),
+                io.Int.Input("align", display_name="尺寸对齐", default=32, min=1, max=512),
+                io.Boolean.Input("enable_chunking", display_name="时间分块", default=True),
+                io.Combo.Input("device", display_name="放大设备",
+                    options=["cuda", "rocm", "cpu"], default="cuda"),
+                io.Combo.Input("precision", display_name="放大精度",
+                    options=["fp32", "fp16", "bf16"], default="bf16"),
+                io.Sigmas.Input("sigmas", display_name="二采 Sigmas", optional=True),
+                io.Int.Input("seed", display_name="二采噪声种子", default=0, min=0,
+                    max=0xffffffffffffffff, control_after_generate=True),
+                io.Combo.Input("scheduler", display_name="未连接 Sigmas 时的调度器",
+                    options=comfy.samplers.SCHEDULER_NAMES, default="beta"),
+                io.Int.Input("steps", display_name="未连接 Sigmas 时的步数", default=4, min=1, max=10000),
+                io.Float.Input("denoise", display_name="未连接 Sigmas 时的降噪强度", default=0.2,
+                    min=0.0, max=1.0, step=0.01),
+                io.Combo.Input("cache_mode", display_name="二采分段缓存",
+                    options=["复用已完成片段", "重新生成全部片段"], default="复用已完成片段"),
+                io.Int.Input("cache_version", display_name="二采缓存版本", default=0,
+                    min=0, max=1000000)],
+            outputs=[io.Video.Output(display_name="video")], enable_expand=True)
+
+    @classmethod
+    def execute(cls, model, video_vae, audio_vae, sampler, second_pass_batch, upscaler_model,
+                megapixels=1.0, align=32, enable_chunking=True, device="cuda", precision="bf16",
+                sigmas=None, seed=0, scheduler="beta", steps=4, denoise=0.2,
+                cache_mode="复用已完成片段", cache_version=0):
+        if upscaler_model.startswith("请先安装"):
+            raise ValueError(upscaler_model)
+        latent_upscale = {"model_name": upscaler_model, "align": align,
+            "enable_chunking": enable_chunking, "device": device, "precision": precision}
+        parent_node_id = cls.hidden.unique_id if cls.hidden is not None else None
+        return MiniMaxH3MultiSegmentSecondPass.execute(model, video_vae, audio_vae, sampler,
+            second_pass_batch, megapixels=megapixels, seed=seed, scheduler=scheduler, steps=steps,
+            denoise=denoise, cache_mode=cache_mode, cache_version=cache_version,
+            _latent_upscale=latent_upscale, _sigmas=sigmas, _parent_node_id=parent_node_id)
 
 
 class MiniMaxH3MultiSegmentGenerate(io.ComfyNode):
@@ -535,12 +634,15 @@ class MiniMaxH3MultiSegmentGenerate(io.ComfyNode):
             start, end = ranges[index]
             segment_duration = end - start
             segment_result = _segment_result(generation_job.timeline, start, end)
-            available_frames = round((ranges[index - 1][1] - ranges[index - 1][0]) * FPS) if index else 0
-            frame_plan = (_segment_frame_plan(generation_job.continuity_seconds, available_frames,
-                round(segment_duration * FPS)) if segment_result is None else None)
+            available_frames = _segment_visible_frames(*ranges[index - 1]) if index else 0
+            frame_plan = (_segment_frame_plan(_segment_continuity_seconds(generation_job, index, ranges), available_frames,
+                _segment_visible_frames(start, end)) if segment_result is None else None)
+            context_mode = (_segment_context_mode(generation_job.timeline, index, ranges)
+                if frame_plan is not None else "off")
             context_frames = frame_plan.locked_frames if frame_plan is not None else 0
             generation_frames = frame_plan.generation_frames if frame_plan is not None else round(segment_duration * FPS)
-            visible_duration = frame_plan.current_frames / FPS if frame_plan is not None else segment_duration
+            visible_frames = frame_plan.requested_frames if frame_plan is not None else _segment_visible_frames(start, end)
+            visible_duration = visible_frames / FPS
             checkpoint_latent = None
             conditioning = None
             if segment_result is None:
@@ -584,8 +686,10 @@ class MiniMaxH3MultiSegmentGenerate(io.ComfyNode):
                     preview_files=preview_files)
                 checkpoint_latent = sampled.out(0)
             entry_inputs = {"video": checkpoint.out(0), "segment_index": index,
+                "start_time": start, "end_time": end,
                 "context_frames": context_frames, "generation_frames": generation_frames,
-                "visible_duration": visible_duration, "cache_file": cache_files[index]}
+                "visible_frames": visible_frames, "visible_duration": visible_duration,
+                "cache_file": cache_files[index], "context_mode": context_mode}
             if conditioning is not None:
                 entry_inputs["conditioning"] = conditioning.out(0)
             if checkpoint_latent is not None:
@@ -602,7 +706,7 @@ class MiniMaxH3MultiSegmentGenerate(io.ComfyNode):
             if segment_result is None:
                 trimmed = stage_node("MiniMaxH3SegmentTrim", f"{stage}_trim", images=images,
                     audio=audio, context_frames=context_frames, duration_seconds=visible_duration,
-                    generated_frames=generation_frames)
+                    generated_frames=generation_frames, visible_frames=visible_frames)
                 images = trimmed.out(0)
                 audio = trimmed.out(1)
             previous_images = images

@@ -5,10 +5,10 @@ import torch
 from comfy_api.latest import io
 
 from .schema import (ACTOR_KINDS, CATEGORY, FPS, H3_ACTOR_INSTANCE, H3_ENVIRONMENT_INSTANCE,
-    H3_AUDIO_REFERENCE, H3_CAMERA_REFERENCE, H3_LANGUAGE, H3_LIGHTING_REFERENCE,
+    H3_AUDIO_REFERENCE, H3_CAMERA_REFERENCE, H3_ENVIRONMENT_REFERENCE, H3_LANGUAGE, H3_LIGHTING_REFERENCE,
     H3_MOTION_REFERENCE, H3_TIMELINE_CLIP, H3_TIMELINE_TRACK, H3_TRACK_LIST,
     SYSTEM_KINDS, ActorInstanceData, ActorPerformanceReferenceData, AudioReferenceData,
-    CameraReferenceData, LanguageData, LightingReferenceData, ReferenceVideoData,
+    CameraReferenceData, EnvironmentReferenceData, LanguageData, LightingReferenceData, ReferenceVideoData,
     TimelineClipData, TimelineTrackData, TrackListData)
 from .utils import _autogrow, _sentence, _text, _values
 
@@ -23,7 +23,8 @@ class MiniMaxH3MotionReference(io.ComfyNode):
             outputs=[H3_MOTION_REFERENCE.Output(display_name="人物表演参考"),
                 H3_CAMERA_REFERENCE.Output(display_name="镜头参考"),
                 H3_LIGHTING_REFERENCE.Output(display_name="灯光参考"),
-                H3_AUDIO_REFERENCE.Output(display_name="音频参考")])
+                H3_AUDIO_REFERENCE.Output(display_name="音频参考"),
+                H3_ENVIRONMENT_REFERENCE.Output(display_name="环境参考")])
 
     @classmethod
     def execute(cls, video, trim_start, trim_end):
@@ -49,7 +50,30 @@ class MiniMaxH3MotionReference(io.ComfyNode):
             audio = {**audio, "waveform": audio["waveform"][..., first_sample:last_sample]}
         source = ReferenceVideoData(frames, audio, duration)
         return io.NodeOutput(ActorPerformanceReferenceData(source), CameraReferenceData(source),
-            LightingReferenceData(source), AudioReferenceData(source))
+            LightingReferenceData(source), AudioReferenceData(source), EnvironmentReferenceData(source))
+
+
+class MiniMaxH3ReferenceVideoPerson(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(node_id="MiniMaxH3ReferenceVideoPerson",
+            display_name="MiniMax H3 参考视频人物解释（Video Person）", category=CATEGORY,
+            description="声明人物表演参考在源视频中对应哪一位人物；同一视频可为不同目标人物分别创建解释节点。",
+            inputs=[H3_MOTION_REFERENCE.Input("motion_reference", display_name="人物表演参考"),
+                io.String.Input("person_id", display_name="源人物编号", default="person_1", placeholder="例如 person_1"),
+                io.String.Input("person_description", display_name="源人物识别描述", multiline=True,
+                    default="the performer on the left", placeholder="例如：画面左侧、穿白色上衣的表演者")],
+            outputs=[H3_MOTION_REFERENCE.Output(display_name="已解释的人物表演参考")])
+
+    @classmethod
+    def execute(cls, motion_reference, person_id, person_description):
+        if not isinstance(motion_reference, ActorPerformanceReferenceData):
+            raise TypeError("人物表演参考必须来自 MiniMax H3 参考视频语义拆分节点")
+        person_id = _text(person_id)
+        person_description = _text(person_description)
+        if not person_id or not person_description:
+            raise ValueError("参考视频人物解释需要源人物编号和识别描述")
+        return io.NodeOutput(replace(motion_reference, person_id=person_id, person_description=person_description))
 
 
 class MiniMaxH3Action(io.ComfyNode):
@@ -59,18 +83,24 @@ class MiniMaxH3Action(io.ComfyNode):
             io.Combo.Input("action_type", display_name="动作种类", options=list(ACTOR_KINDS), default="body"),
             io.Float.Input("start_time", display_name="开始时间（秒）", default=0.0, min=0.0, max=60.0, step=0.05),
             io.Float.Input("end_time", display_name="结束时间（秒）", default=1.0, min=0.0, max=60.0, step=0.05),
-            io.String.Input("content", display_name="动作内容", placeholder="动作内容", default="raises her right hand naturally", multiline=True),
+            io.String.Input("content", display_name="动作内容", placeholder="使用 {actor_1} 等实例宏引用人物", default="{actor_1} raises her right hand naturally", multiline=True),
             io.Combo.Input("speech_type", display_name="说话类型", options=["on-screen", "off-screen voiceover"], default="on-screen"),
             io.String.Input("quality", display_name="动作质量", placeholder="动作质量", default="The movement is physically natural and controlled.", multiline=True, optional=True),
-            io.String.Input("result", display_name="结束状态", placeholder="结束状态", default="She keeps her right hand raised.", multiline=True, optional=True),
+            io.String.Input("result", display_name="结束状态", placeholder="使用 {actor_1} 等实例宏引用人物", default="{actor_1} keeps her right hand raised.", multiline=True, optional=True),
             io.String.Input("delivery", display_name="说话方式", placeholder="说话方式", default="", multiline=True, optional=True),
+            io.Boolean.Input("use_previous_context", display_name="继承前一动作片段的段间引导", default=True,
+                tooltip="关闭后，从这个动作片段开始的新生成段不会锁定或引用前一段的结尾。"),
+            io.Boolean.Input("audio_only_context", display_name="仅段间音频引导", default=False,
+                tooltip="启用后覆盖上方开关：只锁定上一段末尾音频，不锁定画面。"),
             H3_LANGUAGE.Input("language", optional=True), H3_ACTOR_INSTANCE.Input("target", optional=True),
             H3_MOTION_REFERENCE.Input("motion_reference", display_name="人物表演参考", optional=True)],
             outputs=[H3_TIMELINE_CLIP.Output(display_name="clip")])
 
     @classmethod
     def execute(cls, action_type, start_time, end_time, content, quality="", result="", delivery="", speech_type="on-screen",
-                language=None, target=None, motion_reference=None):
+                language=None, target=None, motion_reference=None, use_previous_context=True, audio_only_context=False):
+        if not isinstance(use_previous_context, bool):
+            quality, result, delivery, use_previous_context = use_previous_context, quality, result, True
         if action_type == "speech" and not isinstance(language, LanguageData):
             raise ValueError("A speech action requires a Language input")
         if action_type != "speech" and language is not None:
@@ -85,7 +115,8 @@ class MiniMaxH3Action(io.ComfyNode):
             if end_time - start_time > 15.0 + 1e-6:
                 raise ValueError("带人物表演参考的单个动作片段不能超过 15 秒，请拆分动作片段")
         return io.NodeOutput(TimelineClipData(action_type, start_time, end_time, _text(content), _sentence(quality),
-            _sentence(result), language, _text(delivery), speech_type, target, "", motion_reference))
+            _sentence(result), language, _text(delivery), speech_type, target, "", motion_reference,
+            use_previous_context=bool(use_previous_context), audio_only_context=bool(audio_only_context)))
 
 
 class MiniMaxH3ActionResult(io.ComfyNode):
@@ -112,10 +143,10 @@ class MiniMaxH3Camera(io.ComfyNode):
         return io.Schema(node_id="MiniMaxH3Camera", display_name="MiniMax H3 摄像机动作片段（Camera Clip）", category=CATEGORY, inputs=[
             io.Float.Input("start_time", display_name="开始时间（秒）", default=0.0, min=0.0, max=60.0, step=0.05),
             io.Float.Input("end_time", display_name="结束时间（秒）", default=5.0, min=0.0, max=60.0, step=0.05),
-            io.String.Input("framing_and_angle", display_name="景别与角度", placeholder="用 {actor_0}、{actor_1} 引用人物组成员", default="The camera begins at eye level in a medium shot, keeping {actor_0} centered.", multiline=True),
-            io.String.Input("movement", display_name="摄像机运动", placeholder="用 {actor_0}、{actor_1} 引用人物组成员", default="It slowly pushes toward {actor_0}.", multiline=True),
-            io.String.Input("focus", display_name="对焦与景深", placeholder="用 {actor_0}、{actor_1} 引用人物组成员", default="A shallow depth of field keeps {actor_0}'s face sharp.", multiline=True),
-            io.String.Input("result", display_name="结束状态", placeholder="用 {actor_0}、{actor_1} 引用人物组成员", default="The camera holds on the final framing.", multiline=True, optional=True),
+            io.String.Input("framing_and_angle", display_name="景别与角度", placeholder="用 {actor_1}、{actor_2} 引用人物实例", default="The camera begins at eye level in a medium shot, keeping {actor_1} centered.", multiline=True),
+            io.String.Input("movement", display_name="摄像机运动", placeholder="用 {actor_1}、{actor_2} 引用人物实例", default="It slowly pushes toward {actor_1}.", multiline=True),
+            io.String.Input("focus", display_name="对焦与景深", placeholder="用 {actor_1}、{actor_2} 引用人物实例", default="A shallow depth of field keeps {actor_1}'s face sharp.", multiline=True),
+            io.String.Input("result", display_name="结束状态", placeholder="用 {actor_1}、{actor_2} 引用人物实例", default="The camera holds on the final framing.", multiline=True, optional=True),
             H3_CAMERA_REFERENCE.Input("camera_reference", display_name="镜头参考", optional=True)],
             outputs=[H3_TIMELINE_CLIP.Output(display_name="clip")])
 
@@ -134,9 +165,9 @@ class MiniMaxH3LightingAction(io.ComfyNode):
         return io.Schema(node_id="MiniMaxH3LightingAction", display_name="MiniMax H3 灯光动作片段（Lighting Clip）", category=CATEGORY, inputs=[
             io.Float.Input("start_time", display_name="开始时间（秒）", default=0.0, min=0.0, max=60.0, step=0.05),
             io.Float.Input("end_time", display_name="结束时间（秒）", default=5.0, min=0.0, max=60.0, step=0.05),
-            io.String.Input("lighting", display_name="灯光描述", placeholder="用 {actor_0}、{actor_1} 引用人物组成员", default="Cool city light separates {actor_0} from the background.", multiline=True),
-            io.String.Input("transition", display_name="灯光变化", placeholder="用 {actor_0}、{actor_1} 引用人物组成员", default="The lighting remains stable without flicker.", multiline=True, optional=True),
-            io.String.Input("result", display_name="结束状态", placeholder="用 {actor_0}、{actor_1} 引用人物组成员", default="The final lighting state remains stable.", multiline=True, optional=True),
+            io.String.Input("lighting", display_name="灯光描述", placeholder="用 {actor_1}、{actor_2} 引用人物实例", default="Cool city light separates {actor_1} from the background.", multiline=True),
+            io.String.Input("transition", display_name="灯光变化", placeholder="用 {actor_1}、{actor_2} 引用人物实例", default="The lighting remains stable without flicker.", multiline=True, optional=True),
+            io.String.Input("result", display_name="结束状态", placeholder="用 {actor_1}、{actor_2} 引用人物实例", default="The final lighting state remains stable.", multiline=True, optional=True),
             H3_LIGHTING_REFERENCE.Input("lighting_reference", display_name="灯光参考", optional=True)],
             outputs=[H3_TIMELINE_CLIP.Output(display_name="clip")])
 
@@ -155,9 +186,9 @@ class MiniMaxH3AudioAction(io.ComfyNode):
             io.Combo.Input("audio_type", display_name="音频种类", options=["ambient", "sound effect", "music", "off-screen sound"], default="ambient"),
             io.Float.Input("start_time", display_name="开始时间（秒）", default=0.0, min=0.0, max=60.0, step=0.05),
             io.Float.Input("end_time", display_name="结束时间（秒）", default=5.0, min=0.0, max=60.0, step=0.05),
-            io.String.Input("description", display_name="声音描述", placeholder="用 {actor_0}、{actor_1} 引用人物组成员", default="Rain, wind, and distant traffic remain naturally audible.", multiline=True),
-            io.String.Input("volume_and_space", display_name="音量与空间", placeholder="用 {actor_0}、{actor_1} 引用人物组成员", default="The sound remains soft and spatially coherent.", multiline=True, optional=True),
-            io.String.Input("fade", display_name="淡入淡出", placeholder="用 {actor_0}、{actor_1} 引用人物组成员", default="", multiline=True, optional=True),
+            io.String.Input("description", display_name="声音描述", placeholder="用 {actor_1}、{actor_2} 引用人物实例", default="Rain, wind, and distant traffic remain naturally audible.", multiline=True),
+            io.String.Input("volume_and_space", display_name="音量与空间", placeholder="用 {actor_1}、{actor_2} 引用人物实例", default="The sound remains soft and spatially coherent.", multiline=True, optional=True),
+            io.String.Input("fade", display_name="淡入淡出", placeholder="用 {actor_1}、{actor_2} 引用人物实例", default="", multiline=True, optional=True),
             H3_AUDIO_REFERENCE.Input("audio_reference", display_name="音频参考", optional=True)], outputs=[H3_TIMELINE_CLIP.Output(display_name="clip")])
 
     @classmethod
@@ -179,12 +210,16 @@ class MiniMaxH3EnvironmentAction(io.ComfyNode):
             io.Float.Input("end_time", display_name="结束时间（秒）", default=5.0, min=0.0, max=60.0, step=0.05),
             io.String.Input("change", display_name="环境变化", placeholder="环境变化", default="The rain gradually becomes heavier.", multiline=True),
             io.String.Input("quality", display_name="变化质量", placeholder="变化质量", default="The change occurs continuously and naturally.", multiline=True, optional=True),
-            io.String.Input("result", display_name="结束状态", placeholder="结束状态", default="Heavy rain continues.", multiline=True, optional=True)],
+            io.String.Input("result", display_name="结束状态", placeholder="结束状态", default="Heavy rain continues.", multiline=True, optional=True),
+            H3_ENVIRONMENT_REFERENCE.Input("environment_reference", display_name="环境参考", optional=True)],
             outputs=[H3_TIMELINE_CLIP.Output(display_name="clip")])
 
     @classmethod
-    def execute(cls, start_time, end_time, change, quality="", result=""):
-        return io.NodeOutput(TimelineClipData("environment", start_time, end_time, _text(change), _sentence(quality), _sentence(result)))
+    def execute(cls, start_time, end_time, change, quality="", result="", environment_reference=None):
+        if environment_reference is not None and not isinstance(environment_reference, EnvironmentReferenceData):
+            raise TypeError("环境参考必须来自 MiniMax H3 参考视频语义拆分节点")
+        return io.NodeOutput(TimelineClipData("environment", start_time, end_time, _text(change), _sentence(quality), _sentence(result),
+            environment_reference=environment_reference))
 
 
 def _track_clips(clips, allowed, label):
